@@ -59,8 +59,8 @@ jobs:
         id: s3
         uses: ./.github/actions/ci-s3
         with:
-          role-arn: ${{ vars.URSULA_CI_AWS_ROLE_ARN }}
-          bucket: ${{ vars.URSULA_CI_S3_BUCKET }}
+          role-arn: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
+          bucket: ${{ secrets.URSULA_CI_S3_BUCKET }}
           region: ${{ vars.URSULA_CI_S3_REGION || 'us-east-1' }}
           job-key: ${{ github.job }}
 
@@ -355,8 +355,8 @@ jobs:
         id: s3
         uses: ./.github/actions/ci-s3
         with:
-          role-arn: ${{ vars.URSULA_CI_AWS_ROLE_ARN }}
-          bucket: ${{ vars.URSULA_CI_S3_BUCKET }}
+          role-arn: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
+          bucket: ${{ secrets.URSULA_CI_S3_BUCKET }}
           region: ${{ vars.URSULA_CI_S3_REGION || 'us-east-1' }}
           job-key: ${{ github.job }}
 

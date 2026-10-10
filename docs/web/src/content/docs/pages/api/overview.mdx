@@ -70,18 +70,22 @@ The server sets the header on every refusal of its write admission, which runs b
 
 | Status | Token | Cause |
 | ------ | ----- | ----- |
-| `503` | `WalDiskPressure` | The WAL filesystem is below `raft.wal.min_available_size`. |
-| `503` | `RaftLogPressure` | The node's unsnapshotted Raft log is over twice `raft.snapshot_log_budget`. Writes without a body still pass. |
-| `503` | `IngressBodyBytesLimitReached` | Write bodies in flight on the node use all of `server.http_inflight_body_size`. |
+| `503` | `WalDiskPressure` | The WAL filesystem's free space is below `raft.wal.min_available_size`. Writes pass again once it reaches `raft.wal.resume_available_size`. |
+| `503` | `RaftLogPressure` | The node's unsnapshotted Raft log is over twice `raft.snapshot_log_budget`. Writes with a body pass again once the log is below 1.5 times the budget. Writes without a body still pass. |
+| `503` | `IngressBodyBytesLimitReached` | Write bodies in flight on the node leave too little of `server.http_inflight_body_size` for this body. |
 | `413` | `RequestBodyTooLarge` | The `Content-Length` is over the route's limit. |
 
 The `503` refusals also carry `Retry-After: 1` and name the token as the JSON `error`.
 
 The gateway sets the header on every request it refuses before forwarding it, and passes an upstream's header through. Its tokens are listed in the [gateway README](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-gateway/README.md#refusals-that-applied-nothing). A proxy in front of Ursula may set the header too, but only on requests it refused without passing them on.
 
-Without the header a response promises nothing. A `503` without it, or a timeout, can follow a write that committed. Retry such a write with the same `Producer-Id`, `Producer-Epoch` and `Producer-Seq`, so that the server deduplicates it (see [exactly-once writes](/docs/concepts/exactly-once-writes)).
+The header speaks for one attempt only. A marked answer to a retry says nothing about the earlier attempts. Without the header a response promises nothing. A `503` without it, or a timeout, can follow a write that committed. After such an attempt, keep retrying with the same `Producer-Id`, `Producer-Epoch` and `Producer-Seq` until an answer settles the write, so that the server deduplicates it (see [exactly-once writes](/docs/concepts/exactly-once-writes)).
 
-A node can answer a write with a leader redirect after it proposed the write. A client that follows redirects keeps the header of the final response only if every redirect it followed carried the header too. The gateway follows Raft leader redirects this way.
+### Redirects and retries
+
+A node can answer a write with a leader redirect after it proposed the write. A client that follows redirects keeps the header of the final response only if every redirect it followed carried the header too. The gateway follows Raft leader redirects this way. A gateway older than 0.7.3 passes the leader's header on after any redirect. Upgrade gateways before nodes, and roll back nodes before gateways, so that no older gateway runs in front of a node that sets the header.
+
+An HTTP library or proxy that follows redirects or retries on its own hides the earlier attempts. Turn that off for writes before relying on the header, or ignore the header on a response that followed a redirect, such as a `fetch` response whose `redirected` is `true`. A proxy that sends one request upstream more than once passes the header on only if every attempt carried it.
 
 ## Related concepts
 

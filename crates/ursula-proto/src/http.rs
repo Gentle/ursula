@@ -6,8 +6,9 @@
 /// A layer sets it only when it can guarantee that nothing of the request was
 /// applied: the server's ingress admission, the gateway before it forwards a
 /// request, or a proxy in front of either. A client may then treat the attempt
-/// as having applied nothing, whatever the status. Without the header a
-/// response promises nothing either way.
+/// as having applied nothing, whatever the status. The header speaks for that
+/// attempt only, not for earlier attempts of the same write. Without the
+/// header a response promises nothing either way.
 ///
 /// The value is a short token naming the refusal, such as `RaftLogPressure`,
 /// for logs and diagnostics. The header's presence is the signal. A layer that

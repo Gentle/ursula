@@ -7,6 +7,8 @@ use crate::db::lock;
 use crate::error::Error;
 use crate::error::WriteRefusal;
 use crate::host::full_pathname;
+use crate::stats::Drained;
+use crate::stats::Dropped;
 
 fn json_str(s: &str) -> String {
     let mut out = String::from("\"");
@@ -97,13 +99,22 @@ fn status_json(db: &Db) -> String {
     format!("{{{}}}", body.join(","))
 }
 
+/// `ursula_stats`: drains the attached database's measurements (see [`Stats`]).
+///
+/// [`Stats`]: crate::stats::Stats
 pub(crate) fn stats(path: &str) -> Result<String, Error> {
     let path = full_pathname(path)?;
     let db = attached(&path)?;
-    let mut db = lock(&db);
-    let commits: Vec<String> = db
-        .stats
-        .drain(..)
+    // Rendered once the mutex is released: a commit waits for it.
+    let drained = lock(&db).stats.drain();
+    Ok(stats_json(&drained))
+}
+
+/// `ursula_stats` of what a drain handed over.
+fn stats_json(drained: &Drained) -> String {
+    let commits: Vec<String> = drained
+        .commits
+        .iter()
         .map(|s| {
             format!(
                 "{{\"bytes\":{},\"raw\":{},\"pages\":{},\"attempts\":{},\"append_us\":{},\"vfs_us\":{}}}",
@@ -116,14 +127,14 @@ pub(crate) fn stats(path: &str) -> Result<String, Error> {
             )
         })
         .collect();
-    let checkpoints: Vec<String> = db
+    let checkpoints: Vec<String> = drained
         .checkpoints
-        .drain(..)
+        .iter()
         .map(|d| d.as_micros().to_string())
         .collect();
-    let snapshots: Vec<String> = db
-        .snapshot_stats
-        .drain(..)
+    let snapshots: Vec<String> = drained
+        .snapshots
+        .iter()
         .map(|s| {
             format!(
                 "{{\"offset\":{},\"bytes\":{},\"raw\":{},\"copy_us\":{},\"total_us\":{}}}",
@@ -135,12 +146,24 @@ pub(crate) fn stats(path: &str) -> Result<String, Error> {
             )
         })
         .collect();
-    Ok(format!(
-        "{{\"commits\":[{}],\"checkpoints_us\":[{}],\"snapshots\":[{}]}}",
+    let Dropped {
+        commits: dropped_commits,
+        commit_bytes,
+        append_retries,
+        checkpoints: dropped_checkpoints,
+        snapshots: dropped_snapshots,
+    } = drained.dropped;
+    let dropped = format!(
+        "{{\"commits\":{dropped_commits},\"commit_bytes\":{commit_bytes},\"append_retries\":{append_retries},\"checkpoints\":{dropped_checkpoints},\"snapshots\":{dropped_snapshots}}}"
+    );
+    let (commits, checkpoints, snapshots) = (
         commits.join(","),
         checkpoints.join(","),
-        snapshots.join(",")
-    ))
+        snapshots.join(","),
+    );
+    format!(
+        "{{\"commits\":[{commits}],\"checkpoints_us\":[{checkpoints}],\"snapshots\":[{snapshots}],\"dropped\":{dropped}}}"
+    )
 }
 
 #[cfg(test)]

@@ -103,7 +103,8 @@
 //!   the local state attach started from, `-1` when it rebuilt the file; `installed`: the offset of
 //!   the snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none; the rest
 //!   are the owner's health, see `status`);
-//!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
+//!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench):
+//!   at most the newest 10,000 of each kind between drains, and `dropped` counts the rest.
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
 //! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds every retry
@@ -148,6 +149,7 @@ mod local;
 mod log;
 pub mod snapshot;
 mod snapshotter;
+mod stats;
 mod status;
 mod vfs;
 mod wal;

@@ -183,14 +183,36 @@ export interface VfsSnapshotStat {
 	readonly total_us: number;
 }
 
+/**
+ * What the extension dropped since the last drain to keep at most 10,000 of each kind. The dropped
+ * commits' frame bytes and append retries are counted, so totals built from the drains count every
+ * commit; their durations are lost.
+ */
+export interface VfsDropped {
+	readonly commits: number;
+	/** The dropped commits' frame bytes. */
+	readonly commit_bytes: number;
+	/** The dropped commits' append attempts beyond the first. */
+	readonly append_retries: number;
+	readonly checkpoints: number;
+	readonly snapshots: number;
+}
+
 export interface VfsStats {
 	readonly commits: VfsCommitStat[];
 	/** Checkpoints of the file since the last drain (time holding the checkpoint lock). */
 	readonly checkpoints_us: number[];
 	readonly snapshots: VfsSnapshotStat[];
+	/** What was dropped since the last drain. An extension before 0.7.3 keeps everything and reports none. */
+	readonly dropped?: VfsDropped;
 }
 
-/** Drains the per-commit and per-checkpoint stats of an attached file. */
+/**
+ * Drains the per-commit, per-checkpoint and per-snapshot stats of an attached file: everything kept
+ * since the last drain, oldest first. The extension keeps the newest 10,000 of each kind between
+ * drains, about 640 KB of commits, so a file nobody drains holds a bounded amount; `dropped` counts
+ * the rest.
+ */
 export function drainStats(file: string): VfsStats {
 	const row = loadUrsulaVfs().prepare("SELECT ursula_stats(?) AS s").get(file) as { s: string };
 	return JSON.parse(row.s) as VfsStats;
@@ -370,6 +392,12 @@ export function instrument(file: string, meter: MeterLike, options: { intervalMs
 			append.record(c.append_us / 1000, attributes);
 			if (c.attempts > 1) retries.add(c.attempts - 1, attributes);
 			bytes.add(c.bytes, attributes);
+		}
+		// Commits dropped between two drains still count, though their durations are lost.
+		const dropped = stats.dropped;
+		if (dropped !== undefined) {
+			if (dropped.append_retries > 0) retries.add(dropped.append_retries, attributes);
+			if (dropped.commit_bytes > 0) bytes.add(dropped.commit_bytes, attributes);
 		}
 	};
 	const gauges: [string, string | undefined, (s: AttachStatus) => number | null][] = [

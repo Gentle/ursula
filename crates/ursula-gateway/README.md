@@ -127,7 +127,9 @@ its first upstream failed. The value names the refusal:
 A node's marker passes through unchanged when the gateway sent the request
 to one node. After the gateway follows a Raft leader redirect, it keeps the
 leader's marker only if the redirect carried one too, because a node can
-redirect a write after it proposed it. The other answers the gateway gives
+redirect a write after it proposed it. A node marks only the redirects it
+sends before it proposes a write, so a leader's admission refusal reached
+through such a redirect keeps its marker. The other answers the gateway gives
 when an upstream fails carry no marker: the `502` and `504`, and the `503`
 for a leader it could not connect to after a redirect, since the node that
 redirected may have proposed the request.

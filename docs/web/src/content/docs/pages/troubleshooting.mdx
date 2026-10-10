@@ -234,11 +234,20 @@ the response also carries `x-ursula-not-applied-checked`, which a gateway
 at 0.7.3 or newer adds. See
 [refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing).
 
-Other errors indicate cold-write backpressure for that group. Either the hot
-ring exceeds `storage.cold.max_hot_size_per_group` (cold flush isn't keeping
-up), or the cold backend is slow or erroring out.
+Other `503`s come from the stream's Raft group, and their text names the
+cause. `ColdBackpressure` means that the group's hot ring would exceed
+`storage.cold.max_hot_size_per_group`: cold flush isn't keeping up, or the
+cold backend is slow or erroring out. Raise the per-group ceiling, lower
+`storage.cold.flush_interval`, raise `storage.cold.flush_max_concurrency`, or
+fix the cold backend. `RaftUncommittedBackpressure` means that the group's
+write bytes that are proposed but not yet applied would exceed
+`raft.max_uncommitted_size_per_group`.
 
-Raise the per-group ceiling, lower `storage.cold.flush_interval`, raise `storage.cold.flush_max_concurrency`, or fix the cold backend.
+The node refuses both before it proposes the append, so from 0.7.3 their
+responses also carry the name in `x-ursula-not-applied`, like the admission
+refusals above. A `503` while the group has no known leader, for example
+during an election, carries `NotLeader` when the node found that before it
+proposed the append.
 
 ### `409 Conflict` with `producer-expected-seq` / `producer-received-seq`
 

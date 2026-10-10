@@ -1,8 +1,9 @@
 // Child process for the crash, fencing and snapshot tests: loads the extension, attaches FILE to URL
 // (in the mode CHILD_ATTACH_MODE names, when set), opens it with plain node:sqlite in WAL mode and runs
 // each SQL argument as one exec (`@sleep:<ms>` sleeps instead, `@wait:<path>` waits until the path
-// exists, `@query:<sql>` prints the rows, `@status` prints `ursula_status`), printing a JSON line per
-// step. Then stays alive until killed, unless CHILD_EXIT=1.
+// exists, `@snapshots:<n>` waits until the file's snapshot thread has published and read back n
+// snapshots, `@query:<sql>` prints the rows, `@status` prints `ursula_status`), printing a JSON line
+// per step. Then stays alive until killed, unless CHILD_EXIT=1.
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
@@ -13,6 +14,14 @@ control.loadExtension(ext);
 const mode = process.env.CHILD_ATTACH_MODE;
 const tail = (mode === undefined ? control.prepare("SELECT ursula_attach(?, ?) AS n").get(file, url) : control.prepare("SELECT ursula_attach(?, ?, ?) AS n").get(file, url, mode)).n;
 const status = () => JSON.parse(control.prepare("SELECT ursula_status(?) AS s").get(file).s);
+/** Every commit and snapshot (published and read back) of this process: `ursula_stats` drains them. */
+const drained = { commits: [], snapshots: [] };
+const drain = () => {
+	const s = JSON.parse(control.prepare("SELECT ursula_stats(?) AS s").get(file).s);
+	drained.commits.push(...s.commits);
+	drained.snapshots.push(...s.snapshots);
+	return drained;
+};
 const db = new DatabaseSync(file);
 db.exec("PRAGMA journal_mode=WAL");
 say({ attached: tail });
@@ -25,6 +34,11 @@ for (const [step, sql] of sqls.entries()) {
 	}
 	if (sql.startsWith("@wait:")) {
 		while (!existsSync(sql.slice(6))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+		say({ step, ok: true });
+		continue;
+	}
+	if (sql.startsWith("@snapshots:")) {
+		while (drain().snapshots.length < Number(sql.slice(11))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
 		say({ step, ok: true });
 		continue;
 	}
@@ -43,7 +57,7 @@ for (const [step, sql] of sqls.entries()) {
 		say({ step, ok: false, error: String(error), errcode: error.errcode, errstr: error.errstr });
 	}
 }
-const stats = JSON.parse(control.prepare("SELECT ursula_stats(?) AS s").get(file).s);
+const stats = drain();
 const last = status();
 const { commits, append_retries, attach_ms, log_bytes, snapshot_due_bytes, snapshot_age_ms, snapshot_failures, snapshot_error } = last;
 say({

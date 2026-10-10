@@ -18,9 +18,10 @@ import { freshFile } from "./helpers.ts";
 import { AuthGateway, type Child, type ChildLine, runChild, streamPath } from "./kit.ts";
 
 const nodes = inject("ursulaNodes");
-const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-redirects-"));
+let dir: string | undefined;
 let gateway: AuthGateway | undefined;
 let proxy: RedirectCounter | undefined;
+let moving: { stop(): Promise<number> } | undefined;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -127,6 +128,7 @@ class RedirectCounter {
 
 beforeAll(async () => {
 	if (nodes.length !== 3) return;
+	dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-redirects-"));
 	const unresolvable = nodes.map((node) => {
 		const url = new URL(node.url);
 		url.hostname = "localhost";
@@ -137,9 +139,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+	// A test that timed out leaves its loop running: it must not move leaderships under the next file.
+	await moving?.stop();
 	gateway?.close();
 	await proxy?.close();
-	rmSync(dir, { recursive: true, force: true });
+	if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
 });
 
 const ROWS = "@query:SELECT k, hex(substr(v, 1, 16)) AS head FROM t ORDER BY k";
@@ -156,19 +160,23 @@ async function finished(child: Child, ms: number): Promise<{ done: ChildLine; ro
 it.runIf(nodes.length === 3)(
 	"attach, commits and snapshot read-backs retry the redirects a gateway that checks tokens passes on while leaderships move",
 	async () => {
-		const url = (proxy as RedirectCounter).url + streamPath();
-		const token = join(dir, "token");
+		const counter = proxy as RedirectCounter;
+		const url = counter.url + streamPath();
+		const token = join(dir as string, "token");
 		writeFileSync(token, `${(gateway as AuthGateway).mint()}\n`);
 		// A snapshot whenever the log outgrows the database (about 80 KiB): every few commits, which
 		// are paced so that the snapshot thread keeps up.
 		const env = { URSULA_VFS_TOKEN_FILE: token, URSULA_VFS_SNAPSHOT_MIN_BYTES: "65536", CHILD_EXIT: "1" };
-		const moving = moveLeadershipsUntilStopped(2000);
+		const loop = moveLeadershipsUntilStopped(2000);
+		moving = loop;
 		let moved = 0;
 		let snapshots = 0;
 		try {
 			const steps = ["CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB)"];
 			for (let i = 0; i < 40; i++) steps.push(`INSERT OR REPLACE INTO t VALUES (${i % 4}, randomblob(16384))`, "@sleep:100");
-			steps.push("@sleep:2000", ROWS);
+			// Under these moves one snapshot can take seconds (its requests meet redirects, or a 503 with
+			// Retry-After: 1 from a group between leaders): the owner waits for two before it exits.
+			steps.push("@snapshots:2", "@sleep:2000", ROWS);
 			const file = freshFile();
 			const owner = await finished(runChild(file, url, steps, env), 180_000);
 			snapshots = owner.done.snapshots ?? 0;
@@ -180,15 +188,23 @@ it.runIf(nodes.length === 3)(
 			expect(host.done.installed).not.toBe("-1");
 			expect(host.rows).toEqual(owner.rows);
 
+			// The gateway sends each request to a node picked at random, the leader one time in three,
+			// so the snapshot GETs so far may all have missed a redirect. Until one met a redirect,
+			// read-only hosts (they claim nothing) install the snapshot again.
+			for (let i = 0; counter.count("GET", true) === 0 && i < 10; i++) {
+				const reader = await finished(runChild(freshFile(), url, [ROWS], { ...env, CHILD_ATTACH_MODE: "read_only" }), 90_000);
+				expect(reader.done.installed).not.toBe("-1");
+				expect(reader.rows).toEqual(owner.rows);
+			}
+
 			// The owner attaches its own files again (they hold data: a stream hidden behind a 404
 			// would be refused as missing), takes the stream back and commits.
 			const again = await finished(runChild(file, url, ["INSERT INTO t VALUES (4, x'00')", ROWS], env), 90_000);
 			expect(again.done.local).not.toBe("-1");
 			expect(again.rows).toEqual([...(owner.rows as object[]), { k: 4, head: "00" }]);
 		} finally {
-			moved = await moving.stop();
+			moved = await loop.stop();
 		}
-		const counter = proxy as RedirectCounter;
 		console.log(`leadership moves: ${moved}; redirects passed on: ${counter.summary()}; snapshots: ${snapshots}`);
 		expect(moved).toBeGreaterThanOrEqual(4);
 		// The gateway passed redirects on to appends, and to snapshot read-backs or installs.

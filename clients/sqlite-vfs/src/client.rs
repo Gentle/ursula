@@ -181,12 +181,14 @@ fn payment_required(op: &'static str, url: &str, body: String) -> Error {
     }
 }
 
-/// A redirect the extension retries: a 307 or 308 keeps the method and body, and says only that
+/// A redirect the extension retries: a 307 or 308, which keeps the method and body. A 307 says that
 /// the request belongs elsewhere for now (a gateway passing on the server's redirect to the leader
-/// of the stream's group, which moved). Never followed (`new_agent`): the request is sent again to
-/// the same URL, like a 503, so it reaches the leader through the same gateway, with the token. An
-/// append so answered has an unknown outcome: a leader that loses its leadership answers so, and
-/// what it proposed may still be committed.
+/// of the stream's group, which moved). A 308 says so for good, but neither the server nor the
+/// gateway sends one, and it is retried the same way (a proxy's 308 fails the request once the
+/// budget runs out). Never followed (`new_agent`): the request is sent again to the same URL, like
+/// a 503, so it reaches the leader through the same gateway, with the token. An append so answered
+/// has an unknown outcome: a leader that loses its leadership answers so, and what it proposed may
+/// still be committed.
 fn redirect_retried(status: u16) -> bool {
     matches!(status, 307 | 308)
 }
@@ -329,9 +331,9 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
 ///
 /// A 402 ends the append as [`Append::PaymentRequired`] only while no attempt of it can have
-/// reached the stream. After an attempt whose outcome is unknown (no answer, or a 5xx), the
-/// append may be in the stream, and the next commit, sent with the same sequence, would be
-/// acknowledged as its duplicate: the 402 is then retried like an unknown outcome, until an
+/// reached the stream. After an attempt whose outcome is unknown (no answer, a 5xx, or a 307 or
+/// 308), the append may be in the stream, and the next commit, sent with the same sequence, would
+/// be acknowledged as its duplicate: the 402 is then retried like an unknown outcome, until an
 /// answer settles it or the budget runs out ([`Error::AppendUnknown`]). An attempt answered 401,
 /// 402 or 429 is taken to have applied nothing, which every layer in front of the stream must
 /// ensure (design doc §2): one that passed the append on and then answered so would have the next
@@ -448,8 +450,8 @@ pub(crate) fn append(
             Err(e) => Attempt::Transport(Box::new(e)),
         };
         // Refusals in front of the stream (401, 402) and rate limiting (429) apply nothing (a
-        // requirement on every layer in front of it, see above); any other answer, or none, may
-        // come after the stream applied the append.
+        // requirement on every layer in front of it, see above); any other answer (a 307 or 308
+        // too: `redirect_retried`), or none, may come after the stream applied the append.
         if !matches!(unknown, Attempt::Status {
             status: 401 | 402 | 429,
             ..
@@ -640,7 +642,7 @@ pub(crate) struct Head {
     pub(crate) incarnation: Option<String>,
 }
 
-/// `stopped` ends the retries of a 429/503 early (see `send_retrying`).
+/// `stopped` ends the retries early (`send_retrying` lists the answers it retries).
 pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error> {
     let mut r = send_retrying(
         |refresh| authorized(agent().head(url), refresh).call(),
@@ -673,7 +675,7 @@ pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error>
 }
 
 /// The snapshot at `offset`; `None` when it does not exist (superseded, or not yet visible here).
-/// `stopped` ends the retries of a 429/503 early (see `send_retrying`).
+/// `stopped` ends the retries early (`send_retrying` lists the answers it retries).
 pub(crate) fn get_snapshot(
     url: &str,
     incarnation: &str,
@@ -1115,6 +1117,7 @@ mod tests {
             redirect("303 See Other"),
             redirect("301 Moved Permanently"),
             redirect("302 Found"),
+            redirect("301 Moved Permanently"),
         ]);
         let (bytes, next) = read_from(&url, "i1", "4").unwrap();
         assert_eq!((&bytes[..], next.as_str()), (&b"abc"[..], "7"));
@@ -1162,6 +1165,12 @@ mod tests {
             create.to_string().contains("302 redirect to /elsewhere"),
             "{create}"
         );
+        let snapshot = get_snapshot(&url, "i1", "9", &|| false).unwrap_err();
+        assert!(matches!(snapshot, Error::Redirected {
+            op: "get snapshot",
+            status: 301,
+            ..
+        }));
         set_token(None);
         let requests = server.join().unwrap();
         let lines: Vec<&str> = requests
@@ -1187,7 +1196,8 @@ mod tests {
             "HEAD /b/s",
             read,
             "PUT /b/s",
-            "PUT /b/s"
+            "PUT /b/s",
+            "GET /b/s/snapshot/9"
         ]);
         for request in &requests {
             let request = request.to_ascii_lowercase();
@@ -1205,14 +1215,27 @@ mod tests {
 
     // A 307 that lasts the whole retry budget leaves an append's or a PUT's outcome unknown (a
     // leader that loses its leadership answers so, and what it proposed may still be committed),
-    // and fails a read with its status: attach never takes it for a missing stream (a 404).
+    // and fails a HEAD, a read, a snapshot GET or a create with its status: attach never takes it
+    // for a missing stream (a 404), nor a snapshot GET for a superseded snapshot.
     #[test]
     fn a_redirect_to_the_end_of_the_budget_is_an_unknown_outcome() {
-        // The budget ends once a wait would pass it: a Retry-After too large to wait for.
-        let redirect = || {
-            answer("307 Temporary Redirect\r\nlocation: /b/s\r\nretry-after: 18446744073709551615")
+        // The budget ends once a wait would pass it: a Retry-After too large to wait for. The
+        // server's redirect explains itself in its body, which the gateway passes on.
+        let redirect = |body: &str| {
+            answer_with_body(
+                "307 Temporary Redirect\r\nlocation: /b/s\r\nretry-after: 18446744073709551615",
+                body,
+            )
         };
-        let (url, server) = serve(vec![redirect(), redirect(), redirect()]);
+        let (url, server) = serve(vec![
+            redirect(""),
+            redirect(""),
+            redirect(""),
+            redirect("not the leader"),
+            redirect(""),
+            redirect("not the leader"),
+            redirect("not the leader"),
+        ]);
         let unknown = append(&url, "i1", "p", b"x", 1, 1);
         let Append::Failed(Error::AppendUnknown { attempts, last }) = unknown else {
             panic!("not unknown");
@@ -1236,6 +1259,68 @@ mod tests {
             }),
             "{head}"
         );
-        assert_eq!(server.join().unwrap().len(), 3);
+        let read = read_from(&url, "i1", "4").unwrap_err();
+        assert!(
+            matches!(read, Error::Status {
+                op: "read",
+                status: 307,
+                ..
+            }),
+            "{read}"
+        );
+        // Without a body and with one.
+        for _ in 0..2 {
+            let snapshot = get_snapshot(&url, "i1", "9", &|| false).unwrap_err();
+            assert!(
+                matches!(snapshot, Error::Status {
+                    op: "get snapshot",
+                    status: 307,
+                    ..
+                }),
+                "{snapshot}"
+            );
+        }
+        let create = create_stream(&url).unwrap_err();
+        assert!(
+            matches!(create, Error::Status {
+                op: "create",
+                status: 307,
+                ..
+            }),
+            "{create}"
+        );
+        assert_eq!(server.join().unwrap().len(), 7);
+    }
+
+    // A 307 or 308 leaves an append's outcome unknown (a leader that loses its leadership answers
+    // so, and what it proposed may still be committed): a 402 after it is retried as after a 503,
+    // until an answer settles the outcome or the budget runs out. Taken to have applied nothing, it
+    // would end the append as refused with its sequence free, and the next commit, sent with that
+    // sequence, could be acknowledged as this one's duplicate, its pages never appended.
+    #[test]
+    fn a_payment_refusal_after_a_redirect_is_retried() {
+        let refused = |head: &str| answer_with_body(head, "quota exhausted");
+        let (url, server) = serve(vec![
+            answer("307 Temporary Redirect\r\nlocation: /b/s"),
+            refused("402 Payment Required"),
+            answer("200 OK\r\nstream-next-offset: 9"),
+            answer("308 Permanent Redirect\r\nlocation: /b/s"),
+            // The budget ends once a wait would pass it: a Retry-After too large to wait for.
+            refused("402 Payment Required\r\nretry-after: 18446744073709551615"),
+        ]);
+        let settled = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(settled, Append::Acked { next: Some(ref n), attempts: 3 } if n == "9"),
+            "a 402 after a 307 was taken to have applied nothing"
+        );
+        let unknown = append(&url, "i1", "p", b"x", 1, 2);
+        let Append::Failed(Error::AppendUnknown { attempts, last }) = unknown else {
+            panic!("a 402 after a 308 was taken to have applied nothing");
+        };
+        assert_eq!(attempts, 2);
+        assert!(
+            matches!(last, Attempt::Status { status: 402, ref body } if body == "quota exhausted")
+        );
+        assert_eq!(server.join().unwrap().len(), 5);
     }
 }

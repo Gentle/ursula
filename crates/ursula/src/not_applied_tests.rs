@@ -10,6 +10,7 @@ use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::LOCATION;
 use axum::response::Response;
 use tower::ServiceExt;
 use ursula_proto::http::NOT_APPLIED_HEADER;
@@ -202,27 +203,43 @@ async fn admission_marks_an_oversized_body_as_not_applied() {
     assert_eq!(not_applied(&response), Some("RequestBodyTooLarge"));
 }
 
-/// A `503` that can follow a committed proposal never carries the marker:
+/// An answer that can follow a committed proposal never carries the marker:
 /// a client that took it as "applied nothing" and reused the producer
 /// sequence for other data would have that data acknowledged as a duplicate
-/// of the committed append.
+/// of the committed append. That includes the redirect to a known leader:
+/// the gateway keeps a leader's marker after a redirect only when the
+/// redirect carried one too.
 #[tokio::test]
-async fn a_503_that_can_follow_a_proposal_carries_no_marker() {
+async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
+    const PEER: &str = "http://127.0.0.1:4437";
+    let uri = "/benchcmp/committed";
     let cases = [
         (
             "outcome unknown",
             GroupEngineError::Infra(GroupInfraError::OutcomeUnknown),
             false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
         ),
-        // OpenRaft reports a forward after `client_write` (RT1); with no
+        // OpenRaft reports a forward after `client_write` (RT1). With no
         // known leader the node answers the retryable 503.
         (
-            "forward after client_write",
+            "forward after client_write, leader unknown",
             GroupEngineError::forward_to_leader("client_write responder", None, None),
             true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+        // With a known leader it redirects there.
+        (
+            "forward after client_write, leader known",
+            GroupEngineError::forward_to_leader("client_write responder", Some(1), None),
+            true,
+            StatusCode::TEMPORARY_REDIRECT,
+            Some(format!("{PEER}{uri}")),
         ),
     ];
-    for (case, error, clustered) in cases {
+    for (case, error, clustered, status, location) in cases {
         let runtime = ShardRuntime::spawn_with_engine_factory(
             RuntimeConfig::new(1, 1),
             CommitThenFailFactory { error },
@@ -231,12 +248,11 @@ async fn a_503_that_can_follow_a_proposal_carries_no_marker() {
         let app = if clustered {
             router_with_static_raft_cluster(runtime, RaftGroupHandleRegistry::default(), [(
                 1,
-                "http://127.0.0.1:4437".to_owned(),
+                PEER.to_owned(),
             )])
         } else {
             router(runtime)
         };
-        let uri = "/benchcmp/committed";
         let created = send(
             &app,
             "PUT",
@@ -256,7 +272,15 @@ async fn a_503_that_can_follow_a_proposal_carries_no_marker() {
         )
         .await;
 
-        assert_eq!(appended.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+        assert_eq!(appended.status(), status, "{case}");
+        assert_eq!(
+            appended
+                .headers()
+                .get(LOCATION)
+                .map(|value| value.to_str().expect("an ASCII URL")),
+            location.as_deref(),
+            "{case}"
+        );
         assert_eq!(not_applied(&appended), None, "{case}");
         // The append did commit.
         let read = send(&app, "GET", &format!("{uri}?offset=-1"), &[], "").await;

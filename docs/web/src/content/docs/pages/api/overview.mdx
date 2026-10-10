@@ -62,6 +62,27 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
 curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 ```
 
+## Refusals that applied nothing
+
+A response with the `x-ursula-not-applied` header answers a request that was refused before it reached the stream. Nothing of the request was applied, whatever the status. The value is a short token that names the refusal, such as `RaftLogPressure`. Log the token, but rely only on the presence of the header.
+
+The server sets the header on every refusal of its write admission, which runs before a request reaches the stream:
+
+| Status | Token | Cause |
+| ------ | ----- | ----- |
+| `503` | `WalDiskPressure` | The WAL filesystem is below `raft.wal.min_available_size`. |
+| `503` | `RaftLogPressure` | The node's unsnapshotted Raft log is over twice `raft.snapshot_log_budget`. Writes without a body still pass. |
+| `503` | `IngressBodyBytesLimitReached` | Write bodies in flight on the node use all of `server.http_inflight_body_size`. |
+| `413` | `RequestBodyTooLarge` | The `Content-Length` is over the route's limit. |
+
+The `503` refusals also carry `Retry-After: 1` and name the token as the JSON `error`.
+
+The gateway sets the header on every request it refuses before forwarding it, and passes an upstream's header through. Its tokens are listed in the [gateway README](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-gateway/README.md#refusals-that-applied-nothing). A proxy in front of Ursula may set the header too, but only on requests it refused without passing them on.
+
+Without the header a response promises nothing. A `503` without it, or a timeout, can follow a write that committed. Retry such a write with the same `Producer-Id`, `Producer-Epoch` and `Producer-Seq`, so that the server deduplicates it (see [exactly-once writes](/docs/concepts/exactly-once-writes)).
+
+A node can answer a write with a leader redirect after it proposed the write. A client that follows redirects keeps the header of the final response only if every redirect it followed carried the header too. The gateway follows Raft leader redirects this way.
+
 ## Related concepts
 
 - [Read modes](/docs/concepts/read-modes): catch-up vs long-poll vs SSE

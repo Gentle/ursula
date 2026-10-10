@@ -27,6 +27,9 @@ identifies the Raft leader.
 - Optionally classifies Durable Streams requests as an explicit
   `bucket/stream/action` resource before forwarding them to provider-neutral
   authentication and authorization hooks.
+- Marks every request it refuses before forwarding it with the
+  `x-ursula-not-applied` response header. See
+  [Refusals That Applied Nothing](#refusals-that-applied-nothing).
 
 ## Upstream Selection
 
@@ -98,6 +101,31 @@ Other `307` responses remain visible to the client. Their `Location` header is
 reduced to the path and query so redirect-following clients such as `curl -L`
 continue through the gateway instead of connecting to internal Ursula nodes
 directly.
+
+## Refusals That Applied Nothing
+
+Every request the gateway refuses before forwarding it carries the
+`x-ursula-not-applied` response header. A client can treat such an attempt as
+having applied nothing, whatever its status. The value names the refusal:
+
+| Status | Token | Refusal |
+| ------ | ----- | ------- |
+| `404` | `NotFound` | Access control does not serve the route, or the authorizer concealed the resource |
+| `401` | `InvalidCredential` | The bearer credential is malformed or failed verification |
+| `503` | `AuthenticationUnavailable` | The credential could not be verified, for example because the token issuer is down |
+| `403` | `Forbidden` | The authorizer denied the request |
+| `503` | `AuthorizationUnavailable` | The authorizer could not decide |
+| `429` | `TenantRateLimited` | The bucket is over its request rate |
+| `429` | `TenantLiveReadsExhausted` | The bucket uses all of its live-read connections |
+| `413` | `RequestBodyTooLarge` | The body is over `--max-request-body-bytes` or the bucket's limit |
+| `400` | `RequestBodyUnreadable` | The request body could not be read |
+| `503` | `NoUpstream` | No upstream is configured |
+
+The gateway passes an upstream's `x-ursula-not-applied` through unchanged.
+After it follows a Raft leader redirect, it keeps the leader's header only if
+the redirect carried one too, because a node can redirect a write after it
+proposed it. The `502`, `503` and `504` answers the gateway gives when an
+upstream fails carry no header.
 
 ## SSE Behavior
 

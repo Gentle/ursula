@@ -146,6 +146,12 @@ gateway:
 The chart routes all configured Ingress paths to the gateway Service and its
 named Service port `gateway`.
 
+The ingress controller must not resend a write to another gateway pod. With
+ingress-nginx, set `nginx.ingress.kubernetes.io/proxy-next-upstream: "off"`,
+as `examples/tls-ingress.yaml` does. A resent write can be answered as never
+applied although the first attempt committed (see
+[redirects and retries](https://ursula.tonbo.io/docs/api/overview#redirects-and-retries)).
+
 The internal server Service and headless peer Service expose the same
 `server.ports.client` process port. Ursula's current static peer URL is used
 both for Raft/gRPC traffic and for leader redirects, so the chart keeps those

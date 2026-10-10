@@ -382,7 +382,8 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .unwrap();
     }
     // Establish the fixture with an actual fresh quorum proof. A loaded test
-    // runner can exhaust one ReadIndex round before any fault is injected.
+    // runner can exhaust one ReadIndex round before any fault is injected:
+    // the round then ends unavailable, or at the probe's own deadline (#521).
     let began = tokio::time::Instant::now();
     let proof = loop {
         match probe_rejoin_vote_barrier(
@@ -396,8 +397,12 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         {
             Ok(proof) => break proof,
             Err(crate::grpc::RecoveryProbeError::Rpc(status))
-                if status.code() == tonic::Code::Unavailable
-                    && began.elapsed() < Duration::from_secs(5) =>
+                if matches!(
+                    status.code(),
+                    tonic::Code::Unavailable
+                        | tonic::Code::Cancelled
+                        | tonic::Code::DeadlineExceeded
+                ) && began.elapsed() < Duration::from_secs(5) =>
             {
                 tokio::time::sleep(
                     Duration::from_millis(10)

@@ -228,7 +228,10 @@ leave too little of `server.http_inflight_body_size` for this one.
 
 `WalDiskPressure`, `RaftLogPressure` and `IngressBodyBytesLimitReached` are
 write admission refusals. Their responses also carry the code in
-`x-ursula-not-applied`, which means that this attempt applied nothing. See
+`x-ursula-not-applied`, which means that nothing of this attempt was
+proposed. Behind a gateway at 0.7.3 or newer, which adds
+`x-ursula-not-applied-checked`, a client can count the attempt as never
+applied. See
 [refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing).
 
 Other errors indicate cold-write backpressure for that group. Either the hot

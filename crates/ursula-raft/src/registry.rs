@@ -347,6 +347,7 @@ pub(crate) async fn confirm_recovery_barrier(
     Ok((after.vote, index))
 }
 
+pub use crate::election::IncomingTransferError;
 pub use crate::election::LeadershipTransferError;
 
 impl RaftGroupHandleRegistry {
@@ -1088,24 +1089,29 @@ impl RaftGroupHandleRegistry {
         })
     }
 
+    /// Hands a leadership transfer this node received, from a leader or from
+    /// a self-election, to OpenRaft once the election policy accepts it
+    /// (`ElectionPolicy::validate_incoming_transfer`).
     pub async fn handle_transfer_leader(
         &self,
         raft_group_id: RaftGroupId,
         request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
-    ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, GroupEngineError>
+    ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, IncomingTransferError>
     {
         let entry = self.entry(raft_group_id)?;
         let raft = entry.raft();
-        if *request.to_node_id() == raft.metrics().borrow_watched().id
-            && !self.election.may_campaign(entry.recovery.as_deref())
-        {
-            return Err(GroupEngineError::new(
-                "the recovery gate is closed; refusing leadership transfer",
-            ));
-        }
+        self.election.validate_incoming_transfer(
+            raft_group_id,
+            raft.metrics().borrow_watched().id,
+            &request,
+            entry.recovery.as_deref(),
+        )?;
         raft.handle_transfer_leader(request)
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft handle_transfer_leader: {err}")))
+            .map_err(|source| IncomingTransferError::Raft {
+                group: raft_group_id,
+                source,
+            })
     }
 
     pub async fn build_snapshot_for_transfer(

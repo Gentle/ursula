@@ -8780,8 +8780,13 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
     spawned.raft_wal.unwrap().shutdown().await.unwrap();
 }
 
+/// The leader gains nothing from electing itself again, and OpenRaft would
+/// run that election under its old leader state. Self-election on the leader
+/// is refused before it reaches OpenRaft, and the leader keeps its vote and
+/// commits. A follower's self-election and the campaign policy are covered
+/// with a three-voter group in `ursula-raft`.
 #[tokio::test]
-async fn self_election_uses_the_observed_vote_and_respects_the_recovery_gate() {
+async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
     let root = tempfile::tempdir().unwrap();
     let spawned = spawn_runtime(
         &test_config(1, 1),
@@ -8806,35 +8811,10 @@ async fn self_election_uses_the_observed_vote_and_respects_the_recovery_gate() {
         .current_leader(1, "single voter elected")
         .await
         .unwrap();
-    let admin = admin_router(HttpState::with_raft_registry(
-        runtime.clone(),
-        registry.clone(),
-    ));
-    let observed_term = raft.metrics().borrow_watched().current_term;
+    let admin = admin_router(HttpState::with_raft_registry(runtime.clone(), registry));
+    let observed = raft.metrics().borrow_watched().clone();
     let request = SelfElectionRequest {
-        current_term: observed_term,
-    };
-    let response = http_post(
-        &admin,
-        "/__ursula/raft/0/self-election",
-        &[("content-type", "application/json")],
-        Body::from(serde_json::to_vec(&request).unwrap()),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    // The observed vote matches the persisted one, so OpenRaft drops the
-    // leader lease and runs a real election: the term advances and the
-    // single voter is elected again.
-    raft.wait(Some(Duration::from_secs(5)))
-        .metrics(
-            |metrics| metrics.current_term > observed_term && metrics.current_leader == Some(1),
-            "self-election elects a leader in a newer term",
-        )
-        .await
-        .unwrap();
-    registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
-    let request = SelfElectionRequest {
-        current_term: raft.metrics().borrow_watched().current_term,
+        current_term: observed.current_term,
     };
     let response = http_post(
         &admin,
@@ -8844,6 +8824,17 @@ async fn self_election_uses_the_observed_vote_and_respects_the_recovery_gate() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
+    runtime
+        .create_stream(CreateStreamRequest::new(
+            BucketStreamId::new("benchcmp", "after-self-election"),
+            "application/octet-stream",
+        ))
+        .await
+        .expect("the leader keeps committing");
+    let after = raft.metrics().borrow_watched().clone();
+    assert_eq!(after.vote, observed.vote);
+    assert_eq!(after.current_term, observed.current_term);
+    assert_eq!(after.current_leader, Some(1));
     runtime.shutdown_group_engines().await.unwrap();
     spawned.raft_wal.unwrap().shutdown().await.unwrap();
 }

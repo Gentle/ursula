@@ -2587,6 +2587,10 @@ async fn confirm_raft_quorum(
 
 use ursula_proto::admin::SelfElectionRequest;
 
+/// Starts an election on this node's replica of the group: a leadership
+/// transfer to itself that carries the vote it observes, accepted only while
+/// the term is still the one in the body. A replica that already leads the
+/// group, or that may not campaign, is refused with `409 Conflict`.
 async fn request_raft_self_election(
     State(state): State<HttpState>,
     Path(group_id): Path<u64>,

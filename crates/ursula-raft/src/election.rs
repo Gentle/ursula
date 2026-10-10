@@ -5,9 +5,13 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use openraft::raft::TransferLeaderRequest;
+use openraft::vote::RaftLeaderId;
+use ursula_runtime::GroupEngineError;
 use ursula_shard::RaftGroupId;
 
 use crate::UrsulaRaftTypeConfig;
+use crate::UrsulaVote;
 use crate::owner::OwnerRaftHandle;
 use crate::rejoin::GroupRejoin;
 
@@ -206,6 +210,47 @@ impl ElectionPolicy {
         Ok(())
     }
 
+    /// The one policy for a leadership transfer this node receives, from a
+    /// leader or from a self-election. A transfer to another node only
+    /// drops this node's leader lease. A transfer to this node makes it
+    /// campaign, so its campaign policy must allow that, and it must not
+    /// already lead.
+    ///
+    /// OpenRaft acts on a transfer only while this node's vote equals the
+    /// vote the transfer carries, and compares the two in its core as it
+    /// handles the transfer. A transfer to this node that carries its own
+    /// committed vote can therefore act only while this node leads under
+    /// that vote. OpenRaft would then start an election that keeps the old
+    /// leader state, and a leader call before that election ends breaks
+    /// its invariant that the leader's vote is at least the node's vote
+    /// (an assertion that stops the core thread in debug builds).
+    ///
+    /// The check reads the vote in the request rather than this node's
+    /// state, so nothing can change between the check and the core. A
+    /// transfer it accepts acts only while this node holds another node's
+    /// vote or its own uncommitted vote, and OpenRaft holds leader state
+    /// under such a vote only after an election started on a leader, the
+    /// case refused here.
+    pub(crate) fn validate_incoming_transfer(
+        &self,
+        group: RaftGroupId,
+        node_id: u64,
+        request: &TransferLeaderRequest<UrsulaRaftTypeConfig>,
+        gate: Option<&GroupRejoin>,
+    ) -> Result<(), IncomingTransferError> {
+        if *request.to_node_id() != node_id {
+            return Ok(());
+        }
+        let vote = *request.from_leader();
+        if vote.is_committed() && *vote.leader_id().node_id() == node_id {
+            return Err(IncomingTransferError::AlreadyLeader { group, vote });
+        }
+        if !self.may_campaign(gate) {
+            return Err(IncomingTransferError::MayNotCampaign { group });
+        }
+        Ok(())
+    }
+
     pub(crate) fn refresh(&self, raft: &OwnerRaftHandle, gate: Option<Arc<GroupRejoin>>) {
         let policy = self.clone();
         raft.elect(move || policy.may_campaign(gate.as_deref()));
@@ -243,6 +288,33 @@ pub enum LeadershipTransferError {
         committed: Option<u64>,
     },
     #[error("OpenRaft leadership transfer failed for {group:?}: {source}")]
+    Raft {
+        group: RaftGroupId,
+        #[source]
+        source: openraft::error::Fatal<UrsulaRaftTypeConfig>,
+    },
+}
+
+/// A leadership transfer this node received and refused before OpenRaft saw
+/// it, or could not hand to OpenRaft.
+#[derive(Debug, thiserror::Error)]
+pub enum IncomingTransferError {
+    #[error(transparent)]
+    Group(#[from] GroupEngineError),
+    #[error(
+        "node already leads Raft group {group:?} under vote {vote}; refusing a leadership \
+         transfer to itself"
+    )]
+    AlreadyLeader {
+        group: RaftGroupId,
+        vote: UrsulaVote,
+    },
+    #[error(
+        "node may not campaign for Raft group {group:?} (recovery gate closed or leadership \
+         shed); refusing a leadership transfer to itself"
+    )]
+    MayNotCampaign { group: RaftGroupId },
+    #[error("OpenRaft could not take the leadership transfer for {group:?}: {source}")]
     Raft {
         group: RaftGroupId,
         #[source]

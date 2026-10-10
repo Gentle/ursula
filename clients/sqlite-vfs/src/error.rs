@@ -327,8 +327,9 @@ pub(crate) enum WriteRefusal {
         with_body(.body)
     )]
     Unauthorized { body: String },
-    /// 403 without `Producer-Epoch`: an authorizer denied the write (the server's fence names the
-    /// epoch that owns the stream).
+    /// 403 without `Producer-Epoch`, marked `x-ursula-not-applied`: an authorizer denied the write
+    /// before passing it on (the server's fence names the epoch that owns the stream, and an
+    /// unmarked 403 may have replaced the stream's own answer: `client::append`).
     #[error("403{}: an authorizer denied it", with_body(.body))]
     Forbidden { body: String },
     /// 429 until the retry budget ran out, unmarked (`NotApplied` otherwise).
@@ -336,8 +337,9 @@ pub(crate) enum WriteRefusal {
     RateLimited { body: String },
     /// An answer marked `x-ursula-not-applied` (the server's ingress admission, a gateway or a
     /// proxy refusing it before passing it on): a final one, or the last one when the retry budget
-    /// ran out. `reason` is the marker's token (`RaftLogPressure`, say).
-    #[error("{status} (not applied: {reason})")]
+    /// ran out. A marked 401, 402 or 403 keeps its own kind. `reason` is the marker's token
+    /// (`RaftLogPressure`, say), empty when it has none.
+    #[error("{status} (not applied{})", with_token(.reason))]
     NotApplied { status: u16, reason: String },
 }
 
@@ -419,6 +421,16 @@ fn with_body(body: &str) -> String {
         String::new()
     } else {
         format!(" {body}")
+    }
+}
+
+/// `: token` for a marker's token, nothing for an empty one.
+fn with_token(token: &str) -> String {
+    let token = token.trim();
+    if token.is_empty() {
+        String::new()
+    } else {
+        format!(": {token}")
     }
 }
 

@@ -175,6 +175,14 @@ impl Db {
         self.log > self.snapshot_due_bytes()
     }
 
+    /// A snapshot is due and may be taken now: never while the database is poisoned, nor while
+    /// writes are refused before they reach the stream, whatever refused them (`refused`): its
+    /// publish would be refused too. The next acknowledged commit clears the refusal and requests
+    /// one if it is still due.
+    pub(crate) fn snapshot_wanted(&self) -> bool {
+        self.snapshot_due() && self.poisoned.is_none() && self.refused.is_none()
+    }
+
     /// The log size past which a snapshot is due: the database's size, or the configured minimum
     /// (`URSULA_VFS_SNAPSHOT_MIN_BYTES`) when larger.
     pub(crate) fn snapshot_due_bytes(&self) -> u64 {
@@ -509,6 +517,42 @@ mod tests {
         d.writes_refused(payment("quota exhausted"), "snapshot publish");
         d.writes_refused(pressure, "commit");
         assert!(d.refused.is_none() && d.fenced());
+    }
+
+    // A due snapshot waits while writes are refused, whatever refused them (its publish would be
+    // refused too), and while the database is poisoned. An acknowledged commit lets it go again.
+    #[test]
+    fn no_snapshot_while_writes_are_refused() {
+        let mut d = Db::for_tests();
+        assert!(!d.snapshot_wanted(), "not due");
+        d.log = u64::MAX;
+        assert!(d.snapshot_due() && d.snapshot_wanted());
+        for refusal in [
+            WriteRefusal::NotApplied {
+                status: 503,
+                reason: "RaftLogPressure".into(),
+            },
+            WriteRefusal::Unauthorized {
+                body: String::new(),
+            },
+            WriteRefusal::Forbidden {
+                body: String::new(),
+            },
+            WriteRefusal::RateLimited {
+                body: String::new(),
+            },
+            WriteRefusal::PaymentRequired {
+                body: String::new(),
+            },
+        ] {
+            let kind = refusal.kind();
+            d.refuse(refusal);
+            assert!(!d.snapshot_wanted(), "{kind}");
+            d.writes_accepted();
+            assert!(d.snapshot_wanted(), "{kind}");
+        }
+        d.poison(Error::ProducerExpiredAgain);
+        assert!(!d.snapshot_wanted());
     }
 
     #[test]

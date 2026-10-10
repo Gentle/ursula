@@ -1,7 +1,7 @@
 // Writes refused before they reach the stream for other reasons than a 402: answers marked
 // `x-ursula-not-applied` (the server's admission while it is under write pressure, a gateway that
-// cannot authorize a request), a token refused until the retry budget runs out, and an authorizer's
-// 403. Nothing of such a write was applied, so it fails alone, as a refused 402 does: the commit is
+// cannot authorize a request, an authorizer's 403), and a token refused until the retry budget runs
+// out. Nothing of such a write was applied, so it fails alone, as a refused 402 does: the commit is
 // rolled back but the file is not poisoned, reads go on, and the next commit goes out as usual and
 // succeeds once the refusals stop. An attempt whose outcome is unknown among the refusals still
 // poisons: the commit may be in the stream. The refusing layer is `gate.mjs`.
@@ -16,9 +16,13 @@ import { type Child, type ChildLine, Gate, openPlain, runChild, streamPath, ursu
 const COMMIT_REFUSED = 7178;
 /** SQLITE_IOERR_WRITE: a commit that poisons the file. */
 const POISONED = 778;
+/** SQLITE_ERROR: an attach that failed for any other reason than a refusal. */
+const SQLITE_ERROR = 1;
 /** The server's answer while its Raft log is over its hard limit, marked as applying nothing. */
 const PRESSURE = { status: 503, headers: { "x-ursula-not-applied": "RaftLogPressure", "retry-after": "1" } };
 const PRESSURE_BODY = '{"error":"RaftLogPressure"}';
+/** An authorizer's denial, marked as applying nothing the way Ursula's gateway marks it. */
+const DENIED = { status: 403, headers: { "x-ursula-not-applied": "Forbidden" } };
 /** A retry budget that runs out after two attempts answered `Retry-After: 1`. */
 const SHORT_BUDGET = { URSULA_VFS_RETRY_MS: "1500" };
 
@@ -138,31 +142,37 @@ it("an append whose answer was lost and whose retries are refused as applying no
 	expect(xs(copy)).toEqual(["once"]);
 });
 
-// An authorizer's 403 (without `Producer-Epoch`, which only the server's fence carries) is final and
-// applied nothing: the commit fails alone at once, without waiting out the budget. An attach whose
+// An authorizer's 403 marked `x-ursula-not-applied` (as Ursula's gateway marks its denials) is final
+// and applied nothing: the commit fails alone at once, without waiting out the budget. An attach whose
 // claim it refuses claims nothing and throws UrsulaWriteRefusedError, and a read-only attach reads the
-// database meanwhile.
-it("an authorizer's 403 fails a commit alone at once, and an attach it refuses throws UrsulaWriteRefusedError", async () => {
+// database meanwhile. Without the marker a 403 says nothing about the stream (a filtering proxy can send
+// one after the stream applied the write): the commit poisons, and the attach fails as before.
+it("an authorizer's marked 403 fails a commit alone at once, and an attach it refuses throws UrsulaWriteRefusedError", async () => {
 	const path = streamPath();
 	const file = freshFile();
-	const [refusing, accepting] = [`${file}.refusing`, `${file}.accepting`];
-	const steps = ["CREATE TABLE t(x TEXT)", `@wait:${refusing}`, "INSERT INTO t VALUES ('d1')", "@status", `@wait:${accepting}`, "INSERT INTO t VALUES ('d2')"];
+	const [refusing, accepting, unmarked] = [`${file}.refusing`, `${file}.accepting`, `${file}.unmarked`];
+	const steps = ["CREATE TABLE t(x TEXT)", `@wait:${refusing}`, "INSERT INTO t VALUES ('d1')", "@status", `@wait:${accepting}`, "INSERT INTO t VALUES ('d2')", `@wait:${unmarked}`, "INSERT INTO t VALUES ('d3')"];
 	const child = runChild(file, gate.url + path, steps, { CHILD_EXIT: "1" });
 	await child.waitFor((l) => l.step === 1 && l.phase === "start");
-	await gate.refuse("write access denied", { status: 403 });
+	await gate.refuse("write access denied", DENIED);
 	writeFileSync(refusing, "");
 	await child.waitFor((l) => l.step === 4 && l.phase === "start");
 	await gate.refuse(null);
 	writeFileSync(accepting, "");
+	await child.waitFor((l) => l.step === 6 && l.phase === "start");
+	await gate.refuse("write access denied", { status: 403 });
+	writeFileSync(unmarked, "");
 	const done = await child.waitFor((l) => l.done === true);
 	expect((await child.exited).code, child.stderr()).toBe(0);
 	expect(step(child, 2)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
 	expect(step(child, 3)?.status).toMatchObject({ poisoned: false, fenced: false, writes_refused: true, refused_kind: "forbidden", refused_reason: "write access denied" });
 	expect(step(child, 5)?.ok).toBe(true);
-	expect(done).toMatchObject({ poisoned: false, writes_refused: false, attempts: [1, 1] });
+	expect(step(child, 7)).toMatchObject({ ok: false, errcode: POISONED });
+	expect(done).toMatchObject({ poisoned: true, fenced: false, writes_refused: false, refused_kind: null, attempts: [1, 1] });
+	expect(done.reason).toMatch(/append \S+: 403/);
 	expect(child.stderr()).not.toMatch(/event=append_retry/);
 
-	await gate.refuse("write access denied", { status: 403 });
+	await gate.refuse("write access denied", DENIED);
 	const reader = freshFile();
 	let error: unknown;
 	try {
@@ -176,13 +186,22 @@ it("an authorizer's 403 fails a commit alone at once, and an attach it refuses t
 	expect((error as Error).message).toMatch(/claim \S+: 403 write access denied: an authorizer denied it/);
 	expect(errcode((error as Error).cause)).toBe(COMMIT_REFUSED);
 	expect(() => openPlain(reader)).toThrow(/unable to open database file/);
+	await gate.refuse("write access denied", { status: 403 });
+	let unmarkedError: unknown;
+	try {
+		attach(reader, gate.url + path);
+	} catch (e) {
+		unmarkedError = e;
+	}
+	expect(unmarkedError).not.toBeInstanceOf(UrsulaWriteRefusedError);
+	expect(errcode(unmarkedError)).toBe(SQLITE_ERROR);
 	attach(reader, gate.url + path, { readOnly: true });
 	expect(xs(reader)).toEqual(["d2"]);
 });
 
-it("Pi: a commit an authorizer refuses with 403 rejects with UrsulaWriteRefusedError, and the storage commits again once it is allowed", async () => {
+it("Pi: a commit an authorizer refuses with a marked 403 rejects with UrsulaWriteRefusedError, and the storage commits again once it is allowed", async () => {
 	const storage = await openUrsulaPiStorage(freshFile(), gate.url + streamPath());
-	await gate.refuse("write access denied", { status: 403 });
+	await gate.refuse("write access denied", DENIED);
 	const error = await openHarness(storage).then(
 		() => undefined,
 		(e: unknown) => e,

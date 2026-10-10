@@ -39,7 +39,7 @@ db.exec("PRAGMA journal_mode=WAL");
 
 The extension is loaded once per process and becomes SQLite's default VFS there. Files that were never attached are not affected.
 
-When a commit is refused before it reaches the stream, that commit fails alone. Examples are a `402 Payment Required` from a quota or billing service in front of the stream, an authorizer's `403`, or a server that refuses writes for a while under sustained load (marked `x-ursula-not-applied`). The file is not poisoned, reads keep working, and the next commit succeeds once the refusals stop. Through `openUrsulaPiStorage` the refused commit rejects with `UrsulaWriteRefusedError` (`UrsulaPaymentRequiredError` for a `402`).
+When a commit is refused before it reaches the stream, that commit fails alone. Examples are a `402 Payment Required` from a quota or billing service in front of the stream, and any answer marked `x-ursula-not-applied`, such as a server that refuses writes for a while under sustained load or a gateway whose authorizer denies the write. The file is not poisoned, reads keep working, and the next commit succeeds once the refusals stop. Through `openUrsulaPiStorage` the refused commit rejects with `UrsulaWriteRefusedError` (`UrsulaPaymentRequiredError` for a `402`).
 
 `attach(file, url, { readOnly: true })` reads a database without claiming its stream. It never writes the stream, so it does not fence the owner, and every write to the file fails.
 

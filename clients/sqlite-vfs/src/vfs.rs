@@ -1130,6 +1130,8 @@ mod tests {
     // offset, so the next commit goes out with the same producer sequence and is acknowledged once
     // the refusals stop. One attempt whose outcome is unknown among the refusals poisons instead:
     // the append may be in the stream, and the next commit would be acknowledged as its duplicate.
+    // So does a 403 that does not say it applied nothing (a filtering proxy may have sent it after
+    // the stream applied the append).
     #[test]
     fn a_commit_refused_before_the_stream_fails_alone_but_an_unknown_outcome_poisons() {
         let (url, server) = serve(vec![
@@ -1138,15 +1140,17 @@ mod tests {
             pressure("RaftLogPressure", LAST),
             // The token refused until the budget runs out.
             answer(&format!("401 Unauthorized\r\n{LAST}")),
-            // An authorizer's denial: at once.
-            answer("403 Forbidden"),
+            // An authorizer's denial, marked: at once.
+            answer("403 Forbidden\r\nx-ursula-not-applied: Forbidden"),
             // Accepted again.
             answer("200 OK\r\nstream-next-offset: 00000000000000000012"),
             // No answer, then refusals until the budget runs out.
             String::new(),
             pressure("RaftLogPressure", LAST),
+            // Another owner: a denial without the marker.
+            answer("403 Forbidden"),
         ]);
-        let mut d = owner(url);
+        let mut d = owner(url.clone());
         assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
         assert!(d.poisoned.is_none());
         assert_eq!(
@@ -1172,12 +1176,19 @@ mod tests {
             Some(Error::AppendUnknown { attempts: 2, .. })
         ));
         assert!(!d.fenced() && d.refused.is_none());
+        let mut e = owner(url);
+        assert_eq!(e.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_WRITE));
+        assert!(matches!(
+            e.poisoned.as_ref().map(|p| &p.first),
+            Some(Error::Unauthorized { status: 403, .. })
+        ));
+        assert!(!e.fenced() && e.refused.is_none());
         let requests = server.join().unwrap();
         let seqs: Vec<&str> = requests
             .iter()
             .map(|r| request_header(r, "producer-seq").unwrap())
             .collect();
-        assert_eq!(seqs, ["5", "5", "5", "5", "5", "6", "6"]);
+        assert_eq!(seqs, ["5", "5", "5", "5", "5", "6", "6", "5"]);
     }
 
     // The server expired the owner's producer: the owner takes the stream back before the commit

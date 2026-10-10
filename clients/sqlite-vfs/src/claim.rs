@@ -223,14 +223,16 @@ mod tests {
     use crate::frame::PAGE;
 
     // A claim refused before it reached the stream claimed nothing: the attach fails with the
-    // refusal (`ursula_attach` reports it with a code of its own), and reads nothing back.
+    // refusal (`ursula_attach` reports it with a code of its own), and reads nothing back. A 403
+    // that does not say so (unmarked) fails it as unauthorized, as any other failed claim.
     #[test]
     fn a_claim_refused_before_the_stream_claims_nothing() {
         let (url, server) = serve(vec![
-            answer("403 Forbidden"),
+            answer("403 Forbidden\r\nx-ursula-not-applied: Forbidden"),
             answer(&format!(
                 "503 Service Unavailable\r\nx-ursula-not-applied: RaftLogPressure\r\n{LAST}"
             )),
+            answer("403 Forbidden"),
         ]);
         let denied = claim(&url, "i1", "p", 3, START).unwrap_err();
         assert!(matches!(denied, Error::Refused {
@@ -244,7 +246,9 @@ mod tests {
             refusal: WriteRefusal::NotApplied { status: 503, .. },
             ..
         }));
-        assert_eq!(server.join().unwrap().len(), 2);
+        let unmarked = claim(&url, "i1", "p", 3, START).unwrap_err();
+        assert!(matches!(unmarked, Error::Unauthorized { status: 403, .. }));
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     // A claim is ours only if it is the frame ending at the answered offset (the bytes read from a

@@ -43,17 +43,19 @@
 //!   reflected locally) advances. On a rejection or an exhausted retry budget the overlay is
 //!   dropped, the write fails with SQLITE_IOERR_WRITE (SQLite rolls the transaction back) and the
 //!   database is poisoned until it is re-attached. A commit refused before it reached the stream
-//!   fails the transaction alone with SQLITE_IOERR_AUTH: a 402 or a 403 without `Producer-Epoch`
-//!   from a layer in front of the stream (an authorizer, a quota or billing service) at once, and
-//!   401s, 429s and answers marked `x-ursula-not-applied` (the server's ingress admission under
-//!   pressure, a gateway or a proxy that refused it before passing it on) once the retry budget
-//!   runs out on them. Nothing of it reached the stream, so the database is not poisoned, reads go
-//!   on from the local files, and the next commit is sent as usual (the epoch and the claim stay
-//!   valid). Unless an attempt of the append may have reached the stream (no answer, or an
-//!   unmarked 5xx): its outcome is then unknown, and the commit poisons as on an exhausted budget
-//!   (see `client::append`). The overlay belongs to the write transaction: it is cleared whenever
-//!   the WAL write lock is taken or released, so a rolled-back transaction's spilled frames never
-//!   shadow a later one's.
+//!   fails the transaction alone with SQLITE_IOERR_AUTH: a 402 from a layer in front of the stream
+//!   (an authorizer, a quota or billing service) or a 4xx marked `x-ursula-not-applied` (an
+//!   authorizer's 403 among them) at once, and 401s, 429s and 5xx marked `x-ursula-not-applied`
+//!   (the server's ingress admission under pressure, a gateway or a proxy that refused it before
+//!   passing it on) once the retry budget runs out on them. Nothing of it reached the stream, so
+//!   the database is not poisoned, reads go on from the local files, and the next commit is sent
+//!   as usual (the epoch and the claim stay valid). Unless an attempt of the append may have
+//!   reached the stream (no answer, or an unmarked 5xx): its outcome is then unknown, and the
+//!   commit poisons as on an exhausted budget (see `client::append`). So does an unmarked 403
+//!   without `Producer-Epoch`, which a filtering proxy may send in place of the stream's own
+//!   answer. The overlay belongs to the write transaction: it is cleared whenever the WAL write
+//!   lock is taken or released, so a rolled-back transaction's spilled frames never shadow a later
+//!   one's.
 //! * Durability is the stream's acknowledgement alone: the local files (db, -wal, -shm, sidecar)
 //!   are a cache, not fsynced on the commit path (`xSync` of an attached database is a no-op,
 //!   whatever `PRAGMA synchronous` says). The sidecar records the kernel's boot id, the stream's
@@ -74,7 +76,8 @@
 //!   db file's pages, fsyncs the WAL and the db file (a write-back error poisons the database, and
 //!   nothing is published), publishes the pages at the stream offset they reflect, reads the
 //!   snapshot back and only then advances the stream's retention to the *previous* snapshot's
-//!   offset. A publish or retention move refused with 402 waits for the next acknowledged commit.
+//!   offset. A publish or retention move refused with 402, like a commit refused before it reached
+//!   the stream, holds snapshots until the next acknowledged commit.
 //!   Attach installs the latest snapshot when the local file is missing or behind it, then replays
 //!   the tail.
 //! * `SELECT ursula_status(path)` returns

@@ -131,8 +131,9 @@ enum Refused {
     /// the request until something is paid or settled. Final for the request, never a fence, and
     /// nothing of it reached the stream (unless an earlier attempt of an append did: `append`).
     PaymentRequired,
-    /// A 403 without `Producer-Epoch`: an authorizer denied the request. Final, never a fence, and
-    /// nothing of it reached the stream (unless an earlier attempt of an append did: `append`).
+    /// A 403 without `Producer-Epoch`: an authorizer denied the request. Final, and never a fence.
+    /// Nothing of it reached the stream only when the answer is marked `x-ursula-not-applied`
+    /// (see `append`): a filtering proxy can answer 403 in place of the stream's own answer.
     Denied,
     /// A 403 with `Producer-Epoch`: the server's fence, which names the epoch that owns the stream
     /// (only an append can meet it).
@@ -313,17 +314,19 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// producer at its epoch, so whatever holds (epoch, seq) there is ours. A claim's answer is
 /// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
 ///
-/// An attempt answered 401, 402, 403 without `Producer-Epoch` or 429, or marked
-/// `x-ursula-not-applied` whatever its status, is taken to have applied nothing, which every layer
-/// in front of the stream must ensure (design doc §2): one that passed the append on and then
-/// answered so would have the next commit acknowledged as this one's duplicate, its pages never
-/// appended. While no attempt of the append can have reached the stream, a 402, a 403 or a marked
-/// final answer (another 4xx) ends it as [`Append::Refused`] at once, and the retried ones (401,
-/// 429, a marked 5xx) end it so once the budget runs out. After an attempt whose outcome is
-/// unknown (no answer, or an unmarked 5xx), the append may be in the stream, and the next commit,
-/// sent with the same sequence, would be acknowledged as its duplicate. Its refusals then prove
-/// nothing: a 402 is retried like an unknown outcome, until an answer settles it or the budget
-/// runs out ([`Error::AppendUnknown`]), and a 403 fails it.
+/// An attempt answered 401, 402 or 429, or marked `x-ursula-not-applied` whatever its status, is
+/// taken to have applied nothing, which every layer in front of the stream must ensure (design doc
+/// §2): one that passed the append on and then answered so would have the next commit acknowledged
+/// as this one's duplicate, its pages never appended. A 403 without `Producer-Epoch` counts only
+/// when marked: a filtering proxy can answer 403 in place of the stream's own answer, after the
+/// stream applied the append, so an unmarked one fails the append, as before 0.7.3. While no
+/// attempt of the append can have reached the stream, a 402 or a marked final answer (any other
+/// 4xx, an authorizer's 403 among them) ends it as [`Append::Refused`] at once, and the retried
+/// ones (401, 429, a marked 5xx) end it so once the budget runs out. After an attempt whose outcome
+/// is unknown (no answer, or an unmarked 5xx), the append may be in the stream, and the next
+/// commit, sent with the same sequence, would be acknowledged as its duplicate. Its refusals then
+/// prove nothing: a 402 is retried like an unknown outcome, until an answer settles it or the
+/// budget runs out ([`Error::AppendUnknown`]), and a 403 fails it.
 pub(crate) fn append(
     url: &str,
     incarnation: &str,
@@ -364,7 +367,8 @@ pub(crate) fn append(
                 let marked = not_applied(&r);
                 match refused(&r) {
                     Some(Refused::Fenced { current }) => return Append::Fenced { current },
-                    Some(Refused::Denied) if !reached => {
+                    // Unmarked, the denial may have replaced the stream's answer (see above).
+                    Some(Refused::Denied) if !reached && marked.is_some() => {
                         return Append::Refused(WriteRefusal::Forbidden {
                             body: body_text(&mut r),
                         });
@@ -797,7 +801,9 @@ pub(crate) mod mock {
     pub(crate) const LAST: &str = "retry-after: 18446744073709551615";
 
     /// Answers one connection per answer, in order, and returns each request's head. An empty
-    /// answer closes the connection without one: the attempt's outcome is unknown.
+    /// answer closes the connection without one: the attempt's outcome is unknown. The request's
+    /// body is read whole before the answer: a connection closed with unread bytes is reset, which
+    /// can drop the answer before the client reads it.
     pub(crate) fn serve(answers: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/b/s", listener.local_addr().unwrap());
@@ -812,8 +818,12 @@ pub(crate) mod mock {
                         conn.read_exact(&mut byte).unwrap();
                         request.push(byte[0]);
                     }
+                    let head = String::from_utf8_lossy(&request).into_owned();
+                    let len =
+                        request_header(&head, "content-length").map_or(0, |n| n.parse().unwrap());
+                    conn.read_exact(&mut vec![0u8; len]).unwrap();
                     conn.write_all(answer.as_bytes()).unwrap();
-                    String::from_utf8_lossy(&request).into_owned()
+                    head
                 })
                 .collect()
         });
@@ -940,20 +950,26 @@ mod tests {
     // Every request carries the token. A 401 is an authorizer refusing it: the request is sent
     // again (with the token read again) within the retry budget, a create too. A 403 is a fence
     // only with the epoch that owns the stream (the server's); without it, an authorizer's final
-    // denial, never taken for a fence: it refuses an append none of whose attempts can have
-    // reached the stream (nothing was appended), and fails one whose outcome is unknown.
+    // denial, never taken for a fence. Marked `x-ursula-not-applied`, it refuses an append none of
+    // whose attempts can have reached the stream (nothing was appended). Unmarked (a filtering
+    // proxy may have answered it after the stream applied the append), or after an attempt whose
+    // outcome is unknown, it fails the append.
     #[test]
     fn auth_refusals_are_retried_or_final_never_fences() {
         set_token(Some("t1"));
+        let denied =
+            |marker: &str| answer_with_body(&format!("403 Forbidden{marker}"), "read only");
+        let marked = "\r\nx-ursula-not-applied: Forbidden";
         let (url, server) = serve(vec![
             answer("401 Unauthorized\r\nwww-authenticate: Bearer error=\"invalid_token\""),
             answer("200 OK\r\nstream-next-offset: 9"),
             answer("401 Unauthorized"),
             answer("200 OK\r\nstream-incarnation: i1"),
             answer("403 Forbidden\r\nproducer-epoch: 4"),
-            answer_with_body("403 Forbidden", "read only"),
+            denied(marked),
+            denied(""),
             answer("503 Service Unavailable\r\nretry-after: 0"),
-            answer("403 Forbidden"),
+            denied(marked),
             answer("401 Unauthorized"),
             answer("201 Created"),
         ]);
@@ -969,6 +985,11 @@ mod tests {
         assert!(
             matches!(&denied, Append::Refused(WriteRefusal::Forbidden { body }) if body == "read only")
         );
+        let unmarked = append(&url, "i1", "p", b"x", 1, 2);
+        assert!(matches!(
+            unmarked,
+            Append::Failed(Error::Unauthorized { status: 403, .. })
+        ));
         let after_unknown = append(&url, "i1", "p", b"x", 1, 2);
         assert!(matches!(
             after_unknown,
@@ -977,7 +998,7 @@ mod tests {
         create_stream(&url).unwrap();
         set_token(None);
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 10);
+        assert_eq!(requests.len(), 11);
         for request in &requests {
             assert!(
                 request
@@ -1113,8 +1134,9 @@ mod tests {
 
     // Answers that applied nothing (401, 429, or marked `x-ursula-not-applied`, whatever the
     // status) leave the outcome known: when the budget runs out on them, the append is refused,
-    // with the last answer's reason (the marker's token when there is one), and the producer
-    // sequence is free. A marked final answer refuses it at once.
+    // with the last answer's reason (the marker's token when there is one, cut like a body; an
+    // empty marker still marks), and the producer sequence is free. A marked final answer refuses
+    // it at once.
     #[test]
     fn refusals_that_applied_nothing_refuse_the_append_when_the_budget_runs_out() {
         let marked = |status: &str, token: &str, last: &str| {
@@ -1144,8 +1166,11 @@ mod tests {
             // A marked 429 is named by its marker.
             marked("429 Too Many Requests", "TenantRateLimited", LAST),
             // A marked final answer: refused at once. Unmarked: rejected (poisons).
-            answer("413 Payload Too Large\r\nx-ursula-not-applied: BodyTooLarge"),
+            answer("413 Payload Too Large\r\nx-ursula-not-applied: RequestBodyTooLarge"),
             answer("413 Payload Too Large"),
+            // A marker without a token, and one with a token too long to show whole.
+            marked("503 Service Unavailable", "", LAST),
+            marked("503 Service Unavailable", &"x".repeat(300), LAST),
         ]);
         let unauthorized = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
@@ -1168,14 +1193,27 @@ mod tests {
         let too_large = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
             &too_large,
-            Append::Refused(WriteRefusal::NotApplied { status: 413, reason }) if reason == "BodyTooLarge"
+            Append::Refused(WriteRefusal::NotApplied { status: 413, reason }) if reason == "RequestBodyTooLarge"
         ));
         let rejected = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
             rejected,
             Append::Failed(Error::AppendRejected { status: 413, .. })
         ));
-        assert_eq!(server.join().unwrap().len(), 10);
+        let Append::Refused(empty) = append(&url, "i1", "p", b"x", 1, 1) else {
+            panic!("an empty marker does not mark");
+        };
+        assert_eq!(empty.to_string(), "503 (not applied)");
+        assert!(
+            matches!(empty, WriteRefusal::NotApplied { status: 503, .. })
+                && empty.reason().is_none()
+        );
+        let long = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            &long,
+            Append::Refused(WriteRefusal::NotApplied { status: 503, reason }) if *reason == "x".repeat(256)
+        ));
+        assert_eq!(server.join().unwrap().len(), 12);
     }
 
     // One attempt whose outcome is unknown (no answer, an unmarked 5xx) and the append may be in
@@ -1201,7 +1239,7 @@ mod tests {
             answer(&format!("401 Unauthorized\r\n{LAST}")),
             // An unmarked 503, then a marked final answer.
             answer("503 Service Unavailable\r\nretry-after: 0"),
-            answer("413 Payload Too Large\r\nx-ursula-not-applied: BodyTooLarge"),
+            answer("413 Payload Too Large\r\nx-ursula-not-applied: RequestBodyTooLarge"),
         ]);
         let unknown = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(

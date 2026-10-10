@@ -215,10 +215,13 @@ export class UrsulaReplicationError extends Error {
  *
  * - `payment_required`: a layer in front of the stream answered `402 Payment Required`;
  * - `unauthorized`: the token was refused (`401`) until the retry budget ran out;
- * - `forbidden`: an authorizer denied the write (`403` without `Producer-Epoch`);
+ * - `forbidden`: an authorizer denied the write with a `403` marked `x-ursula-not-applied` (an unmarked
+ *   `403` fails the commit and poisons the file, since a filtering proxy can send one after the stream
+ *   applied the write);
  * - `rate_limited`: `429` until the retry budget ran out;
- * - `not_applied`: answers marked `x-ursula-not-applied` (the server under write pressure, or a gateway
- *   that could not authorize the request) until the retry budget ran out, or a marked final answer.
+ * - `not_applied`: other answers marked `x-ursula-not-applied` (the server under write pressure, or a
+ *   gateway that could not authorize the request) until the retry budget ran out, or a marked final
+ *   answer such as a `413`.
  */
 export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden" | "rate_limited" | "not_applied";
 
@@ -237,7 +240,7 @@ export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden"
  * `attach` turns them into this error and {@link UrsulaPaymentRequiredError}.
  */
 export class UrsulaWriteRefusedError extends Error {
-	/** What refused it, for a refused commit (`null` for a refused attach, whose message names it). */
+	/** What refused it, for a refused commit. `null` for an attach refused other than with a `402`, whose message names it. */
 	readonly kind: WriteRefusedKind | null;
 	/** Why (`refused_reason`), for a refused commit: `null` when the layer sent no explanation, and for a refused attach, whose message carries it. */
 	readonly reason: string | null;

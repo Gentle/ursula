@@ -2371,27 +2371,42 @@ mod reconnect_tests {
     }
 
     /// #507: `raft_grpc_append_stream_frame_bytes_max` reports the largest request frame sent,
-    /// as the encoded bytes of its calls before compression. The gauge is process-wide, so other
-    /// tests' frames can only raise it, and they are far smaller than this one.
+    /// as the encoded bytes of its calls before compression. The gauge is process-wide, and no
+    /// other test sends a frame anywhere near 1 MiB through a live session, so it reads less than
+    /// one such frame before this test sends any. After two of them it reads the size of one,
+    /// where a sum would read two, and a smaller frame after them does not lower it.
     #[tokio::test]
     async fn append_stream_frame_bytes_max_reports_the_largest_frame_sent() {
+        let gauge = || raft_grpc_metrics_snapshot().raft_grpc_append_stream_frame_bytes_max;
         let transport = Arc::new(CoreRaftTransport::default());
         let (endpoint, _registry, server) = spawn_append_stream_server().await;
-        let envelope = raft_internal_proto::RaftRpcEnvelopeV1 {
+        let network = test_network(transport, RaftGroupId(1), 2, endpoint);
+        let envelope_of = |payload_bytes: usize| raft_internal_proto::RaftRpcEnvelopeV1 {
             raft_group_id: 1,
             node_id: 2,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            payload: vec![7_u8; 1024 * 1024].into(),
+            payload: vec![7_u8; payload_bytes].into(),
         };
-        let frame_bytes = u64::try_from(envelope.encoded_len()).expect("fits in u64");
-        let status = test_network(transport, RaftGroupId(1), 2, endpoint)
-            .try_append_stream(envelope, RPCOption::new(Duration::from_secs(10)))
-            .await
-            .expect_err("the peer hosts no group");
-        // The peer answered the call, so its frame went out.
-        assert_eq!(status.code(), tonic::Code::NotFound);
+        let large = envelope_of(1024 * 1024);
+        let frame_bytes = u64::try_from(large.encoded_len()).expect("fits in u64");
+        let before = gauge();
         assert!(
-            raft_grpc_metrics_snapshot().raft_grpc_append_stream_frame_bytes_max >= frame_bytes
+            before < frame_bytes,
+            "a {before} B frame went out before this test's"
+        );
+        // Each call waits for its answer, so each goes out in a frame of its own.
+        for envelope in [large.clone(), large, envelope_of(1024)] {
+            let status = network
+                .try_append_stream(envelope, RPCOption::new(Duration::from_secs(10)))
+                .await
+                .expect_err("the peer hosts no group");
+            // The peer answered the call, so its frame went out.
+            assert_eq!(status.code(), tonic::Code::NotFound);
+        }
+        let max = gauge();
+        assert!(
+            (frame_bytes..2 * frame_bytes).contains(&max),
+            "the largest frame is {frame_bytes} B, and the gauge reads {max} B"
         );
         server.abort();
     }

@@ -867,16 +867,19 @@ async fn a_limited_read_weighs_cached_entries_too() {
 /// stops inside the pending batch, a pending entry over the whole limit
 /// comes alone rather than leaving the read empty, and a durable prefix that
 /// stops early is never followed by pending entries past the gap, which the
-/// replication reader would refuse as a fatal storage error. The durable
-/// prefix comes from the cache, then from disk with a 2 MiB per-group cache,
-/// each group's share of the default 256 MiB `cache_size` at 128 groups.
+/// replication reader would refuse as a fatal storage error. Here the
+/// durable prefix comes from the cache.
 #[tokio::test]
-async fn a_limited_read_weighs_pending_entries_and_keeps_them_consecutive() {
-    for (group_cache_bytes, durable_from_disk) in
-        [(64 * 1024 * 1024, false), (2 * 1024 * 1024, true)]
-    {
-        limited_reads_of_pending_entries(group_cache_bytes, durable_from_disk).await;
-    }
+async fn a_limited_read_weighs_pending_entries_after_a_cached_prefix() {
+    limited_reads_of_pending_entries(64 * 1024 * 1024, false).await;
+}
+
+/// [`a_limited_read_weighs_pending_entries_after_a_cached_prefix`] with a
+/// 2 MiB per-group cache, each group's share of the default 256 MiB
+/// `cache_size` at 128 groups, so the durable prefix comes from disk.
+#[tokio::test]
+async fn a_limited_read_weighs_pending_entries_after_a_prefix_from_disk() {
+    limited_reads_of_pending_entries(2 * 1024 * 1024, true).await;
 }
 
 async fn limited_reads_of_pending_entries(group_cache_bytes: u64, durable_from_disk: bool) {
@@ -942,11 +945,21 @@ async fn limited_reads_of_pending_entries(group_cache_bytes: u64, durable_from_d
         flushes.push(result);
     }
 
-    for (store, expected, from_disk) in [
-        (&only_pending, &[1, 2, 3][..], false),
-        (&after_durable, &[1, 2, 3][..], durable_from_disk),
-        (&after_a_stop, &[1, 2, 3][..], durable_from_disk),
-        (&oversized_first, &[1][..], false),
+    for (label, store, expected, from_disk) in [
+        ("only_pending", &only_pending, &[1, 2, 3][..], false),
+        (
+            "after_durable",
+            &after_durable,
+            &[1, 2, 3][..],
+            durable_from_disk,
+        ),
+        (
+            "after_a_stop",
+            &after_a_stop,
+            &[1, 2, 3][..],
+            durable_from_disk,
+        ),
+        ("oversized_first", &oversized_first, &[1][..], false),
     ] {
         let misses = core.metrics.snapshot().wal_cache_misses;
         let mut reader = store.clone();
@@ -957,16 +970,19 @@ async fn limited_reads_of_pending_entries(group_cache_bytes: u64, durable_from_d
             .into_iter()
             .map(|entry| entry.log_id.index)
             .collect::<Vec<_>>();
-        assert_eq!(read, expected);
+        assert_eq!(read, expected, "{label}, {group_cache_bytes} B group cache");
         assert_eq!(
             core.metrics.snapshot().wal_cache_misses > misses,
             from_disk,
-            "whether the durable prefix came from disk"
+            "{label}, {group_cache_bytes} B group cache: whether the durable prefix came from disk"
         );
     }
     // No append has completed, so every read above found its batch pending.
     for flush in &mut flushes {
-        assert!(matches!(flush.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            matches!(flush.try_recv(), Err(TryRecvError::Empty)),
+            "an append completed during the reads"
+        );
     }
     drop(release);
     for flush in flushes {

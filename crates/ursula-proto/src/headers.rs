@@ -10,11 +10,13 @@
 ///
 /// Nothing was proposed, so nothing of the attempt can apply later, whatever
 /// the status. A layer sets the marker only when it knows this: the server's
-/// ingress admission, which refuses a write before it reaches a handler, and
-/// the gateway, for the requests it refuses before forwarding them and for a
-/// request whose first upstream it could not connect to. The value is a short
-/// token naming the refusal, such as `RaftLogPressure`, for logs and
-/// diagnostics. The header's presence is the signal.
+/// ingress admission, which refuses a write before it reaches a handler, a
+/// node that refused a create, append, close or delete before it proposed
+/// the write's one command, a leader redirect included, and the gateway, for
+/// the requests it refuses before forwarding them and for a request whose
+/// first upstream it could not connect to. The value is a short token naming
+/// the refusal, such as `RaftLogPressure`, for logs and diagnostics. The
+/// header's presence is the signal.
 ///
 /// The marker speaks for one exchange. A layer that answers one request with
 /// several upstream exchanges, as a gateway following a leader redirect does,

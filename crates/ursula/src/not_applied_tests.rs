@@ -1,10 +1,20 @@
 //! `x-ursula-not-applied`: ingress admission marks the refusals it makes
-//! before a request reaches a handler, and each marked refusal applied
-//! nothing. The refusals left unmarked on purpose are pinned here, and so is
-//! the rule that a node never sets the gateway's vouch,
-//! `x-ursula-not-applied-checked`, which [`send`] checks on every response.
-//! The pressure refusals are pinned with their tests in `tests.rs`, which
-//! check the vouch too.
+//! before a request reaches a handler, a write that proposes one command
+//! marks the runtime's refusals raised before that command was proposed, and
+//! each marked refusal applied nothing. The refusals left unmarked on purpose
+//! are pinned here, and so is the rule that a node never sets the gateway's
+//! vouch, `x-ursula-not-applied-checked`, which [`send`] checks on every
+//! response. The pressure refusals are pinned with their tests in `tests.rs`,
+//! and so are the redirects of a real follower and a real non-voter, with the
+//! static gRPC cluster tests. Those tests check the vouch too.
+
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::num::NonZeroU64;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -16,15 +26,23 @@ use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::LOCATION;
 use axum::response::Response;
 use tower::ServiceExt;
+use ursula_gateway::DEFAULT_MAX_REQUEST_BODY_BYTES;
+use ursula_gateway::Gateway;
+use ursula_gateway::GatewayConfig;
 use ursula_proto::admin::ApplyFailureKind;
 use ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER;
 use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_raft::RaftGroupHandleRegistry;
+use ursula_runtime::AdvanceRetentionRequest;
+use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::CloseStreamRequest;
+use ursula_runtime::ColdStore;
 use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteStreamRequest;
+use ursula_runtime::GroupAdvanceRetentionFuture;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBucketUsageFuture;
 use ursula_runtime::GroupCloseStreamFuture;
@@ -38,12 +56,14 @@ use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupInstallSnapshotFuture;
+use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngine;
+use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
@@ -51,43 +71,82 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
+use crate::HEADER_STREAM_CLOSED;
+use crate::HEADER_STREAM_NEXT_OFFSET;
 use crate::HttpState;
 use crate::IngressAdmission;
 use crate::MAX_HTTP_BODY_BYTES;
 use crate::client_router_with_admission;
 use crate::router;
 use crate::router_with_static_raft_cluster;
+use crate::staging_cleanup_tests::deleted_paths;
+use crate::staging_cleanup_tests::observe;
+use crate::staging_cleanup_tests::staged_external_paths;
 
 const STREAM: &str = "/benchcmp/committed";
 const PEER: &str = "http://127.0.0.1:4437";
 const TEXT: (&str, &str) = ("content-type", "text/plain");
 
-/// How the test engine answers an append.
+/// A node with a cold store stages a body of at least this many bytes there
+/// as an external payload before it proposes the write.
+const EXTERNAL_PAYLOAD_BYTES: usize = 4;
+
+/// How the test engine fails writes.
 #[derive(Clone)]
-enum AppendFailure {
-    /// Commits the append, then answers with the error, as a node does when
-    /// the response to a committed proposal is lost or overtaken by a leader
-    /// change.
-    AfterCommit(GroupEngineError),
-    /// Answers with the error and proposes nothing.
-    BeforeProposal(GroupEngineError),
+enum WriteFailure {
+    /// Commits every append, then answers it with the error, as a node does
+    /// when the response to a committed proposal is lost or overtaken by a
+    /// leader change. Every other write passes.
+    AppendAfterCommit(GroupEngineError),
+    /// Answers every write with the error and proposes nothing. Reads pass.
+    Refuse(GroupEngineError),
 }
 
-/// An in-memory engine whose appends fail as `failure` says. Everything else
-/// passes through.
-struct FailingAppendEngine {
+/// The future of a write that [`FailingEngine`] refuses.
+type Refused<'a, T> = Pin<Box<dyn Future<Output = Result<T, GroupEngineError>> + Send + 'a>>;
+
+fn refused<'a, T: 'a>(error: GroupEngineError) -> Refused<'a, T> {
+    Box::pin(async move { Err(error) })
+}
+
+/// An in-memory engine whose writes fail as `failure` says.
+struct FailingEngine {
     inner: InMemoryGroupEngine,
-    failure: AppendFailure,
+    failure: WriteFailure,
 }
 
-impl GroupEngine for FailingAppendEngine {
+impl FailingEngine {
+    /// The error every write gets, when the engine refuses writes.
+    fn refusal(&self) -> Option<GroupEngineError> {
+        match &self.failure {
+            WriteFailure::Refuse(error) => Some(error.clone()),
+            WriteFailure::AppendAfterCommit(_) => None,
+        }
+    }
+}
+
+impl GroupEngine for FailingEngine {
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
-        self.inner.create_stream(request, placement, admission)
+        match self.refusal() {
+            Some(error) => refused(error),
+            None => self.inner.create_stream(request, placement, admission),
+        }
+    }
+
+    fn create_stream_external<'a>(
+        &'a mut self,
+        request: CreateStreamExternalRequest,
+        placement: ShardPlacement,
+    ) -> GroupCreateStreamFuture<'a> {
+        match self.refusal() {
+            Some(error) => refused(error),
+            None => self.inner.create_stream_external(request, placement),
+        }
     }
 
     fn head_stream<'a>(
@@ -110,6 +169,28 @@ impl GroupEngine for FailingAppendEngine {
         self.inner.read_stream(request, placement)
     }
 
+    fn publish_snapshot<'a>(
+        &'a mut self,
+        request: PublishSnapshotRequest,
+        placement: ShardPlacement,
+    ) -> GroupPublishSnapshotFuture<'a> {
+        match self.refusal() {
+            Some(error) => refused(error),
+            None => self.inner.publish_snapshot(request, placement),
+        }
+    }
+
+    fn advance_retention<'a>(
+        &'a mut self,
+        request: AdvanceRetentionRequest,
+        placement: ShardPlacement,
+    ) -> GroupAdvanceRetentionFuture<'a> {
+        match self.refusal() {
+            Some(error) => refused(error),
+            None => self.inner.advance_retention(request, placement),
+        }
+    }
+
     fn touch_stream_access<'a>(
         &'a mut self,
         stream_id: BucketStreamId,
@@ -126,7 +207,10 @@ impl GroupEngine for FailingAppendEngine {
         request: CloseStreamRequest,
         placement: ShardPlacement,
     ) -> GroupCloseStreamFuture<'a> {
-        self.inner.close_stream(request, placement)
+        match self.refusal() {
+            Some(error) => refused(error),
+            None => self.inner.close_stream(request, placement),
+        }
     }
 
     fn delete_stream<'a>(
@@ -134,7 +218,10 @@ impl GroupEngine for FailingAppendEngine {
         request: DeleteStreamRequest,
         placement: ShardPlacement,
     ) -> GroupDeleteStreamFuture<'a> {
-        self.inner.delete_stream(request, placement)
+        match self.refusal() {
+            Some(error) => refused(error),
+            None => self.inner.delete_stream(request, placement),
+        }
     }
 
     fn append<'a>(
@@ -146,13 +233,24 @@ impl GroupEngine for FailingAppendEngine {
         let failure = self.failure.clone();
         Box::pin(async move {
             match failure {
-                AppendFailure::AfterCommit(error) => {
+                WriteFailure::AppendAfterCommit(error) => {
                     self.inner.append(request, placement, admission).await?;
                     Err(error)
                 }
-                AppendFailure::BeforeProposal(error) => Err(error),
+                WriteFailure::Refuse(error) => Err(error),
             }
         })
+    }
+
+    fn append_external<'a>(
+        &'a mut self,
+        request: AppendExternalRequest,
+        placement: ShardPlacement,
+    ) -> GroupAppendFuture<'a> {
+        match self.refusal() {
+            Some(error) => refused(error),
+            None => self.inner.append_external(request, placement),
+        }
     }
 
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
@@ -167,17 +265,17 @@ impl GroupEngine for FailingAppendEngine {
     }
 }
 
-struct FailingAppendFactory {
-    failure: AppendFailure,
+struct FailingFactory {
+    failure: WriteFailure,
 }
 
-impl GroupEngineFactory for FailingAppendFactory {
+impl GroupEngineFactory for FailingFactory {
     fn create<'a>(
         &'a self,
         _placement: ShardPlacement,
         _metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
-        let engine: Box<dyn GroupEngine> = Box::new(FailingAppendEngine {
+        let engine: Box<dyn GroupEngine> = Box::new(FailingEngine {
             inner: InMemoryGroupEngine::default(),
             failure: self.failure.clone(),
         });
@@ -185,22 +283,85 @@ impl GroupEngineFactory for FailingAppendFactory {
     }
 }
 
-/// A node whose appends fail as `failure` says. A clustered node knows one
-/// peer, node 1 at [`PEER`], so a forward to node 1 answers a redirect there.
-fn node_failing_appends(failure: AppendFailure, clustered: bool) -> Router {
-    let runtime =
-        ShardRuntime::spawn_with_engine_factory(RuntimeConfig::new(1, 1), FailingAppendFactory {
-            failure,
-        })
-        .expect("runtime");
-    if clustered {
-        router_with_static_raft_cluster(runtime, RaftGroupHandleRegistry::default(), [(
-            1,
-            PEER.to_owned(),
-        )])
-    } else {
-        router(runtime)
+/// The engines of a node outside every group's voter set: it hosts none.
+struct HostsNoGroup;
+
+impl GroupEngineFactory for HostsNoGroup {
+    fn hosts_group(&self, _placement: ShardPlacement) -> bool {
+        false
     }
+
+    fn create<'a>(
+        &'a self,
+        placement: ShardPlacement,
+        _metrics: GroupEngineMetrics,
+    ) -> GroupEngineCreateFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "group {} is not hosted here",
+                placement.raft_group_id.0
+            )))
+        })
+    }
+}
+
+/// What a test node knows of other nodes.
+#[derive(Clone, Copy)]
+enum Peers {
+    /// Nothing: the node runs without peers.
+    None,
+    /// Node 1 at [`PEER`], so a forward to node 1 answers a redirect there.
+    Leader,
+    /// Node 1 at [`PEER`], the only voter of group 0. The node is node 2, so
+    /// a group it does not host is redirected there.
+    GroupHost,
+}
+
+/// A node over `factory` that knows the nodes `peers` names. With a
+/// `cold_store`, it stages a body of at least [`EXTERNAL_PAYLOAD_BYTES`]
+/// there before it proposes the write.
+fn node(
+    factory: impl GroupEngineFactory,
+    peers: Peers,
+    cold_store: Option<Arc<ColdStore>>,
+) -> Router {
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        factory,
+        cold_store,
+    )
+    .expect("runtime");
+    let registry = RaftGroupHandleRegistry::default();
+    let peer = [(1, PEER.to_owned())];
+    let state = match peers {
+        Peers::None => HttpState::new(runtime),
+        Peers::Leader => HttpState::with_static_raft_cluster(runtime, registry, peer),
+        Peers::GroupHost => HttpState::with_static_raft_cluster_topology(
+            runtime,
+            registry,
+            2,
+            peer,
+            BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1]))]),
+        ),
+    };
+    client_router_with_admission(
+        state.with_external_payload_min_bytes(EXTERNAL_PAYLOAD_BYTES),
+        IngressAdmission::default(),
+    )
+}
+
+/// A node whose writes fail as `failure` says.
+fn node_failing(failure: WriteFailure, peers: Peers) -> Router {
+    node(FailingFactory { failure }, peers, None)
+}
+
+/// A [`node`] with a cold store of its own, which it also returns.
+fn node_with_cold_store(
+    factory: impl GroupEngineFactory,
+    peers: Peers,
+) -> (Router, Arc<ColdStore>) {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    (node(factory, peers, Some(cold_store.clone())), cold_store)
 }
 
 /// A node with the production admission and an in-flight write-body budget
@@ -321,7 +482,7 @@ async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
         (
             "outcome unknown",
             GroupEngineError::Infra(GroupInfraError::OutcomeUnknown),
-            false,
+            Peers::None,
             StatusCode::SERVICE_UNAVAILABLE,
             None,
         ),
@@ -333,7 +494,7 @@ async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
                 index: 1,
                 kind: ApplyFailureKind::Panic,
             }),
-            false,
+            Peers::None,
             StatusCode::SERVICE_UNAVAILABLE,
             None,
         ),
@@ -342,21 +503,29 @@ async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
         (
             "forward after client_write, leader unknown",
             GroupEngineError::forward_to_leader("client_write responder", None, None),
-            true,
+            Peers::Leader,
             StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+        // A node without peers names no leader and answers 500.
+        (
+            "forward after client_write, no peers",
+            GroupEngineError::forward_to_leader("client_write responder", None, None),
+            Peers::None,
+            StatusCode::INTERNAL_SERVER_ERROR,
             None,
         ),
         // With a known leader it redirects there.
         (
             "forward after client_write, leader known",
             GroupEngineError::forward_to_leader("client_write responder", Some(1), None),
-            true,
+            Peers::Leader,
             StatusCode::TEMPORARY_REDIRECT,
             Some(format!("{PEER}{STREAM}")),
         ),
     ];
-    for (case, error, clustered, status, redirect) in cases {
-        let app = node_failing_appends(AppendFailure::AfterCommit(error), clustered);
+    for (case, error, peers, status, redirect) in cases {
+        let app = node_failing(WriteFailure::AppendAfterCommit(error), peers);
         create(&app).await;
 
         let appended = send(&app, "POST", STREAM, &[TEXT], "abc").await;
@@ -369,58 +538,201 @@ async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
     }
 }
 
-/// Refusals the runtime makes before it proposes anything stay unmarked as
-/// well. The shared runtime-error path renders them, and it also answers
-/// handlers that issue several commands: a bucket purge proposes once per
-/// group, so a later group's refusal there can follow earlier groups'
-/// purges. Marking them needs a decision per handler.
+/// The stream every refused write below addresses.
+const REFUSED: &str = "/benchcmp/refused";
+
+/// A write of [`REFUSED`] that proposes one command for its request.
+struct OneCommandWrite {
+    name: &'static str,
+    method: &'static str,
+    headers: &'static [(&'static str, &'static str)],
+    body: &'static str,
+}
+
+impl OneCommandWrite {
+    /// Whether a node with a cold store stages the body there first.
+    fn external(&self) -> bool {
+        self.body.len() >= EXTERNAL_PAYLOAD_BYTES
+    }
+}
+
+const ONE_COMMAND_WRITES: [OneCommandWrite; 6] = [
+    OneCommandWrite {
+        name: "create",
+        method: "PUT",
+        headers: &[TEXT],
+        body: "abc",
+    },
+    OneCommandWrite {
+        name: "create with an external payload",
+        method: "PUT",
+        headers: &[TEXT],
+        body: "abcd",
+    },
+    OneCommandWrite {
+        name: "append",
+        method: "POST",
+        headers: &[TEXT],
+        body: "abc",
+    },
+    OneCommandWrite {
+        name: "append with an external payload",
+        method: "POST",
+        headers: &[TEXT],
+        body: "abcd",
+    },
+    OneCommandWrite {
+        name: "close",
+        method: "POST",
+        headers: &[(HEADER_STREAM_CLOSED, "true")],
+        body: "",
+    },
+    OneCommandWrite {
+        name: "delete",
+        method: "DELETE",
+        headers: &[],
+        body: "",
+    },
+];
+
+/// Snapshot and retention `PUT`s, which stay unmarked. They need no marker:
+/// repeating a publish with the same body, or an advance to the same offset,
+/// is harmless, so a client retries an attempt whose outcome is unknown.
+/// Their handlers can also propose twice. When apply refused an offset whose
+/// JSON message boundary it could not check, they propose again, so a
+/// refusal of the second proposal follows a first one that reached the Raft
+/// log.
+const SNAPSHOT_AND_RETENTION_PUTS: [(&str, &str, &str); 2] = [
+    ("snapshot", "/benchcmp/refused/snapshot/0", "sn"),
+    ("retention", "/benchcmp/refused/retention/0", ""),
+];
+
+/// A write refused before its one command was proposed applied nothing, so
+/// its answer carries the marker, a redirect included: a node that found it
+/// does not lead the group (`NotLeader`), and a node that does not host the
+/// group (`GroupNotHosted`). A write with an external payload staged the
+/// body first, which proposes nothing, and the refusal deletes it again. No
+/// answer carries the vouch.
 #[tokio::test]
-async fn runtime_refusals_before_proposal_stay_unmarked() {
+async fn a_refusal_before_proposal_marks_every_one_command_write() {
+    let refusing = |error| FailingFactory {
+        failure: WriteFailure::Refuse(error),
+    };
+    let not_leader = |leader| {
+        refusing(GroupEngineError::forward_to_leader_before_proposal(
+            "not the leader",
+            leader,
+            None,
+        ))
+    };
     let cases = [
         (
-            "uncommitted backpressure",
-            GroupEngineError::raft_uncommitted_backpressure(8, 4, 10),
-            false,
-            StatusCode::SERVICE_UNAVAILABLE,
-            None,
-        ),
-        (
-            "cold backpressure",
-            GroupEngineError::cold_backpressure(
-                BucketStreamId::new("benchcmp", "committed"),
-                8,
-                11,
-                10,
-            ),
-            false,
-            StatusCode::SERVICE_UNAVAILABLE,
-            None,
-        ),
-        (
-            "forward before proposal, leader unknown",
-            GroupEngineError::forward_to_leader_before_proposal("not the leader", None, None),
-            true,
-            StatusCode::SERVICE_UNAVAILABLE,
-            None,
-        ),
-        (
-            "forward before proposal, leader known",
-            GroupEngineError::forward_to_leader_before_proposal("not the leader", Some(1), None),
-            true,
+            "leader known",
+            node_with_cold_store(not_leader(Some(1)), Peers::Leader),
             StatusCode::TEMPORARY_REDIRECT,
-            Some(format!("{PEER}{STREAM}")),
+            "NotLeader",
+        ),
+        (
+            "leader unknown",
+            node_with_cold_store(not_leader(None), Peers::Leader),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NotLeader",
+        ),
+        // A node without peers names no leader and answers 500, as for any
+        // forward. Its leadership check still ran before any proposal.
+        (
+            "no peers",
+            node_with_cold_store(not_leader(None), Peers::None),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "NotLeader",
+        ),
+        (
+            "group hosted by a peer",
+            node_with_cold_store(HostsNoGroup, Peers::GroupHost),
+            StatusCode::TEMPORARY_REDIRECT,
+            "GroupNotHosted",
+        ),
+        (
+            "group hosted by no known node",
+            node_with_cold_store(HostsNoGroup, Peers::None),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GroupNotHosted",
         ),
     ];
-    for (case, error, clustered, status, redirect) in cases {
-        let app = node_failing_appends(AppendFailure::BeforeProposal(error), clustered);
-        create(&app).await;
+    for (case, (app, cold_store), status, token) in cases {
+        let redirect =
+            (status == StatusCode::TEMPORARY_REDIRECT).then(|| format!("{PEER}{REFUSED}"));
+        for write in ONE_COMMAND_WRITES {
+            let events = observe(&cold_store);
+            let response = send(&app, write.method, REFUSED, write.headers, write.body).await;
+            let name = write.name;
+            assert_eq!(response.status(), status, "{case}: {name}");
+            assert_eq!(location(&response), redirect.as_deref(), "{case}: {name}");
+            assert_eq!(not_applied(&response), Some(token), "{case}: {name}");
+            let staged = staged_external_paths(&events);
+            assert_eq!(
+                staged.len(),
+                usize::from(write.external()),
+                "{case}: {name}"
+            );
+            assert_eq!(deleted_paths(&events), staged, "{case}: {name}");
+        }
+        for (name, uri, body) in SNAPSHOT_AND_RETENTION_PUTS {
+            let response = send(&app, "PUT", uri, &[], body).await;
+            assert_eq!(response.status(), status, "{case}: {name}");
+            assert_eq!(not_applied(&response), None, "{case}: {name}");
+        }
+    }
+}
 
-        let refused = send(&app, "POST", STREAM, &[TEXT], "abc").await;
+/// The runtime's backpressure refuses a create or an append before it
+/// proposes it, so the refused write applied nothing and its `503` carries
+/// the marker.
+#[tokio::test]
+async fn backpressure_refusals_are_marked_not_applied() {
+    let uri = "/benchcmp/pressured";
+    let created_uri = "/benchcmp/pressured-create";
+    for (token, config) in [
+        // Two bytes exceed a one-byte limit on the group's uncommitted Raft
+        // bytes, and on its hot bytes.
+        (
+            "RaftUncommittedBackpressure",
+            RuntimeConfig::new(1, 1).with_raft_max_uncommitted_bytes_per_group(Some(1)),
+        ),
+        (
+            "ColdBackpressure",
+            RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(1)),
+        ),
+    ] {
+        let app = router(ShardRuntime::spawn(config).expect("runtime"));
+        // An empty create adds no bytes and passes.
+        let created = send(&app, "PUT", uri, &[TEXT], "").await;
+        assert_eq!(created.status(), StatusCode::CREATED, "{token}");
+        assert_eq!(not_applied(&created), None, "{token}");
 
-        assert_eq!(refused.status(), status, "{case}");
-        assert_eq!(location(&refused), redirect.as_deref(), "{case}");
-        assert_eq!(not_applied(&refused), None, "{case}");
-        assert_eq!(stream_content(&app).await, "", "{case}");
+        let appended = send(&app, "POST", uri, &[TEXT], "ab").await;
+        let refused_create = send(&app, "PUT", created_uri, &[TEXT], "ab").await;
+        for (write, response) in [("append", appended), ("create", refused_create)] {
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{token}: {write}"
+            );
+            assert_eq!(not_applied(&response), Some(token), "{token}: {write}");
+        }
+
+        // Neither applied anything.
+        let head = send(&app, "HEAD", uri, &[], "").await;
+        assert_eq!(head.status(), StatusCode::OK, "{token}");
+        assert_eq!(
+            head.headers()
+                .get(HEADER_STREAM_NEXT_OFFSET)
+                .map(|value| value.to_str().expect("an ASCII offset")),
+            Some("00000000000000000000"),
+            "{token}"
+        );
+        let head = send(&app, "HEAD", created_uri, &[], "").await;
+        assert_eq!(head.status(), StatusCode::NOT_FOUND, "{token}");
     }
 }
 
@@ -483,4 +795,125 @@ async fn a_node_never_sets_the_vouch() {
         assert_eq!(response.status(), *status, "{case}");
         assert_eq!(not_applied(response), *marker, "{case}");
     }
+}
+
+/// Serves `app` on a fresh loopback port.
+async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (url, server)
+}
+
+/// The part of the gateway's metrics these tests read.
+#[derive(serde::Deserialize)]
+struct GatewayRedirects {
+    leader_redirects: u64,
+}
+
+async fn leader_redirects(gateway: &Gateway) -> u64 {
+    let request = Request::get("/__ursula/gateway/metrics")
+        .body(Body::empty())
+        .expect("request");
+    let body = to_bytes(gateway.handle(request).await.into_body(), usize::MAX)
+        .await
+        .expect("metrics body");
+    serde_json::from_slice::<GatewayRedirects>(&body)
+        .expect("gateway metrics")
+        .leader_redirects
+}
+
+/// Under sustained writes a leader refuses them at admission while a
+/// follower still admits them, and a gateway with both as upstreams sends an
+/// attempt to either. Behind a follower's redirect raised before proposal the
+/// leader's refusal keeps its marker, so the client gets a marked `503` with
+/// the gateway's vouch whichever node the attempt reached first. Behind a
+/// redirect that can follow a proposal the gateway drops the marker and
+/// still vouches.
+#[tokio::test]
+async fn a_gateway_keeps_a_leader_refusal_marked_behind_a_redirect_raised_before_proposal() {
+    let coordinator = ursula_raft::SnapshotBuildCoordinator::new(1);
+    assert_eq!(coordinator.observe_log_bytes(300, 200, 100), Some(true));
+    let (leader, leader_server) = serve(client_router_with_admission(
+        HttpState::new(ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime")),
+        IngressAdmission::default().with_raft_log_pressure(Some(coordinator)),
+    ))
+    .await;
+    let cases = [
+        (
+            "raised before proposal",
+            GroupEngineError::forward_to_leader_before_proposal("not leader", Some(2), None),
+            Some("RaftLogPressure"),
+        ),
+        (
+            "reported after client_write",
+            GroupEngineError::forward_to_leader("client_write responder", Some(2), None),
+            None,
+        ),
+    ];
+    for (redirect, error, expected) in cases {
+        let (follower, follower_server) = serve(router_with_static_raft_cluster(
+            ShardRuntime::spawn_with_engine_factory(RuntimeConfig::new(1, 1), FailingFactory {
+                failure: WriteFailure::Refuse(error),
+            })
+            .expect("runtime"),
+            RaftGroupHandleRegistry::default(),
+            [(2, leader.clone())],
+        ))
+        .await;
+        let gateway = Gateway::new(GatewayConfig {
+            listen: "127.0.0.1:0".parse().expect("listen address"),
+            upstreams: vec![follower, leader.clone()],
+            response_header_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(1),
+            upstream_tcp_user_timeout_secs: NonZeroU64::new(5).expect("non-zero"),
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            raft_group_count: None,
+            cors_allowed_origins: Vec::new(),
+            usage_chunk_bytes: None,
+        });
+        // The gateway picks an upstream at random. Send attempts until one
+        // goes through the follower: each does with probability 1/2.
+        let mut followed = false;
+        for _attempt in 0..64 {
+            let redirects = leader_redirects(&gateway).await;
+            let request = Request::post("/benchcmp/stream")
+                .header(TEXT.0, TEXT.1)
+                .body(Body::from("abc"))
+                .expect("request");
+            let response = gateway.handle(request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{redirect}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(NOT_APPLIED_CHECKED_HEADER)
+                    .map(|value| value.as_bytes()),
+                Some(&b"1"[..]),
+                "{redirect}"
+            );
+            if leader_redirects(&gateway).await == redirects {
+                // The leader's own refusal.
+                assert_eq!(
+                    not_applied(&response),
+                    Some("RaftLogPressure"),
+                    "{redirect}"
+                );
+                continue;
+            }
+            assert_eq!(not_applied(&response), expected, "{redirect}");
+            followed = true;
+            break;
+        }
+        assert!(followed, "{redirect}: no attempt went through the follower");
+        follower_server.abort();
+    }
+    leader_server.abort();
 }

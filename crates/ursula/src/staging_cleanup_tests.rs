@@ -178,9 +178,11 @@ impl GroupEngineFactory for LostResponseEngineFactory {
     }
 }
 
-type Events = Arc<Mutex<Vec<ColdStoreEvent>>>;
+/// The events a cold store reported since [`observe`] started recording.
+pub(crate) type Events = Arc<Mutex<Vec<ColdStoreEvent>>>;
 
-fn observe(cold_store: &ColdStore) -> Events {
+/// Records the events of `cold_store` from now on.
+pub(crate) fn observe(cold_store: &ColdStore) -> Events {
     let events = Events::default();
     let observed = events.clone();
     cold_store.set_observer(move |event| {
@@ -189,7 +191,8 @@ fn observe(cold_store: &ColdStore) -> Events {
     events
 }
 
-fn staged_external_paths(events: &Events) -> Vec<String> {
+/// The external payloads staged in the cold store.
+pub(crate) fn staged_external_paths(events: &Events) -> Vec<String> {
     events
         .lock()
         .expect("events lock")
@@ -203,7 +206,8 @@ fn staged_external_paths(events: &Events) -> Vec<String> {
         .collect()
 }
 
-fn deleted_paths(events: &Events) -> Vec<String> {
+/// The objects deleted from the cold store.
+pub(crate) fn deleted_paths(events: &Events) -> Vec<String> {
     events
         .lock()
         .expect("events lock")

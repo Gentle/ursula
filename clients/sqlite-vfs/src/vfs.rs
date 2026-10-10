@@ -1376,7 +1376,7 @@ mod tests {
             answer_with_body("402 Payment Required", "quota exhausted"),
             // Rate limited until the budget runs out.
             answer(&format!("429 Too Many Requests\r\n{LAST}")),
-            // A commit over a layer's request limit, marked: at once.
+            // A commit over a layer's request limit, marked and vouched for: at once, as too large.
             answer(&format!(
                 "413 Payload Too Large\r\n{}",
                 vouched("RequestBodyTooLarge")
@@ -1414,8 +1414,9 @@ mod tests {
         assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
         assert_eq!(
             d.refused,
-            Some(WriteRefusal::NotApplied {
-                status: 413,
+            Some(WriteRefusal::TooLarge {
+                bytes: 5,
+                limit: None,
                 reason: "RequestBodyTooLarge".into()
             })
         );

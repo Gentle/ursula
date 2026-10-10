@@ -75,6 +75,22 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
     PANIC_IN_FOR_TESTS.set(entry);
 }
 
+/// The largest commit frame the extension sends by default: the server refuses a request body over
+/// 32 MiB, and so does a gateway by default (`--max-request-body-bytes`).
+pub(crate) const DEFAULT_MAX_FRAME_BYTES: usize = 32 << 20;
+
+/// The largest commit frame the extension sends (`client::append`): `URSULA_VFS_MAX_FRAME_BYTES`, or
+/// [`DEFAULT_MAX_FRAME_BYTES`]. Lower it to a smaller limit in front of the server.
+pub(crate) fn max_frame_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("URSULA_VFS_MAX_FRAME_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_FRAME_BYTES)
+    })
+}
+
 pub(crate) fn snapshot_min_bytes() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {

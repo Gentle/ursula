@@ -345,3 +345,63 @@ it("Pi: a commit an authorizer refuses with a marked 403 rejects with UrsulaWrit
 	await harness.close(ctx);
 	await storage.close(ctx);
 });
+
+// A transaction whose commit frame is larger than one request may be (over URSULA_VFS_MAX_FRAME_BYTES,
+// 32 MiB by default, the server's own limit) is never sent: it fails alone as `too_large`, the file
+// is not poisoned, and the next, smaller commit succeeds. Random blobs do not compress, so 40 MiB of
+// them make a frame over the limit.
+it("a transaction too large for one request fails alone without being sent, and the next commit succeeds", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const [ready, checked] = [`${file}.ready`, `${file}.checked`];
+	const big = Array.from({ length: 40 }, () => "INSERT INTO b VALUES (randomblob(1048576));").join(" ");
+	const steps = [
+		"CREATE TABLE t(x TEXT)",
+		"CREATE TABLE b(x BLOB)",
+		"INSERT INTO t VALUES ('a1')",
+		"@status",
+		`@wait:${ready}`,
+		`BEGIN; ${big} COMMIT`,
+		"@status",
+		`@wait:${checked}`,
+		"INSERT INTO t VALUES ('a2')",
+	];
+	const child = runChild(file, gate.url + path, steps, { CHILD_EXIT: "1" });
+	await child.waitFor((l) => l.step === 4 && l.phase === "start");
+	const before = await gate.counts();
+	writeFileSync(ready, "");
+	await child.waitFor((l) => l.step === 7 && l.phase === "start");
+	// Nothing went out while the transaction was refused.
+	expect(await gate.counts()).toEqual(before);
+	writeFileSync(checked, "");
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code, child.stderr()).toBe(0);
+
+	const accepted = step(child, 3)?.status;
+	expect(step(child, 5)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
+	expect(step(child, 6)?.status).toMatchObject({
+		poisoned: false,
+		fenced: false,
+		writes_refused: true,
+		refused_kind: "too_large",
+		refused_reason: null,
+		offset: accepted?.offset,
+		epoch: accepted?.epoch,
+	});
+	expect(step(child, 8)?.ok).toBe(true);
+	expect(done).toMatchObject({ poisoned: false, fenced: false, writes_refused: false, refused_kind: null, refused_reason: null });
+	const log = child.stderr();
+	expect(log).toMatch(/event=writes_refused file=\S+ stream=\S+ during=commit kind=too_large reason="\d+-byte commit frame over the 33554432-byte frame limit/);
+	expect(log).not.toMatch(/event=poisoned/);
+
+	// The stream holds the accepted commits alone.
+	const copy = freshFile();
+	attach(copy, ursulaUrl() + path);
+	expect(xs(copy)).toEqual(["a1", "a2"]);
+	const db = openPlain(copy);
+	try {
+		expect(db.prepare("SELECT count(*) AS n FROM b").get()).toEqual({ n: 0 });
+	} finally {
+		db.close();
+	}
+});

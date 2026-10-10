@@ -243,12 +243,17 @@ export class UrsulaReplicationError extends Error {
  * - `rate_limited`: `429` until the retry budget ran out, marked or not;
  * - `not_applied`: other answers marked `x-ursula-not-applied` and vouched for by a gateway (the server
  *   under write pressure, or a gateway that could not authorize the request) until the retry budget
- *   ran out, or a marked final answer such as a `413`.
+ *   ran out, or another marked final answer;
+ * - `too_large`: the transaction's commit frame is larger than one request may be, so it was never
+ *   sent (over `URSULA_VFS_MAX_FRAME_BYTES`, 32 MiB by default), or a lower limit in front refused it
+ *   with a marked and vouched `413`. The same transaction can never be sent: split it into smaller
+ *   ones.
  *
  * The marker counts only with the vouch, which `ursula gateway` adds from 0.7.3 on. Without such a
- * gateway in front of the servers, only a `401`, `402` or `429` refuses a write this way.
+ * gateway in front of the servers, only a `401`, `402` or `429`, or the extension's own frame limit,
+ * refuses a write this way.
  */
-export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden" | "rate_limited" | "not_applied";
+export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden" | "rate_limited" | "not_applied" | "too_large";
 
 /**
  * A write refused before it reached the stream, so that nothing of it was applied: by a layer in front

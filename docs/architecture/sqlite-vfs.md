@@ -118,10 +118,12 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   epoch, producer sequence and offset, so the next commit is sent as usual, with the sequence the
   refused append never used, and is acknowledged once the refusals stop, without a new attach.
   `ursula_status` reports `writes_refused`, with `refused_kind` (`payment_required`,
-  `unauthorized`, `forbidden`, `rate_limited` or `not_applied`, the last for any status but 401,
-  402, 403 and 429) and `refused_reason` (the refusing layer's response body, its first 256 bytes
-  followed by `...` when it is longer, or the marker's value when the body is empty, and always the
-  marker's value for `not_applied`), until a commit is acknowledged or the database is poisoned
+  `unauthorized`, `forbidden`, `rate_limited`, `not_applied` for any status but 401, 402, 403, 413
+  and 429, or `too_large` for a commit too large for one request, §7) and `refused_reason` (the
+  refusing layer's response body, its first 256 bytes followed by `...` when it is longer, or the
+  marker's value when the body is empty, and always the marker's value for `not_applied`; for
+  `too_large`, the frame's size and limit, or the marker's value of the 413), until a commit is
+  acknowledged or the database is poisoned
   (it then needs an attach whatever the layer does). A 402 also shows in `payment_required` and
   `payment_reason`, its fields since 0.7.1. The extension logs `writes_refused`
   (`payment_required` for a 402) when refusals of a kind start, and `writes_resumed` at the first
@@ -753,8 +755,18 @@ The crate refuses to build with `panic = "abort"`.
 - One owner process per stream at a time; connections in other processes that load the extension
   cannot open the file (§1); processes without it are not replicated (and block recovery).
 - The local files must be on a local filesystem (§6).
-- Commit frames are at most the server's request limit (32 MiB), about 8000 changed pages per
-  transaction.
+- A transaction must fit one request. Its commit frame as sent, a 12-byte header and the
+  transaction's changed pages compressed with zstd, is at most `URSULA_VFS_MAX_FRAME_BYTES`: 32 MiB
+  (33,554,432 bytes) by default, the server's request body limit, which a gateway's
+  `--max-request-body-bytes` matches by default. That is about 8,000 changed pages of incompressible
+  data (random, encrypted or already compressed bytes, such as embeddings or media), and about three
+  times as many of typical text. A larger transaction is never sent. It fails alone with
+  `SQLITE_IOERR_AUTH` and `refused_kind` `too_large` (§2), and the database stays usable. Split bulk
+  imports into smaller transactions. `VACUUM` rewrites every page in one transaction, so on a
+  database whose compressed size is above the limit it fails the same way: copy its rows into a new
+  database in smaller transactions instead. Behind a layer with a lower limit, lower
+  `URSULA_VFS_MAX_FRAME_BYTES` to match it: a marked `413` also fails the commit alone, but an
+  unmarked one poisons.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
   by the server at 1 GiB compressed (32 MiB inline or through the gateway).
 - Producer expiry after 7 idle days; the owner reclaims only if nobody wrote meanwhile.

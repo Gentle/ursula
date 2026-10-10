@@ -96,9 +96,10 @@
 //!   first poison's, which a later one never replaces; `fenced`: a fence was seen since, first or
 //!   later, never reset; `writes_refused`: the latest write was refused before it reached the
 //!   stream, until a commit is acknowledged (never while poisoned), with what refused it in
-//!   `refused_kind` (`payment_required`, `unauthorized`, `forbidden`, `rate_limited` or
-//!   `not_applied`) and why in `refused_reason` (the layer's explanation, or the marker's token
-//!   when it sent no body, and always for `not_applied`);
+//!   `refused_kind` (`payment_required`, `unauthorized`, `forbidden`, `rate_limited`,
+//!   `not_applied` or `too_large`) and why in `refused_reason` (the layer's explanation, or the
+//!   marker's token when it sent no body, and always for `not_applied`; for `too_large`, the
+//!   frame's size and limit, or the token of the `413`'s marker);
 //!   `payment_required`, `payment_reason`: the same for a 402 alone; `local`: the stream offset of
 //!   the local state attach started from, `-1` when it rebuilt the file; `installed`: the offset of
 //!   the snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none; the rest

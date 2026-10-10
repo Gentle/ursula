@@ -384,6 +384,20 @@ pub(crate) enum WriteRefusal {
     /// the marker's token (`RaftLogPressure`, say), empty when it has none.
     #[error("{status} (not applied{})", with_token(.reason))]
     NotApplied { status: u16, reason: String },
+    /// The commit's frame, `bytes` long, is larger than one request may be: never sent because it
+    /// is over the extension's frame limit (`limit`, `URSULA_VFS_MAX_FRAME_BYTES`), or refused with
+    /// a 413 marked `x-ursula-not-applied` by a lower limit in front (`limit` is `None`, `reason` the
+    /// marker's token). The same transaction can never be sent: split it.
+    #[error(
+        "{bytes}-byte commit frame over {}{}: split the transaction",
+        frame_limit(*.limit),
+        with_token(.reason)
+    )]
+    TooLarge {
+        bytes: usize,
+        limit: Option<usize>,
+        reason: String,
+    },
 }
 
 impl WriteRefusal {
@@ -395,6 +409,7 @@ impl WriteRefusal {
             WriteRefusal::Forbidden { .. } => "forbidden",
             WriteRefusal::RateLimited { .. } => "rate_limited",
             WriteRefusal::NotApplied { .. } => "not_applied",
+            WriteRefusal::TooLarge { .. } => "too_large",
         }
     }
 
@@ -407,7 +422,9 @@ impl WriteRefusal {
             | WriteRefusal::Unauthorized { body }
             | WriteRefusal::Forbidden { body }
             | WriteRefusal::RateLimited { body } => body,
-            WriteRefusal::NotApplied { reason, .. } => reason,
+            WriteRefusal::NotApplied { reason, .. } | WriteRefusal::TooLarge { reason, .. } => {
+                reason
+            }
         };
         Some(reason.trim()).filter(|reason| !reason.is_empty())
     }
@@ -469,6 +486,14 @@ fn with_body(body: &str) -> String {
 }
 
 /// `: token` for a marker's token, nothing for an empty one.
+/// The limit a too-large commit frame is over, for [`WriteRefusal::TooLarge`]'s message.
+fn frame_limit(limit: Option<usize>) -> String {
+    match limit {
+        Some(limit) => format!("the {limit}-byte frame limit (URSULA_VFS_MAX_FRAME_BYTES)"),
+        None => "a request body limit in front of the stream (413)".to_owned(),
+    }
+}
+
 fn with_token(token: &str) -> String {
     let token = token.trim();
     if token.is_empty() {
@@ -643,6 +668,24 @@ mod tests {
                 },
                 "not_applied",
                 Some("WalDiskPressure"),
+            ),
+            (
+                WriteRefusal::TooLarge {
+                    bytes: 40 << 20,
+                    limit: Some(32 << 20),
+                    reason: body(""),
+                },
+                "too_large",
+                None,
+            ),
+            (
+                WriteRefusal::TooLarge {
+                    bytes: 9 << 20,
+                    limit: None,
+                    reason: body("RequestBodyTooLarge"),
+                },
+                "too_large",
+                Some("RequestBodyTooLarge"),
             ),
         ];
         for (refusal, kind, reason) in cases {

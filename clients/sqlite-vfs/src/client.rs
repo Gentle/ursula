@@ -132,8 +132,9 @@ enum Refused {
     /// nothing of it reached the stream (unless an earlier attempt of an append did: `append`).
     PaymentRequired,
     /// A 403 without `Producer-Epoch`: an authorizer denied the request. Final, and never a fence.
-    /// Nothing of it reached the stream only when the answer is marked `x-ursula-not-applied`
-    /// (see `append`): a filtering proxy can answer 403 in place of the stream's own answer.
+    /// Nothing of it reached the stream only when the answer proves it (`applied_nothing`: marked
+    /// `x-ursula-not-applied`, with a gateway's vouch): a filtering proxy can answer 403 in place
+    /// of the stream's own answer (see `append`).
     Denied,
     /// A 403 with `Producer-Epoch`: the server's fence, which names the epoch that owns the stream
     /// (only an append can meet it).
@@ -155,16 +156,65 @@ fn refused(r: &ureq::http::Response<ureq::Body>) -> Option<Refused> {
 /// The response header with which a layer (the server's ingress admission, a gateway, a proxy in
 /// front of either) marks its answer to a request it refused before passing it on: the stream
 /// applied nothing of it, whatever the status. The value is a short token naming why
-/// (`RaftLogPressure`, say). Older layers never send it: an answer without it is read by its
-/// status alone.
+/// (`RaftLogPressure`, say). Older layers never send it. It counts only with a gateway's vouch
+/// (`NOT_APPLIED_CHECKED`): see `applied_nothing`.
 const NOT_APPLIED: &str = "x-ursula-not-applied";
 
-/// The token of an answer marked `x-ursula-not-applied` (see `NOT_APPLIED`), cut to `BODY_SHOWN`
-/// bytes like a body; `None` for an unmarked answer. A marker with an empty value still marks it.
-fn not_applied(r: &ureq::http::Response<ureq::Body>) -> Option<String> {
-    let value = r.headers().get(NOT_APPLIED)?.as_bytes();
-    let shown = value.get(..BODY_SHOWN).unwrap_or(value);
-    Some(String::from_utf8_lossy(shown).trim().to_owned())
+/// The response header with which a gateway vouches for `NOT_APPLIED`. Ursula's gateway sets it
+/// (to `1`) from 0.7.3 on, on every answer it returns: the answers it forwards, after it applied
+/// its own rule to their marker (an answer it got by following a leader redirect keeps the marker
+/// only if the redirect carried it too), and its own refusals and errors. It removes any copy that
+/// comes from upstream before it adds its own, and a node never sets it. A gateway before 0.7.3
+/// relays the marker of an answer it got by following a redirect, which a node can send after it
+/// proposed the write, and it never vouches: through it, and without a gateway, a marker proves
+/// nothing.
+const NOT_APPLIED_CHECKED: &str = "x-ursula-not-applied-checked";
+
+/// How an answer proves that the stream applied nothing of the request it answers (see
+/// `applied_nothing`).
+enum Proof {
+    /// Its status: 401, 402 or 429.
+    Status,
+    /// `x-ursula-not-applied` with a gateway's vouch: the marker's token, cut to `BODY_SHOWN` bytes
+    /// like a body. A marker with an empty value still marks.
+    Marked(String),
+}
+
+impl Proof {
+    /// The refusal that an answer with `status` and `body`, proven this way, stands for: a 401, 402
+    /// or 403 keeps its own kind, a vouched marker names any other (`NotApplied`), and a 429
+    /// without one is rate limiting.
+    fn refusal(self, status: u16, body: String) -> WriteRefusal {
+        match (status, self) {
+            (401, _) => WriteRefusal::Unauthorized { body },
+            (402, _) => WriteRefusal::PaymentRequired { body },
+            (403, _) => WriteRefusal::Forbidden { body },
+            (_, Proof::Marked(reason)) => WriteRefusal::NotApplied { status, reason },
+            (_, Proof::Status) => WriteRefusal::RateLimited { body },
+        }
+    }
+}
+
+/// Whether an answer proves that the stream applied nothing of the request it answers, and how: the
+/// one place that decides it (design doc §2). It does when its status is 401 or 402 (a layer in
+/// front of the stream refused the request before passing it on) or 429 (the same, or the server's
+/// limit on a stream's producers, which never answers an attempt sent after an earlier one was
+/// applied: that one is acknowledged as a duplicate), or when it carries both `x-ursula-not-applied`
+/// and the vouch `x-ursula-not-applied-checked`. Any other answer proves nothing, whatever its
+/// status, a 403, 413 or 503 with only one of the two headers among them: `None`.
+fn applied_nothing(r: &ureq::http::Response<ureq::Body>) -> Option<Proof> {
+    let headers = r.headers();
+    if let Some(marker) = headers
+        .get(NOT_APPLIED)
+        .filter(|_| headers.contains_key(NOT_APPLIED_CHECKED))
+    {
+        let value = marker.as_bytes();
+        let shown = value.get(..BODY_SHOWN).unwrap_or(value);
+        return Some(Proof::Marked(
+            String::from_utf8_lossy(shown).trim().to_owned(),
+        ));
+    }
+    matches!(r.status().as_u16(), 401 | 402 | 429).then_some(Proof::Status)
 }
 
 /// The error of request `op` to `url` that a layer in front of the stream refused (a refused
@@ -314,19 +364,22 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// producer at its epoch, so whatever holds (epoch, seq) there is ours. A claim's answer is
 /// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
 ///
-/// An attempt answered 401, 402 or 429, or marked `x-ursula-not-applied` whatever its status, is
-/// taken to have applied nothing, which every layer in front of the stream must ensure (design doc
-/// §2): one that passed the append on and then answered so would have the next commit acknowledged
-/// as this one's duplicate, its pages never appended. A 403 without `Producer-Epoch` counts only
-/// when marked: a filtering proxy can answer 403 in place of the stream's own answer, after the
-/// stream applied the append, so an unmarked one fails the append, as before 0.7.3. While no
-/// attempt of the append can have reached the stream, a 402 or a marked final answer (any other
-/// 4xx, an authorizer's 403 among them) ends it as [`Append::Refused`] at once, and the retried
-/// ones (401, 429, a marked 5xx) end it so once the budget runs out. After an attempt whose outcome
-/// is unknown (no answer, or an unmarked 5xx), the append may be in the stream, and the next
-/// commit, sent with the same sequence, would be acknowledged as its duplicate. Its refusals then
-/// prove nothing: a 402 is retried like an unknown outcome, until an answer settles it or the
-/// budget runs out ([`Error::AppendUnknown`]), and a 403 fails it.
+/// An attempt whose answer proves that it applied nothing (`applied_nothing`: a 401, 402 or 429, or
+/// any answer marked `x-ursula-not-applied` that a gateway vouched for with
+/// `x-ursula-not-applied-checked`) is taken to have applied nothing, which every layer in front of
+/// the stream must ensure (design doc §2): one that passed the append on and then answered so would
+/// have the next commit acknowledged as this one's duplicate, its pages never appended. A marker
+/// without the vouch proves nothing: a gateway before 0.7.3 relays the marker of an answer it got
+/// by following a leader redirect, which a node can send after it proposed the append. A 403
+/// without `Producer-Epoch` counts only when proven: a filtering proxy can answer 403 in place of
+/// the stream's own answer, after the stream applied the append, so any other fails the append, as
+/// before 0.7.3. While no attempt of the append can have reached the stream, a 402 or a proven
+/// final answer (any other 4xx, an authorizer's 403 among them) ends it as [`Append::Refused`] at
+/// once, and the retried ones (401, 429, a proven 5xx) end it so once the budget runs out. After
+/// an attempt whose outcome is unknown (no answer, or a 5xx that proves nothing), the append may be
+/// in the stream, and the next commit, sent with the same sequence, would be acknowledged as its
+/// duplicate. Its refusals then prove nothing: a 402 is retried like an unknown outcome, until an
+/// answer settles it or the budget runs out ([`Error::AppendUnknown`]), and a 403 fails it.
 pub(crate) fn append(
     url: &str,
     incarnation: &str,
@@ -364,38 +417,33 @@ pub(crate) fn append(
                 // Rate limiting (429, e.g. ursulagw) and overload (503) are transient: retried
                 // with the same producer sequence, no sooner than Retry-After (seconds).
                 retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
-                let marked = not_applied(&r);
+                // Whether the attempt applied nothing: every branch below takes it from here.
+                let proof = applied_nothing(&r);
                 match refused(&r) {
                     Some(Refused::Fenced { current }) => return Append::Fenced { current },
-                    // Unmarked, the denial may have replaced the stream's answer (see above).
-                    Some(Refused::Denied) if !reached && marked.is_some() => {
-                        return Append::Refused(WriteRefusal::Forbidden {
-                            body: body_text(&mut r),
-                        });
-                    }
+                    // Unproven, the denial may have replaced the stream's answer (see above).
                     Some(Refused::Denied) => {
-                        return Append::Failed(unauthorized("append", url, status));
+                        return match proof {
+                            Some(proof) if !reached => {
+                                Append::Refused(proof.refusal(status, body_text(&mut r)))
+                            }
+                            _ => Append::Failed(unauthorized("append", url, status)),
+                        };
                     }
                     Some(Refused::PaymentRequired) => {
                         let body = body_text(&mut r);
-                        if !reached {
-                            return Append::Refused(WriteRefusal::PaymentRequired { body });
+                        match proof.map(|proof| proof.refusal(status, body.clone())) {
+                            Some(refusal) if !reached => return Append::Refused(refusal),
+                            // An earlier attempt may be in the stream: the outcome is still
+                            // unknown.
+                            refusal => (Attempt::Status { status, body }, refusal),
                         }
-                        // An earlier attempt may be in the stream: the outcome is still unknown.
-                        let attempt = Attempt::Status {
-                            status,
-                            body: body.clone(),
-                        };
-                        (attempt, Some(WriteRefusal::PaymentRequired { body }))
                     }
                     Some(Refused::Token) => {
                         token_refused = true;
                         let body = body_text(&mut r);
-                        let attempt = Attempt::Status {
-                            status,
-                            body: body.clone(),
-                        };
-                        (attempt, Some(WriteRefusal::Unauthorized { body }))
+                        let refusal = proof.map(|proof| proof.refusal(status, body.clone()));
+                        (Attempt::Status { status, body }, refusal)
                     }
                     None => match status {
                         200..=299 => {
@@ -420,26 +468,20 @@ pub(crate) fn append(
                             };
                         }
                         // A definite rejection (429 is retried, below), final: the append fails
-                        // alone when the answer is marked and no earlier attempt can have reached
-                        // the stream.
+                        // alone when the answer proves it applied nothing and no earlier attempt
+                        // can have reached the stream.
                         400..=499 if status != 429 => {
                             let body = body_text(&mut r);
-                            return match marked {
-                                Some(reason) if !reached => {
-                                    Append::Refused(WriteRefusal::NotApplied { status, reason })
+                            return match proof {
+                                Some(proof) if !reached => {
+                                    Append::Refused(proof.refusal(status, body))
                                 }
                                 _ => Append::Failed(Error::AppendRejected { status, body }),
                             };
                         }
                         _ => {
                             let body = body_text(&mut r);
-                            let refusal = match marked {
-                                Some(reason) => Some(WriteRefusal::NotApplied { status, reason }),
-                                None if status == 429 => {
-                                    Some(WriteRefusal::RateLimited { body: body.clone() })
-                                }
-                                None => None,
-                            };
+                            let refusal = proof.map(|proof| proof.refusal(status, body.clone()));
                             (Attempt::Status { status, body }, refusal)
                         }
                     },
@@ -447,8 +489,9 @@ pub(crate) fn append(
             }
             Err(e) => (Attempt::Transport(Box::new(e)), None),
         };
-        // Any answer but a refusal that applied nothing, or none, may come after the stream
-        // applied the append (see above).
+        // An answer that does not prove the attempt applied nothing (`refusal` is set exactly
+        // when `applied_nothing` proved it), or none, may come after the stream applied the
+        // append (see above).
         reached |= refusal.is_none();
         // A retried commit is a stall the application sees: say why, attempt by attempt, and
         // whether another attempt follows.
@@ -711,8 +754,10 @@ pub(crate) fn get_snapshot(
 /// `PUT` to stream incarnation `incarnation` (a 412 when it is not) with retries while the outcome
 /// is unknown (transport errors, 5xx): both publishing a snapshot and advancing retention are
 /// idempotent, so a 402 fails the request alone ([`Error::Refused`]), whatever an earlier attempt
-/// did. Returns the status and response. Gives up once `stopped` (a re-attach is waiting for the
-/// snapshot thread).
+/// did. No other answer refuses it, whatever headers it carries: no answer here decides a producer
+/// sequence, so none needs `applied_nothing`, and a marked 413 for a snapshot body over a gateway's
+/// limit stays a snapshot failure, which the snapshot thread counts. Returns the status and
+/// response. Gives up once `stopped` (a re-attach is waiting for the snapshot thread).
 pub(crate) fn put_idempotent(
     url: &str,
     incarnation: &str,
@@ -842,6 +887,21 @@ pub(crate) mod mock {
         )
     }
 
+    /// A gateway's vouch for the marker, as a header line of an answer: alone, it proves nothing.
+    pub(crate) const VOUCH: &str = "x-ursula-not-applied-checked: 1";
+
+    /// The header line that marks an answer as applying nothing, with `token`, as a node or a
+    /// gateway before 0.7.3 sends it: alone, it proves nothing.
+    pub(crate) fn marker(token: &str) -> String {
+        format!("x-ursula-not-applied: {token}")
+    }
+
+    /// The header lines of an answer marked as applying nothing, with `token`, and vouched for by a
+    /// gateway from 0.7.3 on: the marker counts.
+    pub(crate) fn vouched(token: &str) -> String {
+        format!("{}\r\n{VOUCH}", marker(token))
+    }
+
     /// The value of header `name` in a request head `serve` returned.
     pub(crate) fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
         request.split("\r\n").find_map(|line| {
@@ -864,9 +924,12 @@ mod tests {
     use super::head;
     use super::in_clear;
     use super::mock::LAST;
+    use super::mock::VOUCH;
     use super::mock::answer;
     use super::mock::answer_with_body;
+    use super::mock::marker;
     use super::mock::serve;
+    use super::mock::vouched;
     use super::put_idempotent;
     use super::read_from;
     use crate::auth::set_token;
@@ -950,26 +1013,26 @@ mod tests {
     // Every request carries the token. A 401 is an authorizer refusing it: the request is sent
     // again (with the token read again) within the retry budget, a create too. A 403 is a fence
     // only with the epoch that owns the stream (the server's); without it, an authorizer's final
-    // denial, never taken for a fence. Marked `x-ursula-not-applied`, it refuses an append none of
-    // whose attempts can have reached the stream (nothing was appended). Unmarked (a filtering
-    // proxy may have answered it after the stream applied the append), or after an attempt whose
-    // outcome is unknown, it fails the append.
+    // denial, never taken for a fence. Marked `x-ursula-not-applied` with a gateway's vouch, it
+    // refuses an append none of whose attempts can have reached the stream (nothing was appended).
+    // Unmarked (a filtering proxy may have answered it after the stream applied the append), or
+    // after an attempt whose outcome is unknown, it fails the append.
     #[test]
     fn auth_refusals_are_retried_or_final_never_fences() {
         set_token(Some("t1"));
         let denied =
-            |marker: &str| answer_with_body(&format!("403 Forbidden{marker}"), "read only");
-        let marked = "\r\nx-ursula-not-applied: Forbidden";
+            |headers: &str| answer_with_body(&format!("403 Forbidden{headers}"), "read only");
+        let marked = format!("\r\n{}", vouched("Forbidden"));
         let (url, server) = serve(vec![
             answer("401 Unauthorized\r\nwww-authenticate: Bearer error=\"invalid_token\""),
             answer("200 OK\r\nstream-next-offset: 9"),
             answer("401 Unauthorized"),
             answer("200 OK\r\nstream-incarnation: i1"),
             answer("403 Forbidden\r\nproducer-epoch: 4"),
-            denied(marked),
+            denied(&marked),
             denied(""),
             answer("503 Service Unavailable\r\nretry-after: 0"),
-            denied(marked),
+            denied(&marked),
             answer("401 Unauthorized"),
             answer("201 Created"),
         ]);
@@ -1132,17 +1195,15 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 2);
     }
 
-    // Answers that applied nothing (401, 429, or marked `x-ursula-not-applied`, whatever the
-    // status) leave the outcome known: when the budget runs out on them, the append is refused,
-    // with the last answer's reason (the marker's token when there is one, cut like a body; an
-    // empty marker still marks), and the producer sequence is free. A marked final answer refuses
-    // it at once.
+    // Answers that applied nothing (401, 429, or marked `x-ursula-not-applied` with a gateway's
+    // vouch, whatever the status) leave the outcome known: when the budget runs out on them, the
+    // append is refused, with the last answer's reason (the marker's token when there is one, cut
+    // like a body; an empty marker still marks), and the producer sequence is free. A marked final
+    // answer refuses it at once.
     #[test]
     fn refusals_that_applied_nothing_refuse_the_append_when_the_budget_runs_out() {
         let marked = |status: &str, token: &str, last: &str| {
-            answer(&format!(
-                "{status}\r\nx-ursula-not-applied: {token}\r\n{last}"
-            ))
+            answer(&format!("{status}\r\n{}\r\n{last}", vouched(token)))
         };
         let (url, server) = serve(vec![
             // The token refused to the end, read again before every attempt.
@@ -1166,7 +1227,10 @@ mod tests {
             // A marked 429 is named by its marker.
             marked("429 Too Many Requests", "TenantRateLimited", LAST),
             // A marked final answer: refused at once. Unmarked: rejected (poisons).
-            answer("413 Payload Too Large\r\nx-ursula-not-applied: RequestBodyTooLarge"),
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                vouched("RequestBodyTooLarge")
+            )),
             answer("413 Payload Too Large"),
             // A marker without a token, and one with a token too long to show whole.
             marked("503 Service Unavailable", "", LAST),
@@ -1217,14 +1281,15 @@ mod tests {
     }
 
     // One attempt whose outcome is unknown (no answer, an unmarked 5xx) and the append may be in
-    // the stream: refusals before or after it prove nothing about it, so a budget that runs out
-    // fails the append as unknown (or as unauthorized, after a refused token), and a marked final
-    // answer is a rejection.
+    // the stream: refusals before or after it prove nothing about it, vouched for or not, so a
+    // budget that runs out fails the append as unknown (or as unauthorized, after a refused token),
+    // and a marked final answer is a rejection.
     #[test]
     fn one_unknown_outcome_among_refusals_keeps_the_append_unknown() {
         let pressure = |last: &str| {
             answer(&format!(
-                "503 Service Unavailable\r\nx-ursula-not-applied: RaftLogPressure\r\n{last}"
+                "503 Service Unavailable\r\n{}\r\n{last}",
+                vouched("RaftLogPressure")
             ))
         };
         let (url, server) = serve(vec![
@@ -1239,7 +1304,10 @@ mod tests {
             answer(&format!("401 Unauthorized\r\n{LAST}")),
             // An unmarked 503, then a marked final answer.
             answer("503 Service Unavailable\r\nretry-after: 0"),
-            answer("413 Payload Too Large\r\nx-ursula-not-applied: RequestBodyTooLarge"),
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                vouched("RequestBodyTooLarge")
+            )),
         ]);
         let unknown = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
@@ -1265,5 +1333,94 @@ mod tests {
             Append::Failed(Error::AppendRejected { status: 413, .. })
         ));
         assert_eq!(server.join().unwrap().len(), 8);
+    }
+
+    // A marker counts only with a gateway's vouch (`applied_nothing`), and the vouch alone proves
+    // nothing: an answer with one of the two headers is read by its status alone. A 503 is then an
+    // unknown outcome, so a budget that runs out on it fails the append as unknown (a poison), and
+    // a 403 or a 413 fails it. A 401, 402 or 429 proves by its status that it applied nothing, with
+    // either header or none (a 429 marked alone is rate limiting). One attempt marked alone among
+    // vouched refusals leaves the append unknown.
+    #[test]
+    fn a_marker_proves_nothing_without_the_vouch() {
+        let unavailable = |headers: &str, last: &str| {
+            answer(&format!("503 Service Unavailable\r\n{headers}\r\n{last}"))
+        };
+        let (url, server) = serve(vec![
+            // The marker alone, and the vouch alone, to the end.
+            unavailable(&marker("RaftLogPressure"), LAST),
+            unavailable(VOUCH, LAST),
+            // A denial and a request too large, each with one of the two headers.
+            answer(&format!("403 Forbidden\r\n{}", marker("Forbidden"))),
+            answer(&format!("403 Forbidden\r\n{VOUCH}")),
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                marker("RequestBodyTooLarge")
+            )),
+            answer(&format!("413 Payload Too Large\r\n{VOUCH}")),
+            // A refused token, a 402 and a 429, marked alone: their status proves it.
+            answer(&format!(
+                "401 Unauthorized\r\n{}\r\n{LAST}",
+                marker("TokenExpired")
+            )),
+            answer_with_body(
+                &format!("402 Payment Required\r\n{}", marker("QuotaExhausted")),
+                "quota",
+            ),
+            answer_with_body(
+                &format!(
+                    "429 Too Many Requests\r\n{}\r\n{LAST}",
+                    marker("TenantRateLimited")
+                ),
+                "slow down",
+            ),
+            // Vouched refusals around one marked alone.
+            unavailable(&vouched("RaftLogPressure"), "retry-after: 0"),
+            unavailable(&marker("RaftLogPressure"), "retry-after: 0"),
+            unavailable(&vouched("RaftLogPressure"), LAST),
+        ]);
+        for _ in 0..2 {
+            let unknown = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(matches!(
+                unknown,
+                Append::Failed(Error::AppendUnknown {
+                    attempts: 1,
+                    last: Attempt::Status { status: 503, .. }
+                })
+            ));
+        }
+        for _ in 0..2 {
+            let denied = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(matches!(
+                denied,
+                Append::Failed(Error::Unauthorized { status: 403, .. })
+            ));
+        }
+        for _ in 0..2 {
+            let rejected = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(matches!(
+                rejected,
+                Append::Failed(Error::AppendRejected { status: 413, .. })
+            ));
+        }
+        let token = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            token,
+            Append::Refused(WriteRefusal::Unauthorized { .. })
+        ));
+        let payment = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&payment, Append::Refused(WriteRefusal::PaymentRequired { body }) if body == "quota")
+        );
+        let limited = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&limited, Append::Refused(WriteRefusal::RateLimited { body }) if body == "slow down")
+        );
+        let mixed = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            mixed,
+            Append::Failed(Error::AppendUnknown { attempts: 3, .. })
+        ));
+        assert_eq!(server.join().unwrap().len(), 12);
     }
 }

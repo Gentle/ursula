@@ -327,18 +327,20 @@ pub(crate) enum WriteRefusal {
         with_body(.body)
     )]
     Unauthorized { body: String },
-    /// 403 without `Producer-Epoch`, marked `x-ursula-not-applied`: an authorizer denied the write
-    /// before passing it on (the server's fence names the epoch that owns the stream, and an
-    /// unmarked 403 may have replaced the stream's own answer: `client::append`).
+    /// 403 without `Producer-Epoch`, marked `x-ursula-not-applied` with a gateway's vouch: an
+    /// authorizer denied the write before passing it on (the server's fence names the epoch that
+    /// owns the stream, and any other 403 may have replaced the stream's own answer:
+    /// `client::append`).
     #[error("403{}: an authorizer denied it", with_body(.body))]
     Forbidden { body: String },
-    /// 429 until the retry budget ran out, unmarked (`NotApplied` otherwise).
+    /// 429 until the retry budget ran out, without a vouched marker (`NotApplied` otherwise).
     #[error("429{}: rate limited until the retry budget ran out", with_body(.body))]
     RateLimited { body: String },
     /// An answer marked `x-ursula-not-applied` (the server's ingress admission, a gateway or a
-    /// proxy refusing it before passing it on): a final one, or the last one when the retry budget
-    /// ran out. A marked 401, 402 or 403 keeps its own kind. `reason` is the marker's token
-    /// (`RaftLogPressure`, say), empty when it has none.
+    /// proxy refusing it before passing it on) and vouched for by a gateway
+    /// (`x-ursula-not-applied-checked`, see `client::applied_nothing`): a final one, or the last
+    /// one when the retry budget ran out. A marked 401, 402 or 403 keeps its own kind. `reason` is
+    /// the marker's token (`RaftLogPressure`, say), empty when it has none.
     #[error("{status} (not applied{})", with_token(.reason))]
     NotApplied { status: u16, reason: String },
 }

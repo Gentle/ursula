@@ -1,10 +1,11 @@
 // Writes refused before they reach the stream for other reasons than a 402: answers marked
 // `x-ursula-not-applied` (the server's admission while it is under write pressure, a gateway that
-// cannot authorize a request, an authorizer's 403), and a token refused until the retry budget runs
-// out. Nothing of such a write was applied, so it fails alone, as a refused 402 does: the commit is
-// rolled back but the file is not poisoned, reads go on, and the next commit goes out as usual and
-// succeeds once the refusals stop. An attempt whose outcome is unknown among the refusals still
-// poisons: the commit may be in the stream. The refusing layer is `gate.mjs`.
+// cannot authorize a request, an authorizer's 403) and vouched for by a gateway with
+// `x-ursula-not-applied-checked`, and a token refused until the retry budget runs out. Nothing of
+// such a write was applied, so it fails alone, as a refused 402 does: the commit is rolled back but
+// the file is not poisoned, reads go on, and the next commit goes out as usual and succeeds once the
+// refusals stop. An attempt whose outcome is unknown among the refusals still poisons: the commit may
+// be in the stream. So does a marker without the vouch. The refusing layer is `gate.mjs`.
 import { writeFileSync } from "node:fs";
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
 import { attach, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
@@ -18,11 +19,15 @@ const COMMIT_REFUSED = 7178;
 const POISONED = 778;
 /** SQLITE_ERROR: an attach that failed for any other reason than a refusal. */
 const SQLITE_ERROR = 1;
-/** The server's answer while its Raft log is over its hard limit, marked as applying nothing. */
-const PRESSURE = { status: 503, headers: { "x-ursula-not-applied": "RaftLogPressure", "retry-after": "1" } };
+/** The vouch with which a gateway (Ursula's, from 0.7.3 on) makes the marker count. */
+const VOUCH = { "x-ursula-not-applied-checked": "1" };
+/** The server's answer while its Raft log is over its hard limit, marked as applying nothing, through a gateway that vouches for the marker. */
+const PRESSURE = { status: 503, headers: { "x-ursula-not-applied": "RaftLogPressure", ...VOUCH, "retry-after": "1" } };
+/** The same answer as a node sends it, or a gateway before 0.7.3 relays it: the marker alone. */
+const UNVOUCHED_PRESSURE = { status: 503, headers: { "x-ursula-not-applied": "RaftLogPressure", "retry-after": "1" } };
 const PRESSURE_BODY = '{"error":"RaftLogPressure"}';
 /** An authorizer's denial, marked as applying nothing the way Ursula's gateway marks it. */
-const DENIED = { status: 403, headers: { "x-ursula-not-applied": "Forbidden" } };
+const DENIED = { status: 403, headers: { "x-ursula-not-applied": "Forbidden", ...VOUCH } };
 /** A retry budget that runs out after two attempts answered `Retry-After: 1`. */
 const SHORT_BUDGET = { URSULA_VFS_RETRY_MS: "1500" };
 
@@ -142,11 +147,47 @@ it("an append whose answer was lost and whose retries are refused as applying no
 	expect(xs(copy)).toEqual(["once"]);
 });
 
-// An authorizer's 403 marked `x-ursula-not-applied` (as Ursula's gateway marks its denials) is final
-// and applied nothing: the commit fails alone at once, without waiting out the budget. An attach whose
-// claim it refuses claims nothing and throws UrsulaWriteRefusedError, and a read-only attach reads the
-// database meanwhile. Without the marker a 403 says nothing about the stream (a filtering proxy can send
-// one after the stream applied the write): the commit poisons, and the attach fails as before.
+// The marker counts only with a gateway's vouch: a node sends it alone, and a gateway before 0.7.3
+// relays it alone on an answer it got by following a redirect, which a node can send after it proposed
+// the write. A commit refused with the marker alone until the budget runs out poisons, as a commit
+// whose outcome is unknown does, and an attach whose claim a 403 marked alone denies fails as before
+// 0.7.3, not with UrsulaWriteRefusedError.
+it("a refusal marked without a gateway's vouch proves nothing: the commit poisons, and the attach fails as before", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const armed = `${file}.armed`;
+	const child = runChild(file, gate.url + path, ["CREATE TABLE t(x TEXT)", `@wait:${armed}`, "INSERT INTO t VALUES ('u1')"], { CHILD_EXIT: "1", ...SHORT_BUDGET });
+	await child.waitFor((l) => l.step === 1 && l.phase === "start");
+	await gate.refuse(PRESSURE_BODY, UNVOUCHED_PRESSURE);
+	writeFileSync(armed, "");
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code, child.stderr()).toBe(0);
+	expect(step(child, 2)).toMatchObject({ ok: false, errcode: POISONED });
+	expect(done).toMatchObject({ poisoned: true, fenced: false, writes_refused: false, refused_kind: null });
+	expect(done.reason).toMatch(/outcome unknown/);
+	expect(child.stderr()).not.toMatch(/event=writes_refused/);
+
+	await gate.refuse("write access denied", { status: 403, headers: { "x-ursula-not-applied": "Forbidden" } });
+	const reader = freshFile();
+	let error: unknown;
+	try {
+		attach(reader, gate.url + path);
+	} catch (e) {
+		error = e;
+	}
+	expect(error).not.toBeInstanceOf(UrsulaWriteRefusedError);
+	expect(errcode(error)).toBe(SQLITE_ERROR);
+	// The gate refused every attempt of the commit: the stream holds the table alone.
+	attach(reader, gate.url + path, { readOnly: true });
+	expect(xs(reader)).toEqual([]);
+});
+
+// An authorizer's 403 marked `x-ursula-not-applied` and vouched for (as Ursula's gateway marks its
+// denials) is final and applied nothing: the commit fails alone at once, without waiting out the
+// budget. An attach whose claim it refuses claims nothing and throws UrsulaWriteRefusedError, and a
+// read-only attach reads the database meanwhile. Without the marker a 403 says nothing about the
+// stream (a filtering proxy can send one after the stream applied the write): the commit poisons, and
+// the attach fails as before.
 it("an authorizer's marked 403 fails a commit alone at once, and an attach it refuses throws UrsulaWriteRefusedError", async () => {
 	const path = streamPath();
 	const file = freshFile();

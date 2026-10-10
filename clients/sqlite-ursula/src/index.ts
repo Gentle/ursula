@@ -215,13 +215,16 @@ export class UrsulaReplicationError extends Error {
  *
  * - `payment_required`: a layer in front of the stream answered `402 Payment Required`;
  * - `unauthorized`: the token was refused (`401`) until the retry budget ran out;
- * - `forbidden`: an authorizer denied the write with a `403` marked `x-ursula-not-applied` (an unmarked
- *   `403` fails the commit and poisons the file, since a filtering proxy can send one after the stream
- *   applied the write);
+ * - `forbidden`: an authorizer denied the write with a `403` marked `x-ursula-not-applied`, which a
+ *   gateway vouched for with `x-ursula-not-applied-checked` (any other `403` fails the commit and
+ *   poisons the file, since a filtering proxy can send one after the stream applied the write);
  * - `rate_limited`: `429` until the retry budget ran out;
- * - `not_applied`: other answers marked `x-ursula-not-applied` (the server under write pressure, or a
- *   gateway that could not authorize the request) until the retry budget ran out, or a marked final
- *   answer such as a `413`.
+ * - `not_applied`: other answers marked `x-ursula-not-applied` and vouched for by a gateway (the server
+ *   under write pressure, or a gateway that could not authorize the request) until the retry budget
+ *   ran out, or a marked final answer such as a `413`.
+ *
+ * The marker counts only with the vouch, which `ursula gateway` adds from 0.7.3 on. Without such a
+ * gateway in front of the servers, only a `401`, `402` or `429` refuses a write this way.
  */
 export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden" | "rate_limited" | "not_applied";
 

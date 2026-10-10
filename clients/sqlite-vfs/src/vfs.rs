@@ -1094,9 +1094,13 @@ mod tests {
 
     use super::lost_page;
     use crate::client::mock::LAST;
+    use crate::client::mock::VOUCH;
     use crate::client::mock::answer;
+    use crate::client::mock::answer_with_body;
+    use crate::client::mock::marker;
     use crate::client::mock::request_header;
     use crate::client::mock::serve;
+    use crate::client::mock::vouched;
     use crate::db::Db;
     use crate::error::Error;
     use crate::error::WriteRefusal;
@@ -1104,11 +1108,15 @@ mod tests {
     use crate::wal::FIRST_PAGE;
     use crate::wal::FRAME;
 
-    /// The server's answer under pressure: refused at ingress, marked as applying nothing.
+    /// The server's answer under pressure: refused at ingress, marked as applying nothing, through
+    /// a gateway that vouches for the marker.
     fn pressure(token: &str, last: &str) -> String {
-        answer(&format!(
-            "503 Service Unavailable\r\nx-ursula-not-applied: {token}\r\n{last}"
-        ))
+        unavailable(&vouched(token), last)
+    }
+
+    /// A 503 with header lines `headers`, then `last`.
+    fn unavailable(headers: &str, last: &str) -> String {
+        answer(&format!("503 Service Unavailable\r\n{headers}\r\n{last}"))
     }
 
     /// An owner at sequence 4 and offset 9 of the stream `url` serves.
@@ -1128,10 +1136,11 @@ mod tests {
     // A commit every attempt of which was refused before it reached the stream fails alone with
     // SQLITE_IOERR_AUTH (`Db::refuse`): the owner is not poisoned and keeps its epoch, sequence and
     // offset, so the next commit goes out with the same producer sequence and is acknowledged once
-    // the refusals stop. One attempt whose outcome is unknown among the refusals poisons instead:
-    // the append may be in the stream, and the next commit would be acknowledged as its duplicate.
-    // So does a 403 that does not say it applied nothing (a filtering proxy may have sent it after
-    // the stream applied the append).
+    // the refusals stop. A 401, 402 or 429 proves it by its status, any other answer by a marker
+    // with a gateway's vouch. One attempt whose outcome is unknown among the refusals poisons
+    // instead: the append may be in the stream, and the next commit would be acknowledged as its
+    // duplicate. So does a 403 that does not say it applied nothing (a filtering proxy may have
+    // sent it after the stream applied the append).
     #[test]
     fn a_commit_refused_before_the_stream_fails_alone_but_an_unknown_outcome_poisons() {
         let (url, server) = serve(vec![
@@ -1141,7 +1150,16 @@ mod tests {
             // The token refused until the budget runs out.
             answer(&format!("401 Unauthorized\r\n{LAST}")),
             // An authorizer's denial, marked: at once.
-            answer("403 Forbidden\r\nx-ursula-not-applied: Forbidden"),
+            answer(&format!("403 Forbidden\r\n{}", vouched("Forbidden"))),
+            // A quota in front of the stream: at once.
+            answer_with_body("402 Payment Required", "quota exhausted"),
+            // Rate limited until the budget runs out.
+            answer(&format!("429 Too Many Requests\r\n{LAST}")),
+            // A commit over a layer's request limit, marked: at once.
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                vouched("RequestBodyTooLarge")
+            )),
             // Accepted again.
             answer("200 OK\r\nstream-next-offset: 00000000000000000012"),
             // No answer, then refusals until the budget runs out.
@@ -1165,6 +1183,21 @@ mod tests {
         assert!(matches!(d.refused, Some(WriteRefusal::Unauthorized { .. })));
         assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
         assert!(matches!(d.refused, Some(WriteRefusal::Forbidden { .. })));
+        assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
+        assert!(matches!(
+            d.refused,
+            Some(WriteRefusal::PaymentRequired { .. })
+        ));
+        assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
+        assert!(matches!(d.refused, Some(WriteRefusal::RateLimited { .. })));
+        assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
+        assert_eq!(
+            d.refused,
+            Some(WriteRefusal::NotApplied {
+                status: 413,
+                reason: "RequestBodyTooLarge".into()
+            })
+        );
         assert!(d.poisoned.is_none());
         assert_eq!(at(&d), (2, 4, "00000000000000000009"));
         assert_eq!(d.append_commit(b"frame"), Ok(1));
@@ -1188,7 +1221,64 @@ mod tests {
             .iter()
             .map(|r| request_header(r, "producer-seq").unwrap())
             .collect();
-        assert_eq!(seqs, ["5", "5", "5", "5", "5", "6", "6", "5"]);
+        assert_eq!(seqs, [
+            "5", "5", "5", "5", "5", "5", "5", "5", "6", "6", "5"
+        ]);
+    }
+
+    // A marker counts only with a gateway's vouch (`client::applied_nothing`): a node sends it
+    // alone, and a gateway before 0.7.3 relays it alone on an answer it got by following a
+    // redirect that a node can send after it proposed the commit. The vouch alone proves nothing
+    // either. So a commit refused that way until the budget runs out poisons as an unknown
+    // outcome, a 403 or a 413 so marked poisons as a failure, and one attempt marked alone among
+    // vouched refusals poisons too. Each time the owner keeps no refusal.
+    #[test]
+    fn a_marker_without_the_vouch_proves_nothing_and_the_commit_poisons() {
+        let (url, server) = serve(vec![
+            // The marker alone until the budget runs out.
+            unavailable(&marker("RaftLogPressure"), "retry-after: 0"),
+            unavailable(&marker("RaftLogPressure"), LAST),
+            // The vouch alone until the budget runs out.
+            unavailable(VOUCH, LAST),
+            // A denial and a commit over a request limit, marked alone.
+            answer(&format!("403 Forbidden\r\n{}", marker("Forbidden"))),
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                marker("RequestBodyTooLarge")
+            )),
+            // Vouched refusals around one marked alone.
+            pressure("RaftLogPressure", "retry-after: 0"),
+            unavailable(&marker("RaftLogPressure"), "retry-after: 0"),
+            pressure("RaftLogPressure", LAST),
+        ]);
+        let poison = |url: &str| {
+            let mut d = owner(url.to_owned());
+            assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_WRITE));
+            assert!(!d.fenced() && d.refused.is_none());
+            assert_eq!(at(&d), (2, 4, "00000000000000000009"));
+            d.poisoned.map(|p| p.first)
+        };
+        assert!(matches!(
+            poison(&url),
+            Some(Error::AppendUnknown { attempts: 2, .. })
+        ));
+        assert!(matches!(
+            poison(&url),
+            Some(Error::AppendUnknown { attempts: 1, .. })
+        ));
+        assert!(matches!(
+            poison(&url),
+            Some(Error::Unauthorized { status: 403, .. })
+        ));
+        assert!(matches!(
+            poison(&url),
+            Some(Error::AppendRejected { status: 413, .. })
+        ));
+        assert!(matches!(
+            poison(&url),
+            Some(Error::AppendUnknown { attempts: 3, .. })
+        ));
+        assert_eq!(server.join().unwrap().len(), 8);
     }
 
     // The server expired the owner's producer: the owner takes the stream back before the commit

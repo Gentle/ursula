@@ -46,16 +46,18 @@
 //!   fails the transaction alone with SQLITE_IOERR_AUTH: a 402 from a layer in front of the stream
 //!   (an authorizer, a quota or billing service) or a 4xx marked `x-ursula-not-applied` (an
 //!   authorizer's 403 among them) at once, and 401s, 429s and 5xx marked `x-ursula-not-applied`
-//!   (the server's ingress admission under pressure, a gateway or a proxy that refused it before
-//!   passing it on) once the retry budget runs out on them. Nothing of it reached the stream, so
-//!   the database is not poisoned, reads go on from the local files, and the next commit is sent
-//!   as usual (the epoch and the claim stay valid). Unless an attempt of the append may have
-//!   reached the stream (no answer, or an unmarked 5xx): its outcome is then unknown, and the
-//!   commit poisons as on an exhausted budget (see `client::append`). So does an unmarked 403
-//!   without `Producer-Epoch`, which a filtering proxy may send in place of the stream's own
-//!   answer. The overlay belongs to the write transaction: it is cleared whenever the WAL write
-//!   lock is taken or released, so a rolled-back transaction's spilled frames never shadow a later
-//!   one's.
+//!   (the server's ingress admission under pressure, a gateway that refused it before passing it
+//!   on) once the retry budget runs out on them. A marker counts only with the vouch
+//!   `x-ursula-not-applied-checked`, which Ursula's gateway adds from 0.7.3 on and a node never
+//!   sends (see `client::applied_nothing`): without a gateway, only a 401, 402 or 429 counts.
+//!   Nothing of it reached the stream, so the database is not poisoned, reads go on from the local
+//!   files, and the next commit is sent as usual (the epoch and the claim stay valid). Unless an
+//!   attempt of the append may have reached the stream (no answer, or a 5xx without a vouched
+//!   marker): its outcome is then unknown, and the commit poisons as on an exhausted budget (see
+//!   `client::append`). So does a 403 without `Producer-Epoch` or a vouched marker, which a
+//!   filtering proxy may send in place of the stream's own answer. The overlay belongs to the
+//!   write transaction: it is cleared whenever the WAL write lock is taken or released, so a
+//!   rolled-back transaction's spilled frames never shadow a later one's.
 //! * Durability is the stream's acknowledgement alone: the local files (db, -wal, -shm, sidecar)
 //!   are a cache, not fsynced on the commit path (`xSync` of an attached database is a no-op,
 //!   whatever `PRAGMA synchronous` says). The sidecar records the kernel's boot id, the stream's

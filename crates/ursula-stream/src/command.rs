@@ -202,6 +202,8 @@ impl StreamCommand {
     /// bytes plus a fixed allowance per command, message end and chunk
     /// reference. Snapshot cadence (bounded-state F12e) counts log bytes
     /// with it, so it needs to track payload volume, not exact encodings.
+    /// A log read also weighs entries with it to bound each Append call to a
+    /// follower (#507).
     pub fn log_bytes_estimate(&self) -> u64 {
         let variable = match self {
             Self::CreateStream {
@@ -220,7 +222,10 @@ impl StreamCommand {
             // Each stream's allowance, hot payload, inline snapshot body and
             // chunk references: a restored group's import is one entry. The
             // bodies are `Vec<u8>`, which MessagePack writes as an array of
-            // integers, two bytes for each byte from 0x80 up.
+            // integers, two bytes for each byte from 0x80 up. The rest of a
+            // stream, such as its names and producer receipts, has only the
+            // allowance, so many streams with small bodies weigh less than
+            // they encode to.
             Self::ImportSnapshot { snapshot } => snapshot
                 .streams
                 .iter()

@@ -101,7 +101,7 @@ enum Outcome {
     /// checkpoint kept it busy): try again shortly.
     Busy,
     /// A layer in front of the stream refused the publish or the retention move with 402 Payment
-    /// Required (`Db::payment_refused`): no snapshot is taken until a commit is acknowledged again,
+    /// Required (`Db::writes_refused`): no snapshot is taken until a commit is acknowledged again,
     /// which requests one if it is still due (nothing adds to the log meanwhile).
     Refused,
 }
@@ -196,13 +196,10 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
     let (url, incarnation, offset, epoch, pages, log) = {
         let mut d = lock(db);
         loop {
-            // While writes are refused with 402 (`Outcome::Refused`), a snapshot would be refused
-            // too: not taken until a commit is acknowledged again.
-            if !d.snapshot_due()
-                || d.poisoned.is_some()
-                || d.payment_required.is_some()
-                || stopped()
-            {
+            // While writes are refused before they reach the stream (a refused commit, or
+            // `Outcome::Refused`), a snapshot would be refused too: not taken until a commit is
+            // acknowledged again.
+            if !d.snapshot_due() || d.poisoned.is_some() || d.refused.is_some() || stopped() {
                 d.window_wanted = false;
                 snapper.window_cv.notify_all();
                 return Ok(Outcome::Skipped);
@@ -288,8 +285,8 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
     };
     // A 402 in front of the stream: nothing was published or moved (`Outcome::Refused`).
     let refused = |e: Error, during: &str| match e {
-        Error::PaymentRequired { body, .. } => {
-            lock(db).payment_refused(body, during);
+        Error::Refused { refusal, .. } => {
+            lock(db).writes_refused(refusal, during);
             Ok(Outcome::Refused)
         }
         e => Err(e),

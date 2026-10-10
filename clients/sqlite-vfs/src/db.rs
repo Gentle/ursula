@@ -18,6 +18,7 @@ use libsqlite3_sys as ffi;
 use crate::config::fail_post_ack;
 use crate::config::snapshot_min_bytes;
 use crate::error::Error;
+use crate::error::WriteRefusal;
 use crate::host::OK;
 use crate::log;
 use crate::log::Level;
@@ -83,11 +84,11 @@ pub(crate) struct Db {
     pub(crate) log: u64,
     /// Why the database is poisoned (re-attach to recover), see `set_poisoned`.
     pub(crate) poisoned: Option<Poisoned>,
-    /// A layer in front of the stream refused the latest write with 402 Payment Required, with its
-    /// explanation (see `payment_refused`): cleared by the next acknowledged commit. Never set
-    /// while `poisoned`: a poisoned database needs a re-attach whatever the layer does
+    /// Why the latest write was refused before it reached the stream, which applied nothing of it
+    /// (see `writes_refused`): cleared by the next acknowledged commit. Never set while
+    /// `poisoned`: a poisoned database needs a re-attach whatever the refusing layer does
     /// (`set_poisoned`).
-    pub(crate) payment_required: Option<String>,
+    pub(crate) refused: Option<WriteRefusal>,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
     /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame
     /// offset + 24).
@@ -214,8 +215,8 @@ impl Db {
     /// read again) or changes nothing (every commit is refused already). But a fence and a lost
     /// write are kept whenever they come (`Poisoned`), so [`Db::fenced`] and [`Db::damaged`] never
     /// flip back. Logged when it poisons the database, and when it fences a poisoned one. It drops
-    /// a refusal recorded before (`payment_required`): the database now needs a re-attach whatever
-    /// the layer in front of the stream does, so `ursula_status` reports the poison alone.
+    /// a refusal recorded before (`refused`): the database now needs a re-attach whatever the
+    /// refusing layer does, so `ursula_status` reports the poison alone.
     pub(crate) fn set_poisoned(&mut self, why: Error, during: Option<&str>) {
         let fenced = why.is_fenced();
         let damaged = why.is_local_damage();
@@ -244,43 +245,59 @@ impl Db {
                 });
             }
         }
-        self.payment_required = None;
+        self.refused = None;
     }
 
-    /// A layer in front of the stream refused the write transaction's commit with 402 Payment
-    /// Required, and nothing of it reached the stream (`Append::PaymentRequired`): the write fails
-    /// with SQLITE_IOERR_AUTH and SQLite rolls the transaction back, as on a poison, but the
-    /// database is not poisoned. Its epoch, producer sequence and offset still describe the
-    /// stream, so the next commit is sent as usual, and is acknowledged once the layer accepts
-    /// writes again: no attach is needed.
-    pub(crate) fn refuse(&mut self, body: String) -> c_int {
-        self.payment_refused(body, "commit");
+    /// The write transaction's commit was refused before it reached the stream, and so was every
+    /// attempt of it (`Append::Refused`): the write fails with SQLITE_IOERR_AUTH and SQLite rolls
+    /// the transaction back, as on a poison, but the database is not poisoned. Its epoch, producer
+    /// sequence and offset still describe the stream, so the next commit is sent as usual, and is
+    /// acknowledged once the refusals stop: no attach is needed.
+    pub(crate) fn refuse(&mut self, refusal: WriteRefusal) -> c_int {
+        self.writes_refused(refusal, "commit");
         self.overlay.clear();
         self.committed = false;
         ffi::SQLITE_IOERR_AUTH
     }
 
-    /// Records a write refused with 402 Payment Required (`during`: which, for the log), logged
-    /// when no refusal is recorded yet. A poisoned database records none (a snapshot publish under
-    /// way can be refused after the poison): see `set_poisoned`.
-    pub(crate) fn payment_refused(&mut self, body: String, during: &str) {
+    /// Records a write refused before it reached the stream (`during`: which, for the log), logged
+    /// when no refusal of its kind is recorded yet: a 402 as `payment_required` with the layer's
+    /// explanation (as since 0.7.1), any other as `writes_refused` with its kind. A poisoned
+    /// database records none (a snapshot publish under way can be refused after the poison): see
+    /// `set_poisoned`.
+    pub(crate) fn writes_refused(&mut self, refusal: WriteRefusal, during: &str) {
         if self.poisoned.is_some() {
             return;
         }
-        if self.payment_required.is_none() {
-            log::emit(Level::Warn, "payment_required", &[
-                ("file", &self.path),
-                ("stream", &self.url),
-                ("during", &during),
-                ("reason", &body),
-            ]);
+        if self
+            .refused
+            .as_ref()
+            .is_none_or(|last| last.kind() != refusal.kind())
+        {
+            match &refusal {
+                WriteRefusal::PaymentRequired { body } => {
+                    log::emit(Level::Warn, "payment_required", &[
+                        ("file", &self.path),
+                        ("stream", &self.url),
+                        ("during", &during),
+                        ("reason", body),
+                    ]);
+                }
+                other => log::emit(Level::Warn, "writes_refused", &[
+                    ("file", &self.path),
+                    ("stream", &self.url),
+                    ("during", &during),
+                    ("kind", &other.kind()),
+                    ("reason", other),
+                ]),
+            }
         }
-        self.payment_required = Some(body);
+        self.refused = Some(refusal);
     }
 
-    /// A commit was acknowledged: a layer that refused writes with 402 accepts them again.
+    /// A commit was acknowledged: whatever refused writes before accepts them again.
     pub(crate) fn writes_accepted(&mut self) {
-        if self.payment_required.take().is_some() {
+        if self.refused.take().is_some() {
             log::emit(Level::Info, "writes_resumed", &[
                 ("file", &self.path),
                 ("stream", &self.url),
@@ -404,7 +421,7 @@ impl Db {
             offset: crate::client::START.into(),
             log: 0,
             poisoned: None,
-            payment_required: None,
+            refused: None,
             overlay: BTreeMap::new(),
             wal_written: BTreeMap::new(),
             committed: false,
@@ -443,41 +460,55 @@ mod tests {
     use super::Mode;
     use crate::error::Error;
     use crate::error::Fence;
+    use crate::error::WriteRefusal;
 
-    // A commit refused with 402 fails its transaction alone: the overlay goes, as on a poison, but
-    // the database is not poisoned and keeps its epoch, sequence and offset, so the next commit
-    // goes out as usual. The refusal shows until a commit is acknowledged, or until a poison, which
-    // needs a re-attach whatever the layer does.
+    // A commit refused before it reached the stream (a 402, or any refusal that applied nothing)
+    // fails its transaction alone: the overlay goes, as on a poison, but the database is not
+    // poisoned and keeps its epoch, sequence and offset, so the next commit goes out as usual. The
+    // latest refusal shows until a commit is acknowledged, or until a poison, which needs a
+    // re-attach whatever the refusing layer does.
     #[test]
     fn a_refused_commit_fails_alone() {
+        let payment = |body: &str| WriteRefusal::PaymentRequired { body: body.into() };
+        let pressure = WriteRefusal::NotApplied {
+            status: 503,
+            reason: "RaftLogPressure".into(),
+        };
         let mut d = Db::for_tests();
         d.seq = 4;
         d.offset = "00000000000000000009".into();
         d.overlay.insert(0, vec![1u8; 32]);
         d.committed = true;
-        assert_eq!(d.refuse("quota exhausted".into()), ffi::SQLITE_IOERR_AUTH);
+        assert_eq!(d.refuse(payment("quota exhausted")), ffi::SQLITE_IOERR_AUTH);
         assert!(d.overlay.is_empty() && !d.committed);
         assert!(d.poisoned.is_none() && !d.fenced());
-        assert_eq!(d.payment_required.as_deref(), Some("quota exhausted"));
+        assert_eq!(d.refused, Some(payment("quota exhausted")));
         assert_eq!(
             (d.epoch, d.seq, d.offset.as_str()),
             (2, 4, "00000000000000000009")
         );
-        d.refuse(String::new());
-        assert_eq!(d.payment_required.as_deref(), Some(""));
+        d.refuse(payment(""));
+        assert_eq!(d.refused, Some(payment("")));
         d.writes_accepted();
-        assert!(d.payment_required.is_none());
+        assert!(d.refused.is_none());
+        // Any other refusal that applied nothing: the same, with its own reason.
+        d.overlay.insert(0, vec![1u8; 32]);
+        assert_eq!(d.refuse(pressure.clone()), ffi::SQLITE_IOERR_AUTH);
+        assert!(d.overlay.is_empty() && d.poisoned.is_none());
+        assert_eq!((d.seq, d.refused.as_ref()), (4, Some(&pressure)));
+        d.refuse(payment("quota exhausted"));
+        assert_eq!(d.refused, Some(payment("quota exhausted")));
         // A fence after a refusal still poisons, and the poison clears the refusal.
-        d.refuse("quota exhausted".into());
         d.poison(Error::Fenced(Fence::Superseded {
             epoch: 2,
             current: Some(3),
         }));
         assert!(d.fenced());
-        assert!(d.payment_required.is_none());
+        assert!(d.refused.is_none());
         // A refusal after a poison (a snapshot publish under way) is not recorded.
-        d.payment_refused("quota exhausted".into(), "snapshot publish");
-        assert!(d.payment_required.is_none());
+        d.writes_refused(payment("quota exhausted"), "snapshot publish");
+        d.writes_refused(pressure, "commit");
+        assert!(d.refused.is_none() && d.fenced());
     }
 
     #[test]

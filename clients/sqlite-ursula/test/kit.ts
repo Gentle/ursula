@@ -70,6 +70,10 @@ export type ChildLine = {
 	payment_required?: boolean;
 	payment_reason?: string | null;
 	read_only?: boolean;
+	/** On `done`: whether the latest write was refused before it reached the stream, what refused it and why. */
+	writes_refused?: boolean;
+	refused_kind?: string | null;
+	refused_reason?: string | null;
 	/** On a `@status` step: `ursula_status`. */
 	status?: AttachStatus;
 	/** On `done`: snapshots published, the latest known snapshot and the retention this owner set. */
@@ -214,10 +218,14 @@ export class StallProxy {
 	}
 }
 
+/** How the gate answers the writes it refuses: `402` without extra headers unless set. */
+export type Refusal = { status?: number; headers?: Record<string, string> };
+
 /**
- * An HTTP layer in front of the node that refuses writes with `402 Payment Required` on demand, the
- * way an authorizer or a quota or billing service may (`gate.mjs`). It runs in a process of its own,
- * so this process can attach and commit through it synchronously.
+ * An HTTP layer in front of the node that refuses writes on demand (`gate.mjs`), with `402 Payment
+ * Required` by default, the way an authorizer or a quota or billing service may, or with any status
+ * and headers. It runs in a process of its own, so this process can attach and commit through it
+ * synchronously.
  */
 export class Gate {
 	private readonly proc: ChildProcess;
@@ -243,16 +251,17 @@ export class Gate {
 	}
 
 	/**
-	 * Answers writes `402` with `body` from now on, without forwarding them: `limit` of them at most,
-	 * and only those with one of `methods` (POST and PUT by default). `null` forwards them again.
+	 * Answers writes `status` (`402` by default) with `headers` and `body` from now on, without
+	 * forwarding them: `limit` of them at most, and only those with one of `methods` (POST and PUT by
+	 * default). `null` forwards them again.
 	 */
-	async refuse(body: string | null, options: { limit?: number; methods?: string[] } = {}): Promise<void> {
+	async refuse(body: string | null, options: { limit?: number; methods?: string[] } & Refusal = {}): Promise<void> {
 		await this.control({ refuse: body, ...options });
 	}
 
-	/** Forwards the next POST but cuts its answer (its outcome stays unknown to the client), then refuses the next `limit` writes with `402` and `body`. */
-	async dropNextPostThenRefuse(body: string, limit: number): Promise<void> {
-		await this.control({ dropNextPost: { refuse: body, limit } });
+	/** Forwards the next POST but cuts its answer (its outcome stays unknown to the client), then refuses the next `limit` writes with `body` (and `refusal`'s status and headers, see `refuse`). */
+	async dropNextPostThenRefuse(body: string, limit: number, refusal: Refusal = {}): Promise<void> {
+		await this.control({ dropNextPost: { refuse: body, limit, ...refusal } });
 	}
 
 	/** Requests refused, forwarded and forwarded with their answer cut, so far. */

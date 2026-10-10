@@ -22,6 +22,7 @@ use crate::attach::attach;
 use crate::auth::set_token;
 use crate::db::Mode;
 use crate::error::Error;
+use crate::error::WriteRefusal;
 use crate::host::API;
 use crate::host::OK;
 use crate::host::UNIX;
@@ -115,9 +116,19 @@ unsafe fn result_error_code(ctx: *mut ffi::sqlite3_context, code: c_int) {
     }
 }
 
+/// The code `ursula_attach` fails with when `e` refused it before anything reached the stream
+/// (nothing was claimed or created), which callers tell from other failures (a read-only attach
+/// can read the database meanwhile): SQLITE_AUTH for a 402 (as since 0.7.1), SQLITE_IOERR_AUTH
+/// (the code of a refused commit) for every other refusal. `None` for any other error.
+fn refused_code(e: &Error) -> Option<c_int> {
+    e.refusal().map(|refusal| match refusal {
+        WriteRefusal::PaymentRequired { .. } => ffi::SQLITE_AUTH,
+        _ => ffi::SQLITE_IOERR_AUTH,
+    })
+}
+
 /// `ursula_attach(path, url[, mode])`: the mode is `'owner'` (the default) or `'read_only'` (see
-/// `Mode`). An attach refused with 402 in front of the stream fails with SQLITE_AUTH, which
-/// callers tell from other failures (a read-only attach can read the database meanwhile).
+/// `Mode`). An attach refused before anything reached the stream fails with `refused_code`.
 unsafe extern "C" fn fn_attach(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
@@ -132,12 +143,12 @@ unsafe extern "C" fn fn_attach(
     let outcome = Mode::try_from(mode.as_str())
         .map_err(Arc::new)
         .and_then(|mode| attach(&path, &url, mode));
-    let refused = matches!(&outcome, Err(e) if e.is_payment_required());
+    let refused = outcome.as_ref().err().and_then(|e| refused_code(e));
     // SAFETY: SQLite calls the function with its context.
     unsafe { result(ctx, "ursula_attach", outcome) };
-    if refused {
+    if let Some(code) = refused {
         // SAFETY: as above; `result` set the error.
-        unsafe { result_error_code(ctx, ffi::SQLITE_AUTH) };
+        unsafe { result_error_code(ctx, code) };
     }
 }
 
@@ -269,4 +280,57 @@ fn register_vfs(a: &ffi::sqlite3_api_routines) -> c_int {
         VFS.store(v, Ordering::Release);
     }
     rc
+}
+
+#[cfg(test)]
+mod tests {
+    use libsqlite3_sys as ffi;
+
+    use super::refused_code;
+    use crate::error::Error;
+    use crate::error::WriteRefusal;
+
+    // An attach refused before anything reached the stream fails with a code of its own:
+    // SQLITE_AUTH for a 402 (as since 0.7.1), SQLITE_IOERR_AUTH (a refused commit's) for any other
+    // refusal. Every other failure keeps SQLITE_ERROR, a denied read included.
+    #[test]
+    fn refused_attaches_fail_with_codes_of_their_own() {
+        let url = || "http://h/b/s".to_owned();
+        let refused = |refusal| Error::Refused {
+            op: "claim",
+            url: url(),
+            refusal,
+        };
+        let payment = WriteRefusal::PaymentRequired {
+            body: String::new(),
+        };
+        assert_eq!(refused_code(&refused(payment)), Some(ffi::SQLITE_AUTH));
+        for refusal in [
+            WriteRefusal::Unauthorized {
+                body: String::new(),
+            },
+            WriteRefusal::Forbidden {
+                body: String::new(),
+            },
+            WriteRefusal::RateLimited {
+                body: String::new(),
+            },
+            WriteRefusal::NotApplied {
+                status: 503,
+                reason: "RaftLogPressure".into(),
+            },
+        ] {
+            assert_eq!(
+                refused_code(&refused(refusal)),
+                Some(ffi::SQLITE_IOERR_AUTH)
+            );
+        }
+        let denied_read = Error::Unauthorized {
+            op: "head",
+            url: url(),
+            status: 403,
+        };
+        assert_eq!(refused_code(&denied_read), None);
+        assert_eq!(refused_code(&Error::ClaimRaces { url: url() }), None);
+    }
 }

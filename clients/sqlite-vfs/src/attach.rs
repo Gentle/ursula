@@ -641,7 +641,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         offset: pos.clone(),
         log,
         poisoned: None,
-        payment_required: None,
+        refused: None,
         overlay: BTreeMap::new(),
         wal_written: BTreeMap::new(),
         committed: false,

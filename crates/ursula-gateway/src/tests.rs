@@ -414,6 +414,8 @@ async fn gateway_sends_one_probe_at_a_time() {
     assert_eq!(gateway.metrics_snapshot().upstream_ejected, 0);
     let probed = probe.await.expect("probe task");
     assert_eq!(probed.status(), StatusCode::GATEWAY_TIMEOUT);
+    // The request reached the upstream, which may have applied it.
+    assert_eq!(not_applied(&probed), None);
     assert_eq!(gateway.metrics_snapshot().upstream_ejections, 0);
     assert!(arrivals.try_recv().is_err(), "one probe only");
 }
@@ -575,6 +577,9 @@ async fn gateway_does_not_eject_an_upstream_for_a_request_it_could_not_build() {
     let response = gateway.handle(get_stream()).await;
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // Upstream failures carry no marker. The same `502` answers an exchange
+    // that broke after the request reached the upstream.
+    assert_eq!(not_applied(&response), None);
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.upstream_ejections, 0);
     assert_eq!(metrics.upstream_ejected, 0);
@@ -596,6 +601,7 @@ async fn gateway_drops_a_silent_cached_leader_and_answers_gateway_timeout() {
     let response = gateway.handle(get_stream()).await;
 
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(not_applied(&response), None);
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.leader_cache_evictions, 1);
     assert_eq!(metrics.leader_cache_entries, 0);
@@ -1063,6 +1069,38 @@ async fn gateway_rejects_body_larger_than_configured_limit_before_forwarding() {
 
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(not_applied(&resp), Some("RequestBodyTooLarge"));
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+/// A request body that fails while the gateway buffers it, as when the
+/// client goes away mid-upload, is answered `400` before anything is
+/// forwarded.
+#[tokio::test]
+async fn gateway_refuses_an_unreadable_body_before_forwarding() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let upstream = spawn_upstream(Router::new().fallback(any(move || {
+        let upstream_hits = Arc::clone(&upstream_hits);
+        async move {
+            upstream_hits.fetch_add(1, Ordering::Relaxed);
+            StatusCode::OK
+        }
+    })))
+    .await;
+    let gateway = gateway_for_url(upstream.url.clone());
+    let body = Body::from_stream(tokio_stream::iter([Err::<bytes::Bytes, _>(
+        std::io::Error::other("client went away"),
+    )]));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/bucket/stream")
+        .body(body)
+        .expect("request");
+
+    let response = gateway.handle(request).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(not_applied(&response), Some("RequestBodyUnreadable"));
     assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
 

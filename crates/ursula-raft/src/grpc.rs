@@ -2370,6 +2370,32 @@ mod reconnect_tests {
         server.abort();
     }
 
+    /// #507: `raft_grpc_append_stream_frame_bytes_max` reports the largest request frame sent,
+    /// as the encoded bytes of its calls before compression. The gauge is process-wide, so other
+    /// tests' frames can only raise it, and they are far smaller than this one.
+    #[tokio::test]
+    async fn append_stream_frame_bytes_max_reports_the_largest_frame_sent() {
+        let transport = Arc::new(CoreRaftTransport::default());
+        let (endpoint, _registry, server) = spawn_append_stream_server().await;
+        let envelope = raft_internal_proto::RaftRpcEnvelopeV1 {
+            raft_group_id: 1,
+            node_id: 2,
+            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            payload: vec![7_u8; 1024 * 1024].into(),
+        };
+        let frame_bytes = u64::try_from(envelope.encoded_len()).expect("fits in u64");
+        let status = test_network(transport, RaftGroupId(1), 2, endpoint)
+            .try_append_stream(envelope, RPCOption::new(Duration::from_secs(10)))
+            .await
+            .expect_err("the peer hosts no group");
+        // The peer answered the call, so its frame went out.
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(
+            raft_grpc_metrics_snapshot().raft_grpc_append_stream_frame_bytes_max >= frame_bytes
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn groups_share_one_append_stream_and_receive_independent_errors() {
         let transport = Arc::new(CoreRaftTransport::default());

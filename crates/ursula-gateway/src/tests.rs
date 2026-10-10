@@ -140,6 +140,14 @@ fn gateway_for_url(upstream_url: impl Into<String>) -> Arc<Gateway> {
     Arc::new(Gateway::new(test_config(vec![upstream_url.into()])))
 }
 
+/// The response's `x-ursula-not-applied` token, if it has one.
+fn not_applied(response: &AxumResponse) -> Option<&str> {
+    response
+        .headers()
+        .get(NOT_APPLIED_HEADER)
+        .map(|value| value.to_str().expect("an ASCII token"))
+}
+
 #[test]
 fn gateway_reuses_learned_stream_leader() {
     let gateway = Gateway::new(test_config(vec![
@@ -489,6 +497,8 @@ async fn gateway_ejects_an_unreachable_redirect_leader() {
     let response = gateway.handle(get_stream()).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // The follower may have proposed the request before it redirected.
+    assert_eq!(not_applied(&response), None);
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.upstream_ejections, 1);
     assert_eq!(metrics.upstream_ejected, 1);
@@ -816,6 +826,7 @@ async fn gateway_handle_returns_service_unavailable_without_upstreams() {
     let resp = gateway.handle(req).await;
 
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(not_applied(&resp), Some("NoUpstream"));
 }
 
 #[tokio::test]
@@ -952,6 +963,7 @@ async fn access_control_conceals_private_resource_before_forwarding() {
     let response = gateway.handle(request).await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(not_applied(&response), Some("NotFound"));
     assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
 
@@ -978,6 +990,7 @@ async fn access_control_rejects_invalid_bearer_before_authorization() {
             .expect("authenticate challenge"),
         r#"Bearer error="invalid_token""#
     );
+    assert_eq!(not_applied(&response), Some("InvalidCredential"));
     assert!(
         authorizer
             .requests
@@ -1016,6 +1029,7 @@ async fn access_control_fails_closed_for_unclassified_routes() {
             .expect("request");
         let response = gateway.handle(request).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(not_applied(&response), Some("NotFound"), "{uri}");
     }
     assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
@@ -1048,7 +1062,189 @@ async fn gateway_rejects_body_larger_than_configured_limit_before_forwarding() {
     let resp = gateway.handle(req).await;
 
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(not_applied(&resp), Some("RequestBodyTooLarge"));
     assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+/// A token issuer or an authorizer that is down is answered `503` before
+/// anything is forwarded, so the refusal, like a denial, is marked as having
+/// applied nothing.
+#[tokio::test]
+async fn access_control_outages_and_denials_are_marked_not_applied() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let upstream = spawn_upstream(Router::new().fallback(any(move || {
+        let upstream_hits = Arc::clone(&upstream_hits);
+        async move {
+            upstream_hits.fetch_add(1, Ordering::Relaxed);
+            StatusCode::OK
+        }
+    })))
+    .await;
+    let issuer_down = Arc::new(FixedPrincipalResolver {
+        calls: AtomicUsize::new(0),
+        result: Err(AuthenticationError::Unavailable),
+    });
+    let authorizer_down = Arc::new(RecordingAuthorizer {
+        decision: Err(AuthorizationError::Unavailable),
+        requests: Mutex::new(Vec::new()),
+    });
+    let allow = || Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
+    let valid = || Arc::new(FixedPrincipalResolver::valid());
+    let cases = [
+        (
+            "token issuer down",
+            gateway_with_access_control(upstream.url.clone(), issuer_down, allow()),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AuthenticationUnavailable",
+        ),
+        (
+            "authorizer down",
+            gateway_with_access_control(upstream.url.clone(), valid(), authorizer_down),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AuthorizationUnavailable",
+        ),
+        (
+            "denied",
+            gateway_with_access_control(
+                upstream.url.clone(),
+                valid(),
+                Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Deny)),
+            ),
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+        ),
+    ];
+
+    for (case, gateway, status, token) in cases {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/owner-a/events")
+            .header(AUTHORIZATION, "Bearer valid-token")
+            .body(Body::from("abc"))
+            .expect("request");
+        let response = gateway.handle(request).await;
+        assert_eq!(response.status(), status, "{case}");
+        assert_eq!(not_applied(&response), Some(token), "{case}");
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+fn post_path(path: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .body(Body::from("abc"))
+        .expect("request")
+}
+
+/// An upstream's marker reaches the client unchanged, and the gateway adds
+/// none to an upstream answer without one.
+#[tokio::test]
+async fn an_upstream_marker_passes_through_unchanged() {
+    let upstream = spawn_upstream(
+        Router::new()
+            .route(
+                "/bucket/refused",
+                post(|| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [
+                            (RETRY_AFTER.as_str(), "1"),
+                            (NOT_APPLIED_HEADER, "RaftLogPressure"),
+                        ],
+                        r#"{"error":"RaftLogPressure"}"#,
+                    )
+                }),
+            )
+            .route(
+                "/bucket/unknown",
+                post(|| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [(RETRY_AFTER.as_str(), "1")],
+                        "outcome unknown",
+                    )
+                }),
+            ),
+    )
+    .await;
+    let gateway = gateway_for_url(upstream.url.clone());
+
+    let refused = gateway.handle(post_path("/bucket/refused")).await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(not_applied(&refused), Some("RaftLogPressure"));
+
+    let unknown = gateway.handle(post_path("/bucket/unknown")).await;
+    assert_eq!(unknown.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(not_applied(&unknown), None);
+}
+
+/// A follower whose Raft redirect to `leader_url` carries `marker` as
+/// `x-ursula-not-applied` when one is given.
+async fn spawn_redirecting_follower(
+    leader_url: String,
+    marker: Option<&'static str>,
+) -> TestUpstream {
+    spawn_upstream(Router::new().route(
+        "/bucket/stream",
+        any(move || {
+            let leader_url = leader_url.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    LOCATION,
+                    HeaderValue::from_str(&leader_url).expect("leader URL"),
+                );
+                headers.insert(HEADER_URSULA_RAFT_LEADER_ID, HeaderValue::from_static("1"));
+                if let Some(marker) = marker {
+                    headers.insert(NOT_APPLIED_HEADER, HeaderValue::from_static(marker));
+                }
+                (StatusCode::TEMPORARY_REDIRECT, headers, "redirecting")
+            }
+        }),
+    ))
+    .await
+}
+
+/// A node can redirect after it proposed the write (OpenRaft reports the
+/// forward after `client_write`), so the leader's marker survives a followed
+/// redirect only when the redirect carried one too.
+#[tokio::test]
+async fn a_followed_redirect_keeps_the_marker_only_when_the_redirect_carried_one() {
+    let leader = spawn_upstream(Router::new().route(
+        "/bucket/stream",
+        post(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(NOT_APPLIED_HEADER, "RaftLogPressure")],
+                r#"{"error":"RaftLogPressure"}"#,
+            )
+        }),
+    ))
+    .await;
+    for (redirect_marker, expected) in [(None, None), (Some("NotLeader"), Some("RaftLogPressure"))]
+    {
+        let follower =
+            spawn_redirecting_follower(format!("{}/bucket/stream", leader.url), redirect_marker)
+                .await;
+        let gateway = Gateway::new(test_config(vec![follower.url.clone(), leader.url.clone()]));
+        gateway.remember_leader("/bucket/stream".to_owned(), follower.url.clone());
+
+        let response = gateway.handle(post_path("/bucket/stream")).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{redirect_marker:?}"
+        );
+        assert_eq!(gateway.metrics_snapshot().leader_redirects, 1);
+        assert_eq!(
+            not_applied(&response),
+            expected,
+            "redirect marker {redirect_marker:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1617,6 +1813,7 @@ mod admission_and_usage {
         );
         let limited = send(&gateway, "GET", "/tenant-a/orders", "").await;
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(not_applied(&limited), Some("TenantRateLimited"));
         let retry_after = limited
             .headers()
             .get("retry-after")
@@ -1634,9 +1831,38 @@ mod admission_and_usage {
 
         let oversized = send(&gateway, "POST", "/tenant-a/orders", "123456789").await;
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(not_applied(&oversized), Some("RequestBodyTooLarge"));
 
         let allowed = send(&gateway, "POST", "/tenant-a/orders", "12345678").await;
         assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(not_applied(&allowed), None);
+    }
+
+    #[tokio::test]
+    async fn live_read_limit_rejects_as_not_applied() {
+        let upstream =
+            spawn_upstream(Router::new().route("/tenant-a/orders", any(|| async { "ok" }))).await;
+        let gateway = metered_gateway(&upstream.url, UsageCollector::new(), None)
+            .with_quota_provider(Arc::new(
+                StaticQuotaProvider::from_toml_str(
+                    r#"
+                    [[bucket]]
+                    id = "tenant-a"
+                    max_concurrent_live_reads = 1
+                    "#,
+                )
+                .expect("parse quotas"),
+            ));
+        let tail = "/tenant-a/orders?offset=now&live=long-poll";
+
+        // The first response holds the tenant's only live-read slot until it
+        // is dropped.
+        let first = send(&gateway, "GET", tail, "").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = send(&gateway, "GET", tail, "").await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(not_applied(&second), Some("TenantLiveReadsExhausted"));
+        drop(first);
     }
 
     #[tokio::test]

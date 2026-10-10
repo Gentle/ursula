@@ -9,6 +9,12 @@
 //! leaking internal node addresses to clients and prevents SSE live reads from
 //! looping when the initial random upstream lands on a follower.
 //!
+//! Every request the gateway refuses before forwarding it (access control,
+//! tenant admission, an oversized body) is answered with
+//! `x-ursula-not-applied`, which tells the client that the attempt applied
+//! nothing. An upstream's `x-ursula-not-applied` passes through unchanged,
+//! unless the gateway followed a leader redirect that did not carry it.
+//!
 //! Module map:
 //!
 //! - [`auth`]: opt-in, provider-neutral authentication and authorization hooks.
@@ -47,6 +53,7 @@ use percent_encoding::percent_decode_str;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
+use ursula_proto::http::NOT_APPLIED_HEADER;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
 
@@ -68,6 +75,7 @@ use crate::auth::AccessControl;
 use crate::auth::Action;
 use crate::auth::AuthenticationError;
 use crate::auth::AuthorizationDecision;
+use crate::auth::AuthorizationError;
 use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
@@ -261,7 +269,7 @@ impl Gateway {
 
         let context = match self.gate(&parts).await {
             Ok(context) => context,
-            Err(response) => return response,
+            Err(refusal) => return refusal.into_response(),
         };
         if self.access_control.is_some() {
             // The credential terminates at the gateway. Internal Ursula nodes
@@ -273,7 +281,7 @@ impl Gateway {
         if let Some(context) = &context {
             match self.admit(context) {
                 Ok(guard) => live_guard = guard,
-                Err(response) => return response,
+                Err(refusal) => return refusal.into_response(),
             }
         }
 
@@ -281,14 +289,15 @@ impl Gateway {
         {
             Ok(b) => b,
             Err(err) => {
-                if err
+                let refusal = if err
                     .source()
                     .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
                 {
-                    return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                    Refusal::BodyTooLarge
                 } else {
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
+                    Refusal::BodyUnreadable
+                };
+                return refusal.into_response();
             }
         };
         if let Some(max) = context
@@ -296,14 +305,14 @@ impl Gateway {
             .and_then(|ctx| ctx.limits.max_request_body_bytes)
             && body_bytes.len() as u64 > max
         {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            return Refusal::BodyTooLarge.into_response();
         }
 
         let upstream = match self.pick_upstream(&parts.uri) {
             Some(u) => u,
             None => {
                 error!("no upstreams configured");
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                return Refusal::NoUpstream.into_response();
             }
         };
 
@@ -351,24 +360,24 @@ impl Gateway {
     async fn gate(
         &self,
         parts: &axum::http::request::Parts,
-    ) -> Result<Option<RequestContext>, AxumResponse> {
+    ) -> Result<Option<RequestContext>, Refusal> {
         let Some(access_control) = self.access_control.as_ref() else {
             return Ok(None);
         };
         let Some(request) = classify_request(&parts.method, &parts.uri, &parts.headers) else {
             // An access-controlled gateway is a public resource server, not a
             // transparent escape hatch to internal or newly added routes.
-            return Err(StatusCode::NOT_FOUND.into_response());
+            return Err(Refusal::NotFound);
         };
 
         let principal = match bearer_token(&parts.headers) {
             Ok(Some(token)) => match access_control.principal_resolver().resolve(token).await {
                 Ok(principal) => Some(principal),
-                Err(error) => return Err(authentication_error_response(error)),
+                Err(error) => return Err(authentication_refusal(error)),
             },
             Ok(None) => None,
             Err(()) => {
-                return Err(authentication_error_response(
+                return Err(authentication_refusal(
                     AuthenticationError::InvalidCredential,
                 ));
             }
@@ -386,13 +395,11 @@ impl Gateway {
             .await;
         match decision {
             Ok(AuthorizationDecision::Allow) => {}
-            Ok(AuthorizationDecision::Deny) => return Err(StatusCode::FORBIDDEN.into_response()),
-            Ok(AuthorizationDecision::ConcealAsNotFound) => {
-                return Err(StatusCode::NOT_FOUND.into_response());
-            }
+            Ok(AuthorizationDecision::Deny) => return Err(Refusal::Forbidden),
+            Ok(AuthorizationDecision::ConcealAsNotFound) => return Err(Refusal::NotFound),
             Err(error) => {
                 error!(error = %error, "gateway authorization failed");
-                return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+                return Err(Refusal::Authorization(error));
             }
         }
 
@@ -412,25 +419,18 @@ impl Gateway {
     /// Enforces the tenant's admission limits. `Retry-After` accompanies every
     /// retryable rejection; Ursula's own `503` backpressure semantics are
     /// untouched.
-    #[expect(
-        clippy::result_large_err,
-        reason = "the error is the terminal HTTP response, produced at most once per request"
-    )]
-    fn admit(&self, context: &RequestContext) -> Result<Option<LiveReadGuard>, AxumResponse> {
+    fn admit(&self, context: &RequestContext) -> Result<Option<LiveReadGuard>, Refusal> {
         if self.quota_provider.is_none() {
             return Ok(None);
         }
-        if let Err(rejection) = self
-            .admission
+        self.admission
             .admit_request(&context.bucket_id, context.limits)
-        {
-            return Err(admission_rejection_response(rejection));
-        }
+            .map_err(Refusal::Admission)?;
         if context.class == UsageClass::LiveRead {
             return self
                 .admission
                 .admit_live_read(&context.bucket_id, context.limits)
-                .map_err(admission_rejection_response);
+                .map_err(Refusal::Admission);
         }
         Ok(None)
     }
@@ -515,6 +515,10 @@ impl Gateway {
                 if let Some(key) = pin_key.clone() {
                     self.remember_leader(key, leader_upstream.to_owned());
                 }
+                // A node can redirect after it proposed the write, so the
+                // leader's answer speaks for the whole request only when the
+                // redirect also applied nothing.
+                let redirect_applied_nothing = response_headers.contains_key(NOT_APPLIED_HEADER);
                 // Drop the follower response; it has no meaningful body.
                 drop(upstream_resp);
 
@@ -534,7 +538,11 @@ impl Gateway {
                     u64::try_from(redirect_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
-                return Self::build_response(leader_resp, tail);
+                let mut response = Self::build_response(leader_resp, tail)?;
+                if !redirect_applied_nothing {
+                    response.headers_mut().remove(NOT_APPLIED_HEADER);
+                }
+                return Ok(response);
             }
         }
 
@@ -880,24 +888,90 @@ fn principal_ref(principal: &VerifiedPrincipal) -> PrincipalRef {
     }
 }
 
-fn admission_rejection_response(rejection: AdmissionRejection) -> AxumResponse {
-    match rejection {
-        AdmissionRejection::RateLimited { retry_after_secs } => {
-            let mut response = (
-                StatusCode::TOO_MANY_REQUESTS,
-                "tenant request rate limit exceeded",
-            )
-                .into_response();
-            if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                response.headers_mut().insert(RETRY_AFTER, value);
-            }
-            response
-        }
-        AdmissionRejection::LiveReadsExhausted => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "tenant live-read connection limit exceeded",
-        )
-            .into_response(),
+/// A request the gateway answered itself, before forwarding it to any
+/// upstream. Nothing of it reached a stream, so every refusal carries
+/// [`NOT_APPLIED_HEADER`] with a token naming it.
+#[derive(Debug)]
+enum Refusal {
+    /// Access control does not serve the route, or the authorizer concealed
+    /// the resource. Both answer the same `404`.
+    NotFound,
+    /// The bearer credential failed verification (`401`), or the verifier is
+    /// unavailable (`503`).
+    Authentication(AuthenticationError),
+    /// The authorizer denied the request (`403`).
+    Forbidden,
+    /// The authorizer could not decide (`503`).
+    Authorization(AuthorizationError),
+    /// A tenant admission limit (`429`).
+    Admission(AdmissionRejection),
+    /// The body is larger than the gateway's or the tenant's limit (`413`).
+    BodyTooLarge,
+    /// The body could not be read (`400`).
+    BodyUnreadable,
+    /// No upstream is configured (`503`).
+    NoUpstream,
+}
+
+impl IntoResponse for Refusal {
+    fn into_response(self) -> AxumResponse {
+        let (mut response, reason) = match self {
+            Self::NotFound => (StatusCode::NOT_FOUND.into_response(), "NotFound"),
+            Self::Authentication(AuthenticationError::Unavailable) => (
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                "AuthenticationUnavailable",
+            ),
+            Self::Authentication(
+                AuthenticationError::InvalidCredential
+                | AuthenticationError::Expired
+                | AuthenticationError::WrongAudience,
+            ) => (
+                (StatusCode::UNAUTHORIZED, [(
+                    WWW_AUTHENTICATE,
+                    HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+                )])
+                    .into_response(),
+                "InvalidCredential",
+            ),
+            Self::Forbidden => (StatusCode::FORBIDDEN.into_response(), "Forbidden"),
+            Self::Authorization(AuthorizationError::Unavailable) => (
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                "AuthorizationUnavailable",
+            ),
+            Self::Admission(AdmissionRejection::RateLimited { retry_after_secs }) => (
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(RETRY_AFTER, HeaderValue::from(retry_after_secs))],
+                    "tenant request rate limit exceeded",
+                )
+                    .into_response(),
+                "TenantRateLimited",
+            ),
+            Self::Admission(AdmissionRejection::LiveReadsExhausted) => (
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "tenant live-read connection limit exceeded",
+                )
+                    .into_response(),
+                "TenantLiveReadsExhausted",
+            ),
+            Self::BodyTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+                "RequestBodyTooLarge",
+            ),
+            Self::BodyUnreadable => (
+                StatusCode::BAD_REQUEST.into_response(),
+                "RequestBodyUnreadable",
+            ),
+            Self::NoUpstream => (
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                "NoUpstream",
+            ),
+        };
+        response
+            .headers_mut()
+            .insert(NOT_APPLIED_HEADER, HeaderValue::from_static(reason));
+        response
     }
 }
 
@@ -1111,18 +1185,11 @@ fn bearer_token(headers: &HeaderMap) -> Result<Option<&str>, ()> {
     Ok(Some(token))
 }
 
-fn authentication_error_response(error: AuthenticationError) -> AxumResponse {
+fn authentication_refusal(error: AuthenticationError) -> Refusal {
     if error == AuthenticationError::Unavailable {
         error!(error = %error, "gateway authentication failed");
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-
-    let mut response = StatusCode::UNAUTHORIZED.into_response();
-    response.headers_mut().insert(
-        WWW_AUTHENTICATE,
-        HeaderValue::from_static(r#"Bearer error="invalid_token""#),
-    );
-    response
+    Refusal::Authentication(error)
 }
 
 // Copy end-to-end headers while removing hop-by-hop proxy headers. Hop-by-hop

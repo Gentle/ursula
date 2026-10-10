@@ -24,6 +24,20 @@ pub(crate) fn retry_budget() -> Duration {
     })
 }
 
+/// `URSULA_VFS_IDLE_MS`: how long a connection is kept after its last request, for the next one
+/// to reuse (90 s by default, see `client::agent`). 0 never reuses one.
+pub(crate) fn idle_age() -> Duration {
+    static V: OnceLock<Duration> = OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("URSULA_VFS_IDLE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90_000),
+        )
+    })
+}
+
 pub(crate) fn snapshot_min_bytes() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {

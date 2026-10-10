@@ -18,6 +18,7 @@ use ureq::tls::TlsConfig;
 
 use crate::auth;
 use crate::config::ca_file;
+use crate::config::idle_age;
 use crate::config::retry_budget;
 use crate::error::Attempt;
 use crate::error::Error;
@@ -34,35 +35,42 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 /// (a snapshot, retention, the local state): it sorts before every offset the server mints.
 pub(crate) const START: &str = "-1";
 
-fn agent() -> &'static ureq::Agent {
-    static A: OnceLock<ureq::Agent> = OnceLock::new();
-    A.get_or_init(|| new_agent(Duration::from_secs(10), MAX_IDLE_AGE))
-}
-
-/// Snapshot transfers move whole databases: a longer timeout than appends.
-fn bulk_agent() -> &'static ureq::Agent {
-    static A: OnceLock<ureq::Agent> = OnceLock::new();
-    A.get_or_init(|| new_agent(Duration::from_secs(120), MAX_IDLE_AGE))
-}
-
-/// How long an agent keeps a connection after its last request, for the next request to reuse.
-/// ureq's default is 15 s, so a writer that commits less often opened a new TCP and TLS connection
+/// Appends, claims, reads and HEADs. It keeps a connection for `idle_age()` (90 s) after its last
+/// request: with ureq's 15 s, a writer that commits less often opened a new TCP and TLS connection
 /// for almost every commit, which behind a reverse proxy or a CDN sometimes costs about a second
 /// more.
 ///
 /// Before it reuses a pooled connection, ureq reads its socket once without blocking (ureq 3.4.2,
 /// `Pool::get` and `probe_tcp_stream`, under TLS too). A connection the server or a proxy closed
 /// while it sat idle (its FIN or RST arrived meanwhile) is dropped, and the request goes out on
-/// another one or a new one. A connection that a NAT, a load balancer or a firewall dropped without
-/// telling either end still looks open. A request sent on it fails, after its whole timeout when
-/// nothing answers (10 s for an append, which `append` then sends again), and ureq never sends it
-/// again on a new connection. Many of these drop a connection idle for about 4 minutes, so the age
+/// another one or a new one. One closed just as the request goes out, and one that a NAT, a load
+/// balancer or a firewall dropped without telling either end, still look open. A request sent on
+/// it fails, at once when the device answers with a reset and after its whole timeout when nothing
+/// answers (10 s), and ureq never sends it again: the retries here do, on a new connection
+/// (`Resend::fresh`). Many such devices drop a connection idle for about 4 minutes, so the age
 /// stays well below that.
-const MAX_IDLE_AGE: Duration = Duration::from_secs(90);
+fn agent() -> &'static ureq::Agent {
+    static A: OnceLock<ureq::Agent> = OnceLock::new();
+    A.get_or_init(|| new_agent(Duration::from_secs(10), idle_age()))
+}
+
+/// Snapshot transfers move whole databases: a longer timeout than appends. One snapshot's requests
+/// follow each other within seconds, so the agent keeps ureq's 15 s idle age (or `idle_age()`,
+/// when shorter): a connection a device dropped would hold a transfer for the whole timeout,
+/// longer than the retry budget.
+fn bulk_agent() -> &'static ureq::Agent {
+    static A: OnceLock<ureq::Agent> = OnceLock::new();
+    A.get_or_init(|| {
+        new_agent(
+            Duration::from_secs(120),
+            idle_age().min(Duration::from_secs(15)),
+        )
+    })
+}
 
 /// An agent whose requests time out after `timeout` and that keeps a connection for
-/// `max_idle_age` after its last request (`MAX_IDLE_AGE`). The pool keeps ureq's bounds: at most 3
-/// idle connections per host and 10 in all.
+/// `max_idle_age` after its last request. The pool keeps ureq's bounds: at most 3 idle
+/// connections per host and 10 in all.
 fn new_agent(timeout: Duration, max_idle_age: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -112,6 +120,55 @@ fn tls() -> TlsConfig {
             .build()
     })
     .clone()
+}
+
+/// How the next attempt of a request goes out, after the one before it (`send_retrying`,
+/// `append`, `put_idempotent`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Resend {
+    /// The attempt's token was refused: the next one reads the token again (`authorized`).
+    refresh: bool,
+    /// The attempt got no answer: the next one takes a new connection (`RETRY_IDLE_AGE`).
+    fresh: bool,
+}
+
+/// How long a pooled connection may have been idle for an attempt after one that got no answer.
+/// ureq checks a request's own idle age when it takes a connection from the pool, and drops one
+/// too old for it: the attempt goes out on a new connection (or one used a moment ago), and the
+/// stale ones are gone. A NAT or a load balancer that drops idle connections without telling
+/// either end leaves every pooled connection to the host dead (up to 3), and ureq takes the oldest
+/// first: each would cost its whole timeout.
+const RETRY_IDLE_AGE: Duration = Duration::from_secs(1);
+
+/// `req` for an attempt: with the token (`authorized`), on a new connection after an attempt that
+/// got no answer (`Resend`).
+fn prepared<B>(req: ureq::RequestBuilder<B>, resend: Resend) -> ureq::RequestBuilder<B> {
+    let req = authorized(req, resend.refresh);
+    if resend.fresh {
+        req.config().max_idle_age(RETRY_IDLE_AGE).build()
+    } else {
+        req
+    }
+}
+
+/// A request that got no answer for a reason another attempt on a new connection may not meet:
+/// the connection was reset, aborted or closed under it, or timed out (a pooled connection closed
+/// as the request went out, or dropped by a device without telling either end, a server
+/// restarting), or the answer came broken. Not a refused connection (nothing listens there), a
+/// failed TLS handshake (`InvalidData`), nor anything about the request or the setup.
+fn no_answer(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Io(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut
+        ),
+        ureq::Error::Timeout(_) | ureq::Error::Protocol(_) => true,
+        _ => false,
+    }
 }
 
 /// A token went out in clear (`authorized`), and the log said so.
@@ -287,20 +344,32 @@ fn retry_deadline() -> Instant {
 /// with a quorum in time), a 307 (`redirect_retried`: sent again to the same URL, never followed)
 /// and a refused token (`Refused::Token`: sent again with the token read again) the way
 /// `append` does: no sooner than Retry-After (seconds), with backoff, within `retry_budget()`.
-/// Returns the first other answer, or the last retried one once the budget is spent or `stopped`
-/// (a re-attach is waiting for the snapshot thread). `send` takes whether to read the token again.
+/// A request that got no answer (`no_answer`) is sent again too, on a new connection, as after a
+/// 503 without Retry-After. Returns the first other answer or error, or the last retried one once
+/// the budget is spent or `stopped` (a re-attach is waiting for the snapshot thread). `send` builds
+/// the request for an attempt (`prepared`).
 fn send_retrying(
-    send: impl Fn(bool) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    send: impl Fn(Resend) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     stopped: &dyn Fn() -> bool,
 ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(20);
-    let mut refresh = false;
+    let mut resend = Resend::default();
     loop {
-        let r = send(refresh)?;
-        refresh = matches!(refused(&r), Some(Refused::Token));
+        let r = match send(std::mem::take(&mut resend)) {
+            Ok(r) => r,
+            Err(e) if no_answer(&e) => {
+                if stopped() || !pause(None, &mut backoff, deadline) {
+                    return Err(e);
+                }
+                resend.fresh = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        resend.refresh = matches!(refused(&r), Some(Refused::Token));
         let status = r.status().as_u16();
-        if !refresh && !matches!(status, 429 | 503) && !redirect_retried(status) {
+        if !resend.refresh && !matches!(status, 429 | 503) && !redirect_retried(status) {
             return Ok(r);
         }
         let retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
@@ -373,13 +442,13 @@ pub(crate) fn append(
     let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(20);
     let mut attempts: u32 = 0;
-    // The last answer refused the token: the next attempt reads it again.
-    let mut token_refused = false;
+    // How the next attempt goes out, after a refused token or no answer.
+    let mut resend = Resend::default();
     // An earlier attempt may have reached the stream: its outcome is unknown.
     let mut reached = false;
     loop {
         attempts = attempts.saturating_add(1);
-        let mut req = authorized(agent().post(url), std::mem::take(&mut token_refused))
+        let mut req = prepared(agent().post(url), std::mem::take(&mut resend))
             .header("content-type", CONTENT_TYPE)
             .header("stream-incarnation", incarnation)
             .header("producer-id", producer)
@@ -413,7 +482,7 @@ pub(crate) fn append(
                         body: body_text(&mut r),
                     },
                     Some(Refused::Token) => {
-                        token_refused = true;
+                        resend.refresh = true;
                         Attempt::Status {
                             status,
                             body: body_text(&mut r),
@@ -467,7 +536,10 @@ pub(crate) fn append(
                     },
                 }
             }
-            Err(e) => Attempt::Transport(Box::new(e)),
+            Err(e) => {
+                resend.fresh = true;
+                Attempt::Transport(Box::new(e))
+            }
         };
         // Refusals in front of the stream (401, 402) and rate limiting (429) apply nothing (a
         // requirement on every layer in front of it, see above); any other answer (a 307 too:
@@ -493,7 +565,7 @@ pub(crate) fn append(
             ("reason", &unknown),
         ]);
         let Some(wait) = wait else {
-            return Append::Failed(if token_refused {
+            return Append::Failed(if resend.refresh {
                 unauthorized("append", url, 401)
             } else {
                 Error::AppendUnknown {
@@ -510,8 +582,8 @@ pub(crate) fn append(
 /// 200).
 pub(crate) fn create_stream(url: &str) -> Result<(), Error> {
     let mut r = send_retrying(
-        |refresh| {
-            authorized(agent().put(url), refresh)
+        |resend| {
+            prepared(agent().put(url), resend)
                 .header("content-type", CONTENT_TYPE)
                 .send_empty()
         },
@@ -576,8 +648,8 @@ pub(crate) fn read_from(
 ) -> Result<(Vec<u8>, String), Error> {
     let request = format!("{url}?offset={offset}&consistency=leader");
     let mut r = send_retrying(
-        |refresh| {
-            authorized(agent().get(request.as_str()), refresh)
+        |resend| {
+            prepared(agent().get(request.as_str()), resend)
                 .header("stream-incarnation", incarnation)
                 .call()
         },
@@ -664,11 +736,8 @@ pub(crate) struct Head {
 
 /// `stopped` ends the retries early (`send_retrying` lists the answers it retries).
 pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error> {
-    let mut r = send_retrying(
-        |refresh| authorized(agent().head(url), refresh).call(),
-        stopped,
-    )
-    .map_err(|e| http_error("head", url, e))?;
+    let mut r = send_retrying(|resend| prepared(agent().head(url), resend).call(), stopped)
+        .map_err(|e| http_error("head", url, e))?;
     if let Some(e) = refusal("head", url, &mut r).or_else(|| redirected("head", url, &r)) {
         return Err(e);
     }
@@ -704,8 +773,8 @@ pub(crate) fn get_snapshot(
 ) -> Result<Option<Vec<u8>>, Error> {
     let request = format!("{url}/snapshot/{offset}");
     let mut r = send_retrying(
-        |refresh| {
-            authorized(bulk_agent().get(request.as_str()), refresh)
+        |resend| {
+            prepared(bulk_agent().get(request.as_str()), resend)
                 .header("stream-incarnation", incarnation)
                 .call()
         },
@@ -752,11 +821,11 @@ pub(crate) fn put_idempotent(
 ) -> Result<(u16, ureq::http::Response<ureq::Body>), Error> {
     let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(50);
-    // The last answer refused the token: the next attempt reads it again.
-    let mut token_refused = false;
+    // How the next attempt goes out, after a refused token or no answer.
+    let mut resend = Resend::default();
     loop {
         let mut retry_after = None;
-        let unknown = match authorized(bulk_agent().put(url), std::mem::take(&mut token_refused))
+        let unknown = match prepared(bulk_agent().put(url), std::mem::take(&mut resend))
             .header("content-type", CONTENT_TYPE)
             .header("stream-incarnation", incarnation)
             .send(body)
@@ -765,7 +834,7 @@ pub(crate) fn put_idempotent(
                 retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
                 match (refused(&r), r.status().as_u16()) {
                     (Some(Refused::Token), status) => {
-                        token_refused = true;
+                        resend.refresh = true;
                         Attempt::Status {
                             status,
                             body: body_text(&mut r),
@@ -789,10 +858,13 @@ pub(crate) fn put_idempotent(
                     },
                 }
             }
-            Err(e) => Attempt::Transport(Box::new(e)),
+            Err(e) => {
+                resend.fresh = true;
+                Attempt::Transport(Box::new(e))
+            }
         };
         if stopped() || !pause(retry_after, &mut backoff, deadline) {
-            return Err(if token_refused {
+            return Err(if resend.refresh {
                 unauthorized("put", url, 401)
             } else {
                 Error::PutUnknown {
@@ -829,9 +901,13 @@ mod tests {
     use std::io::Write as _;
     use std::net::TcpListener;
     use std::net::TcpStream;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::PoisonError;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
+    use std::time::Instant;
 
     use super::Append;
     use super::agent;
@@ -1426,15 +1502,16 @@ mod tests {
     /// An answer that leaves the connection open for the next request.
     const KEPT: &str = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
 
-    // Both agents keep a connection for 90 s after its last request, not ureq's 15 s: a writer that
+    // The agent keeps a connection for 90 s after its last request, not ureq's 15 s: a writer that
     // commits every 15 to 90 s reuses its connection instead of opening a new TCP and TLS
     // connection for almost every commit. Longer, a NAT or a load balancer may have dropped it
-    // without telling either end. The pool keeps ureq's bounds.
+    // without telling either end. The bulk agent keeps ureq's 15 s: one snapshot's requests follow
+    // each other within seconds. The pool keeps ureq's bounds.
     #[test]
-    fn agents_keep_idle_connections_for_90_s() {
-        for agent in [agent(), bulk_agent()] {
+    fn agents_keep_idle_connections_for_90_s_and_15_s() {
+        for (agent, age) in [(agent(), 90), (bulk_agent(), 15)] {
             let config = agent.config();
-            assert_eq!(config.max_idle_age(), Duration::from_secs(90));
+            assert_eq!(config.max_idle_age(), Duration::from_secs(age));
             assert_eq!(config.max_idle_connections_per_host(), 3);
             assert_eq!(config.max_idle_connections(), 10);
         }
@@ -1467,5 +1544,101 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         head(&url, &|| false).unwrap();
         assert_eq!(server.join().unwrap(), [1, 2]);
+    }
+
+    // A read whose pooled connection was closed just as it went out (a proxy dropping idle
+    // connections, a gateway shutting down) gets no answer: it is sent again on a new connection
+    // within the budget, as after a 503, instead of failing the attach. A refused connection
+    // (nothing listens there) fails at once.
+    #[test]
+    fn a_read_that_got_no_answer_is_sent_again_on_a_new_connection() {
+        let (url, server) = serve(vec![
+            String::new(),
+            answer("200 OK\r\nstream-incarnation: i1"),
+        ]);
+        let head_ok = head(&url, &|| false).unwrap();
+        assert_eq!(head_ok.incarnation.as_deref(), Some("i1"));
+        assert_eq!(server.join().unwrap().len(), 2);
+        let started = Instant::now();
+        let refused = head("http://127.0.0.1:1/b/s", &|| false).err().unwrap();
+        assert!(
+            matches!(&refused, Error::Http { source, .. } if matches!(**source, ureq::Error::Io(_))),
+            "{refused}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // A device that drops idle connections without telling either end leaves every pooled
+    // connection to the host dead (here they take a request and close without an answer). After
+    // the first attempt, on the oldest one, gets no answer, the next one goes out on a new
+    // connection and the other stale one is dropped, instead of trying each pooled connection in
+    // turn: where nothing answers, each would cost the whole timeout, and three the whole budget.
+    #[test]
+    fn an_attempt_after_no_answer_goes_out_on_a_new_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", listener.local_addr().unwrap());
+        // Connections numbered below `dead` close at their next request without an answer.
+        let dead = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        {
+            let (dead, accepted) = (dead.clone(), accepted.clone());
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let mut conn = conn.unwrap();
+                    let n = accepted.fetch_add(1, Ordering::SeqCst);
+                    let dead = dead.clone();
+                    std::thread::spawn(move || {
+                        while read_request(&mut conn) {
+                            if n < dead.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            // Both first requests are in flight at once: two connections.
+                            std::thread::sleep(Duration::from_millis(200));
+                            let ok = "HTTP/1.1 200 OK\r\nstream-incarnation: i1\r\n\
+                                      stream-next-offset: 9\r\ncontent-length: 0\r\n\r\n";
+                            conn.write_all(ok.as_bytes()).unwrap();
+                        }
+                    });
+                }
+            });
+        }
+        let reads: Vec<_> = (0..2)
+            .map(|_| {
+                let url = url.clone();
+                std::thread::spawn(move || head(&url, &|| false).unwrap())
+            })
+            .collect();
+        for read in reads {
+            read.join().unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        // Both pooled connections idle past the age an attempt after no answer accepts, and dead.
+        std::thread::sleep(Duration::from_millis(1_200));
+        dead.store(2, Ordering::SeqCst);
+        let appended = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(appended, Append::Acked { next: Some(ref n), attempts: 2 } if n == "9"),
+            "one attempt on the oldest pooled connection, then one on a new connection"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
+
+    /// Reads a request (its head, and a body of its `content-length`): false when the client
+    /// closed the connection instead.
+    fn read_request(conn: &mut TcpStream) -> bool {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match conn.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => return false,
+            }
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let len = head
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |n| n.trim().parse().unwrap());
+        conn.read_exact(&mut vec![0u8; len]).is_ok()
     }
 }

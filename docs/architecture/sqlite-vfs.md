@@ -623,9 +623,11 @@ rebuild, delete `<db>`.
   authorities in `URSULA_VFS_CA_FILE`. One bearer token per process: `ursula_set_token`, else the
   content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a 401. A read of
   the file that finds no token (empty, half-written, missing) keeps the last one it held: sent
-  without one, a request is concealed as a missing stream (404), which poisons at once. A token
-  sent over `http://` to a host that is not loopback is logged once (`token_in_clear`). The SQL
-  functions are direct-only: a trigger or view of an untrusted database cannot call them.
+  without one, a request is concealed as a missing stream (404). That fails an attach, and fails a
+  commit at once, alone when the 404 carries `x-ursula-not-applied` (Ursula's gateway from 0.7.3,
+  §2) and with a poison otherwise. A token sent over `http://` to a host that is not loopback is
+  logged once (`token_in_clear`). The SQL functions are direct-only: a trigger or view of an
+  untrusted database cannot call them.
 
 ### Versions
 

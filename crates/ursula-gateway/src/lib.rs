@@ -53,7 +53,7 @@ use percent_encoding::percent_decode_str;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
-use ursula_proto::http::NOT_APPLIED_HEADER;
+use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
 

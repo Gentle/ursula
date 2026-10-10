@@ -2,7 +2,11 @@
 //! handler, so nothing of a refused request is ever proposed.
 //!
 //! Every refusal carries [`NOT_APPLIED_HEADER`], set by [`mark_not_applied`],
-//! the only place the server sets it.
+//! the only place the server sets it. The server never sets
+//! [`NOT_APPLIED_CHECKED_HEADER`]: only a gateway vouches for the marker,
+//! after it applied its redirect rule.
+//!
+//! [`NOT_APPLIED_CHECKED_HEADER`]: ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER
 
 use std::sync::Arc;
 
@@ -19,7 +23,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
-use ursula_proto::http::NOT_APPLIED_HEADER;
+use ursula_proto::headers::NOT_APPLIED_HEADER;
 
 use crate::CLUSTER_PROBE_PATH;
 use crate::MAX_HTTP_BODY_BYTES;

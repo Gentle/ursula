@@ -17,7 +17,7 @@ use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use serde_json::json;
 use tower::ServiceExt;
-use ursula_proto::http::NOT_APPLIED_HEADER;
+use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftLogProgressSnapshot;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;

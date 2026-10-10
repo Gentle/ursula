@@ -13,7 +13,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::header::LOCATION;
 use axum::response::Response;
 use tower::ServiceExt;
-use ursula_proto::http::NOT_APPLIED_HEADER;
+use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::CloseStreamRequest;

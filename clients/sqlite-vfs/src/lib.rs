@@ -86,9 +86,10 @@
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
 //! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds every retry
-//! loop: appends with an unknown outcome, idempotent PUTs, and reads answered 429/503 (default
-//! 30000). `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log (bytes since the latest snapshot)
-//! that triggers a snapshot.
+//! loop: appends with an unknown outcome, idempotent PUTs, and reads answered 429, 503 or 307
+//! (default 30000). No request follows a redirect: a 307 is sent again to the same URL, and any
+//! other redirect fails the request. `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log (bytes
+//! since the latest snapshot) that triggers a snapshot.
 //!
 //! Module map:
 //!

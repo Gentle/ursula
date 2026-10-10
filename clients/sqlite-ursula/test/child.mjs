@@ -2,8 +2,9 @@
 // (in the mode CHILD_ATTACH_MODE names, when set), opens it with plain node:sqlite in WAL mode and runs
 // each SQL argument as one exec (`@sleep:<ms>` sleeps instead, `@wait:<path>` waits until the path
 // exists, `@snapshots:<n>` waits until the file's snapshot thread has published and read back n
-// snapshots, `@query:<sql>` prints the rows, `@status` prints `ursula_status`), printing a JSON line
-// per step. Then stays alive until killed, unless CHILD_EXIT=1.
+// snapshots, for at most CHILD_SNAPSHOTS_MS (120 s, then the step fails), `@query:<sql>` prints the
+// rows, `@status` prints `ursula_status`), printing a JSON line per step. Then stays alive until
+// killed, unless CHILD_EXIT=1.
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
@@ -38,8 +39,11 @@ for (const [step, sql] of sqls.entries()) {
 		continue;
 	}
 	if (sql.startsWith("@snapshots:")) {
-		while (drain().snapshots.length < Number(sql.slice(11))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-		say({ step, ok: true });
+		const wanted = Number(sql.slice(11));
+		const deadline = Date.now() + Number(process.env.CHILD_SNAPSHOTS_MS ?? 120_000);
+		while (drain().snapshots.length < wanted && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+		const published = drained.snapshots.length;
+		say(published >= wanted ? { step, ok: true } : { step, ok: false, error: `${published} of ${wanted} snapshots before the deadline` });
 		continue;
 	}
 	if (sql.startsWith("@query:")) {

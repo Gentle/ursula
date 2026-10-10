@@ -98,7 +98,7 @@ export interface Child {
 const childScript = join(dirname(fileURLToPath(import.meta.url)), "child.mjs");
 const gateScript = join(dirname(fileURLToPath(import.meta.url)), "gate.mjs");
 
-/** Runs `child.mjs` with this build's extension, or with `ext`'s. */
+/** Runs `child.mjs` with this build's extension, or with `ext`'s. A child that a `waitFor` gives up on is killed, so it does not outlive the test. */
 export function runChild(file: string, url: string, sqls: readonly string[], env: Record<string, string> = {}, ext = vfsPath()): Child {
 	const proc = spawn(process.execPath, [childScript, ext, file, url, ...sqls], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
 	const lines: ChildLine[] = [];
@@ -127,7 +127,10 @@ export function runChild(file: string, url: string, sqls: readonly string[], env
 			const hit = lines.find(pred);
 			if (hit !== undefined) return Promise.resolve(hit);
 			return new Promise((res, rej) => {
-				const timer = setTimeout(() => rej(new Error(`child: timed out; lines ${JSON.stringify(lines)}; stderr ${err}`)), ms);
+				const timer = setTimeout(() => {
+					proc.kill("SIGKILL");
+					rej(new Error(`child: timed out; lines ${JSON.stringify(lines)}; stderr ${err}`));
+				}, ms);
 				waiters.push({ pred, res: (l) => (clearTimeout(timer), res(l)) });
 				void exited.then((x) => setTimeout(() => rej(new Error(`child exited ${JSON.stringify(x)}; lines ${JSON.stringify(lines)}; stderr ${err}`)), 50));
 			});
@@ -319,17 +322,19 @@ export class AuthGateway {
 		for (const upstream of upstreams) args.push("--upstream", upstream);
 		args.push("--auth-issuer", issuer, "--auth-audience", AuthGateway.audience, "--auth-policy", policy, "--auth-jwks-url", `${issuer}/jwks.json`);
 		const proc = spawn(resolve(process.env.URSULA_BIN ?? ""), args, { cwd: dir, stdio: "ignore" });
-		const url = `http://127.0.0.1:${port}`;
+		const gateway = new AuthGateway(`http://127.0.0.1:${port}`, issuer, privateKey, proc, jwks);
 		for (let i = 0; ; i++) {
-			const up = await fetch(`${url}/`).then(
+			const up = await fetch(`${gateway.url}/`).then(
 				() => true,
 				() => false,
 			);
-			if (up) break;
-			if (i > 100) throw new Error("the gateway did not start");
+			if (up) return gateway;
+			if (i > 100 || proc.exitCode !== null) {
+				gateway.close();
+				throw new Error("the gateway did not start");
+			}
 			await new Promise((r) => setTimeout(r, 100));
 		}
-		return new AuthGateway(url, issuer, privateKey, proc, jwks);
 	}
 
 	/** An access token the gateway accepts, valid for an hour. */

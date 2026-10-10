@@ -4,10 +4,12 @@
 // a path-only Location, as it passes on a second redirect after following the first. The extension
 // never follows a redirect. It sends the request again to the same URL with its token, like a 503
 // (followed, the request would go out without the token, and the gateway would hide the stream
-// behind a 404). Meanwhile a loop hands every group's leadership to the next node, again and again,
-// through the nodes' admin API: during an owner's attach, its commits and snapshot read-backs, a
-// second host's attach from the snapshot, and the owner's attach of its own files again. Nothing
-// is poisoned, every commit goes through, and every host reads the same rows.
+// behind a 404). Meanwhile a loop hands every group's leadership to the next node, again and again
+// with a short pause, through the nodes' admin API: from before an owner's attach, through its
+// commits and snapshot read-backs, a second host's attach from the snapshot, and the owner's attach
+// of its own files again, and the test checks that leaderships moved while the owner committed and
+// while it waited for its snapshots. Nothing is poisoned, every commit goes through, every host
+// reads the same rows, and commits and snapshot GETs each met a redirect.
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -60,8 +62,11 @@ async function moveLeaderships(): Promise<number> {
 	return moved;
 }
 
-/** Moves every group's leadership, then waits `pauseMs`, until `stop`, which returns the moves made. */
-function moveLeadershipsUntilStopped(pauseMs: number): { stop(): Promise<number> } {
+/**
+ * Moves every group's leadership, then waits `pauseMs`, until `stop`, which returns the moves made.
+ * `moved` counts them so far.
+ */
+function moveLeadershipsUntilStopped(pauseMs: number): { moved(): number; stop(): Promise<number> } {
 	let running = true;
 	let moved = 0;
 	const loop = (async () => {
@@ -71,6 +76,7 @@ function moveLeadershipsUntilStopped(pauseMs: number): { stop(): Promise<number>
 		}
 	})();
 	return {
+		moved: () => moved,
 		stop: async () => {
 			running = false;
 			await loop;
@@ -79,7 +85,27 @@ function moveLeadershipsUntilStopped(pauseMs: number): { stop(): Promise<number>
 	};
 }
 
-/** An HTTP proxy in front of the gateway that counts the redirects it passes on, by method. */
+/** Waits until the loop has made `n` more moves than `from`. */
+async function movedSince(loop: { moved(): number }, from: number, n: number): Promise<void> {
+	for (let i = 0; loop.moved() - from < n; i++) {
+		if (i > 600) throw new Error(`${loop.moved() - from} leadership moves in a minute, not ${n}`);
+		await sleep(100);
+	}
+}
+
+/**
+ * What a request does, for counting: an append is a claim (producer sequence 0) or a commit, a
+ * request to a snapshot or to retention is named so, any other by its method (a `HEAD`, a catch-up
+ * read, a create).
+ */
+function operation(method: string | undefined, path: string | undefined, seq: string | string[] | undefined): string {
+	if (method === "POST") return seq === "0" ? "claim" : "commit";
+	if (path?.includes("/snapshot/") === true) return `${method} snapshot`;
+	if (path?.includes("/retention/") === true) return "retention";
+	return method ?? "?";
+}
+
+/** An HTTP proxy in front of the gateway that counts the redirects it passes on, by operation. */
 class RedirectCounter {
 	private readonly server: Server;
 	private readonly seen = new Map<string, number>();
@@ -96,8 +122,8 @@ class RedirectCounter {
 		const server = createServer((req, res) => {
 			const up = request({ host: t.hostname, port: t.port, method: req.method, path: req.url, headers: req.headers }, (answer) => {
 				const status = answer.statusCode ?? 502;
-				if (status === 307 || status === 308) {
-					const kind = `${req.method}${req.url?.includes("/snapshot/") === true ? " snapshot" : ""}`;
+				if (status === 307) {
+					const kind = operation(req.method, req.url, req.headers["producer-seq"]);
 					counter?.seen.set(kind, (counter.seen.get(kind) ?? 0) + 1);
 				}
 				res.writeHead(status, answer.headers);
@@ -111,9 +137,9 @@ class RedirectCounter {
 		return counter;
 	}
 
-	/** Redirects passed on to requests of `method` (to a snapshot, with `snapshot`). */
-	count(method: string, snapshot = false): number {
-		return this.seen.get(snapshot ? `${method} snapshot` : method) ?? 0;
+	/** Redirects passed on to requests of `kind` (see `operation`). */
+	count(kind: string): number {
+		return this.seen.get(kind) ?? 0;
 	}
 
 	summary(): string {
@@ -167,18 +193,31 @@ it.runIf(nodes.length === 3)(
 		// A snapshot whenever the log outgrows the database (about 80 KiB): every few commits, which
 		// are paced so that the snapshot thread keeps up.
 		const env = { URSULA_VFS_TOKEN_FILE: token, URSULA_VFS_SNAPSHOT_MIN_BYTES: "65536", CHILD_EXIT: "1" };
-		const loop = moveLeadershipsUntilStopped(2000);
+		// Each pass moves every group (one of them the stream's) and takes about a second: with a
+		// short pause between passes, the stream's leadership moves while the owner attaches, commits
+		// and reads its snapshots back.
+		const loop = moveLeadershipsUntilStopped(250);
 		moving = loop;
 		let moved = 0;
 		let snapshots = 0;
 		try {
+			await movedSince(loop, 0, 1);
 			const steps = ["CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB)"];
 			for (let i = 0; i < 40; i++) steps.push(`INSERT OR REPLACE INTO t VALUES (${i % 4}, randomblob(16384))`, "@sleep:100");
+			const lastCommit = steps.length - 2;
 			// Under these moves one snapshot can take seconds (its requests meet redirects, or a 503 with
 			// Retry-After: 1 from a group between leaders): the owner waits for two before it exits.
 			steps.push("@snapshots:2", "@sleep:2000", ROWS);
 			const file = freshFile();
-			const owner = await finished(runChild(file, url, steps, env), 180_000);
+			const started = loop.moved();
+			const child = runChild(file, url, steps, env);
+			await child.waitFor((l) => l.step === lastCommit && l.ok !== undefined, 180_000);
+			const committed = loop.moved();
+			const owner = await finished(child, 180_000);
+			// Leaderships moved while the owner attached and committed, and while it waited for its
+			// snapshots, published and read back.
+			expect(committed - started, "moves during the commits").toBeGreaterThanOrEqual(2);
+			expect(loop.moved() - committed, "moves during the snapshots").toBeGreaterThanOrEqual(1);
 			snapshots = owner.done.snapshots ?? 0;
 			expect(snapshots).toBeGreaterThanOrEqual(2);
 			expect(owner.rows).toHaveLength(4);
@@ -191,7 +230,7 @@ it.runIf(nodes.length === 3)(
 			// The gateway sends each request to a node picked at random, the leader one time in three,
 			// so the snapshot GETs so far may all have missed a redirect. Until one met a redirect,
 			// read-only hosts (they claim nothing) install the snapshot again.
-			for (let i = 0; counter.count("GET", true) === 0 && i < 10; i++) {
+			for (let i = 0; counter.count("GET snapshot") === 0 && i < 10; i++) {
 				const reader = await finished(runChild(freshFile(), url, [ROWS], { ...env, CHILD_ATTACH_MODE: "read_only" }), 90_000);
 				expect(reader.done.installed).not.toBe("-1");
 				expect(reader.rows).toEqual(owner.rows);
@@ -207,9 +246,9 @@ it.runIf(nodes.length === 3)(
 		}
 		console.log(`leadership moves: ${moved}; redirects passed on: ${counter.summary()}; snapshots: ${snapshots}`);
 		expect(moved).toBeGreaterThanOrEqual(4);
-		// The gateway passed redirects on to appends, and to snapshot read-backs or installs.
-		expect(counter.count("POST")).toBeGreaterThan(0);
-		expect(counter.count("GET", true)).toBeGreaterThan(0);
+		// The gateway passed redirects on to commits, and to snapshot read-backs or installs.
+		expect(counter.count("commit")).toBeGreaterThan(0);
+		expect(counter.count("GET snapshot")).toBeGreaterThan(0);
 	},
 	600_000,
 );

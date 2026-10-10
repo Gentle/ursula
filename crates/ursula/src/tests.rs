@@ -6415,9 +6415,9 @@ mod cluster_egress {
     use ursula_shard::RaftGroupId;
 
     use crate::bootstrap::ClusterEgressProbeScope;
-    use crate::bootstrap::ClusterEgressShedAction;
+    use crate::bootstrap::ShedHandoff;
     use crate::bootstrap::cluster_egress_probe_groups;
-    use crate::bootstrap::plan_cluster_egress_shed;
+    use crate::bootstrap::plan_shed_handoffs;
 
     fn snap(group_id: u32, voters: Vec<u64>) -> RaftGroupMetricsSnapshot {
         snap_with_leader(group_id, 1, Some(1), voters)
@@ -6488,8 +6488,8 @@ mod cluster_egress {
             snap_with_leader(0, 3, Some(3), vec![1, 2, 3]),
             snap_with_leader(1, 3, Some(3), vec![1, 3]),
         ];
-        let actions = plan_cluster_egress_shed(&snaps, 3, |_, target| target != 1);
-        assert_eq!(actions, vec![ClusterEgressShedAction {
+        let actions = plan_shed_handoffs(&snaps, 3, usize::MAX, |_| true, |_, target| target != 1);
+        assert_eq!(actions, vec![ShedHandoff {
             group_id: 0,
             target: 2
         }]);
@@ -6506,22 +6506,22 @@ mod cluster_egress {
             snap_with_leader(5, 3, Some(2), vec![1, 2, 3]),
         ];
 
-        let actions = plan_cluster_egress_shed(&snaps, 3, |_, _| true);
+        let actions = plan_shed_handoffs(&snaps, 3, usize::MAX, |_| true, |_, _| true);
 
         assert_eq!(actions, vec![
-            ClusterEgressShedAction {
+            ShedHandoff {
                 group_id: 0,
                 target: 1,
             },
-            ClusterEgressShedAction {
+            ShedHandoff {
                 group_id: 1,
                 target: 1,
             },
-            ClusterEgressShedAction {
+            ShedHandoff {
                 group_id: 3,
                 target: 1,
             },
-            ClusterEgressShedAction {
+            ShedHandoff {
                 group_id: 4,
                 target: 2,
             },

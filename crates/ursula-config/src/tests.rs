@@ -845,4 +845,44 @@ kms_key_id = "arn:aws:kms:us-east-1:111122223333:key/test"
             Some("arn:aws:kms:us-east-1:111122223333:key/test")
         );
     }
+
+    #[test]
+    fn s3_health_gate_rides_out_one_failed_probe_by_default_and_keeps_explicit_keys() {
+        use std::time::Duration;
+
+        use crate::config::UrsulaConfig;
+        let defaults: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+"#,
+        )
+        .expect("valid config");
+        let s3 = defaults.storage.cold.s3.expect("s3 config");
+        assert_eq!(s3.probe_timeout.as_duration(), Duration::from_secs(5));
+        assert_eq!(s3.unhealthy_ticks, 3);
+        assert_eq!(s3.heal_ticks, 2);
+
+        // A config written for the earlier defaults keeps them.
+        let explicit: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+probe_timeout = "2s"
+unhealthy_ticks = 1
+heal_ticks = 4
+"#,
+        )
+        .expect("valid config");
+        let s3 = explicit.storage.cold.s3.expect("s3 config");
+        assert_eq!(s3.probe_timeout.as_duration(), Duration::from_secs(2));
+        assert_eq!(s3.unhealthy_ticks, 1);
+        assert_eq!(s3.heal_ticks, 4);
+    }
 }

@@ -467,11 +467,15 @@ pub struct S3Config {
     pub timeout: HumanDuration,
     /// Max retries per S3 operation.
     pub max_retries: usize,
-    /// Timeout for S3 health probes.
+    /// Deadline of one snapshot-store health probe, retries of the S3 client
+    /// included. The default leaves room for one retry: the client's first
+    /// backoff is 1 to 2 seconds.
     pub probe_timeout: HumanDuration,
-    /// Consecutive probe failures before marking S3 unhealthy.
+    /// Bad health ticks, with no good tick between them, before the node
+    /// sheds its leadership. A tick is bad when the probe fails or times out,
+    /// or when more than one cold-flush write failed since the previous tick.
     pub unhealthy_ticks: usize,
-    /// Consecutive probe successes before marking S3 healthy again.
+    /// Good health ticks in a row before a node that shed may lead again.
     pub heal_ticks: usize,
 }
 
@@ -488,8 +492,10 @@ impl Default for S3Config {
             kms_key_id: None,
             timeout: HumanDuration::sec(10),
             max_retries: 3,
-            probe_timeout: HumanDuration::sec(2),
-            unhealthy_ticks: 1,
+            // One failed probe the client is still retrying must not move
+            // every leadership on the node (#508).
+            probe_timeout: HumanDuration::sec(5),
+            unhealthy_ticks: 3,
             heal_ticks: 2,
         }
     }

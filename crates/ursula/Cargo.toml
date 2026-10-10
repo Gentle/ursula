@@ -70,6 +70,7 @@ anyhow = { workspace = true }
 criterion = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 # Path-only: a versionless dev-dependency is dropped from the published
 # manifest, so `ursula` publishes without waiting for `ursula-ctl`.

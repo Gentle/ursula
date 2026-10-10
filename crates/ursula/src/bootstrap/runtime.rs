@@ -206,6 +206,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         snapshot::spawn_snapshot_driver(
             &spawned.runtime,
             &registry,
+            *node_id,
             snapshot_store,
             config.storage.cold.s3.as_ref(),
             snapshot_drive_interval_ms,

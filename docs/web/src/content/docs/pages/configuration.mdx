@@ -125,6 +125,9 @@ Every cold-tier object write requests server-side encryption by default (`server
 | `storage.cold.s3.bucket` | none | Required when `backend = "s3"` |
 | `storage.cold.s3.server_side_encryption` | `aes256` | SSE mode for every object write: `aes256` (SSE-S3), `aws-kms`, or `none` |
 | `storage.cold.s3.kms_key_id` | none | Customer managed KMS key; only valid with `aws-kms` |
+| `storage.cold.s3.probe_timeout` | `5s` | Deadline of the snapshot-store health probe. The default leaves the S3 client time to retry once |
+| `storage.cold.s3.unhealthy_ticks` | `3` | Bad health ticks, with no good tick between them, before the node sheds its leaderships |
+| `storage.cold.s3.heal_ticks` | `2` | Good health ticks in a row before a node that shed may lead again |
 | `storage.cold.flush_interval` | `1s` | Background flush worker tick interval |
 | `storage.cold.flush_size` | `8MiB` | Target bytes flushed per group per tick |
 | `storage.cold.flush_max_concurrency` | `4` | Parallel cold writes in flight |
@@ -135,6 +138,8 @@ Every cold-tier object write requests server-side encryption by default (`server
 | `raft.snapshot_log_budget` | `1GiB` | Node Raft-log budget of the snapshot driver: a group snapshots once its log since the last snapshot reaches the larger of this budget over twice the group count (at most `16MiB`) and twice its last snapshot's size; above three quarters of the budget a pressure pass snapshots the groups that free the most log per snapshot byte |
 
 Hot bytes here are payload bytes: the hot window keeps no per-message bookkeeping, so admission and flush thresholds charge exactly the unflushed payload. Flush defaults are conservative, so tune them under load. A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling. Advanced deployments can split the flush threshold and batch size with `storage.cold.flush_min_hot_size` and `storage.cold.flush_max_size`, but the single `storage.cold.flush_size` knob is the normal path. Once a group's accumulated hot payload reaches the threshold, Ursula packs eligible slices from that group into one immutable object up to the configured maximum; single-stream slices of 1 MiB or more keep the direct-object layout, and smaller ones are packed even when they are alone.
+
+With S3 snapshots, the snapshot driver probes the store every `storage.snapshot.drive_interval` (`5s` by default). A tick is bad when the probe fails or misses its deadline, or when more than one cold-flush write failed since the previous tick. One failed probe or one failed write is not enough on its own. After `storage.cold.s3.unhealthy_ticks` bad ticks the node stops campaigning and hands its leaderships to its peers, at most four per tick, so the peers take them over gradually. After `storage.cold.s3.heal_ticks` good ticks in a row it may lead again. The cold-health gate (`governance.cold_health`) also hands off at most four leaderships per tick. Earlier releases probed with a `2s` deadline and shed after one bad tick, which moved every leadership on the node at once.
 
 Raft snapshotting does not force a partial cold flush. Payload below the cold threshold stays in the bounded hot tail and is included in the next group snapshot, so a short snapshot interval does not turn small tails into small cold objects.
 

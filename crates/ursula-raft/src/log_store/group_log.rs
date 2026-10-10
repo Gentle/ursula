@@ -70,12 +70,63 @@ pub(crate) enum ApplyMode {
 
 /// What a read of a range needs: entries the cache holds, and the frames of
 /// the ones before them, oldest first.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ReadPlan {
     pub(crate) disk: Vec<DiskRead>,
     pub(crate) cached: Vec<Entry>,
-    /// Read weight of the entries planned, cached or not.
-    pub(crate) bytes: u64,
+    /// What the planned entries, cached or not, left of the read's budget,
+    /// for the pending entries the store adds after them. A plan that
+    /// stopped before the end of its range leaves nothing.
+    pub(crate) budget: ReadBudget,
+}
+
+/// The weight limit of one read, with entries weighed by [`entry_log_bytes`].
+/// A limited read takes the longest prefix of its range whose entries weigh
+/// at most the limit, and never less than one entry, as OpenRaft forbids an
+/// empty read. One budget covers the entries [`GroupLog::plan_read`] plans
+/// and the pending ones the store adds after them.
+#[derive(Debug)]
+pub(crate) struct ReadBudget {
+    /// The limit, or `None` to read the whole range.
+    max: Option<u64>,
+    taken: Taken,
+}
+
+/// What a [`ReadBudget`] has taken so far.
+#[derive(Debug)]
+enum Taken {
+    /// No entry yet, so the next one is taken whatever it weighs.
+    Nothing,
+    /// Entries of this total weight.
+    Bytes(u64),
+    /// The budget refused an entry, which ends the read.
+    Ended,
+}
+
+impl ReadBudget {
+    // Private: a read starts its budget in `plan_read`, and `merge_pending`
+    // can only spend what the plan left, never a fresh or unlimited budget.
+    fn new(max: Option<u64>) -> Self {
+        Self {
+            max,
+            taken: Taken::Nothing,
+        }
+    }
+
+    /// Takes the read's next entry, which weighs `bytes`, and says whether it
+    /// did. The first entry is always taken, whatever it weighs. A later one
+    /// is refused if it would carry the read past its limit, and so is every
+    /// entry after a refusal, so what a read takes is a prefix of its range.
+    pub(crate) fn take(&mut self, bytes: u64) -> bool {
+        let total = match self.taken {
+            Taken::Nothing => Some(bytes),
+            Taken::Bytes(taken) => Some(taken.saturating_add(bytes))
+                .filter(|total| self.max.is_none_or(|max| *total <= max)),
+            Taken::Ended => None,
+        };
+        self.taken = total.map_or(Taken::Ended, Taken::Bytes);
+        total.is_some()
+    }
 }
 
 /// Entries to read from one frame.
@@ -485,7 +536,7 @@ impl GroupLog {
     /// What reading `range` needs: the cached entries, and the frames of the
     /// entries before the cache. With `max_bytes`, the read covers the
     /// longest prefix of the range whose entries weigh at most that much,
-    /// cached or not, and never less than one entry.
+    /// cached or not, and never less than one entry ([`ReadBudget`]).
     pub(crate) fn plan_read(
         &self,
         range: impl RangeBounds<u64>,
@@ -501,16 +552,16 @@ impl GroupLog {
             Bound::Excluded(end) => Bound::Excluded(*end),
             Bound::Unbounded => Bound::Unbounded,
         };
-        let mut plan = ReadPlan::default();
+        let mut plan = ReadPlan {
+            disk: Vec::new(),
+            cached: Vec::new(),
+            budget: ReadBudget::new(max_bytes),
+        };
         let cache_first = self.cache.first_index();
-        let mut planned = false;
         for entry in self.index.range((start, end)) {
-            let bytes = plan.bytes.saturating_add(u64::from(entry.bytes));
-            if planned && max_bytes.is_some_and(|max| bytes > max) {
+            if !plan.budget.take(u64::from(entry.bytes)) {
                 break;
             }
-            planned = true;
-            plan.bytes = bytes;
             let index = entry.log_id.index;
             if cache_first.is_some_and(|first| index >= first)
                 && let Some(cached) = self.cache.get(index)
@@ -867,6 +918,7 @@ mod tests {
     use super::LogId as GroupLogId;
     use super::MARKER_BYTES;
     use super::RaftGroupLogRecord;
+    use super::ReadBudget;
     use super::SegmentId;
     use super::entry_log_bytes;
 
@@ -1136,7 +1188,7 @@ mod tests {
             at(1, 32),
             ApplyMode::Live,
         );
-        let plan = log.plan_read(1..=8, Some(3 * weight(100)));
+        let mut plan = log.plan_read(1..=8, Some(3 * weight(100)));
         assert!(plan.disk.is_empty());
         assert_eq!(
             plan.cached
@@ -1145,8 +1197,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        assert_eq!(plan.bytes, 3 * weight(100));
+        // The plan stopped before entry 4, so no pending entry may follow it.
+        assert!(!plan.budget.take(0));
+        // A plan that covers its range leaves the rest of the limit to the
+        // pending entries after it.
+        let mut covered = log.plan_read(1..=2, Some(3 * weight(100)));
+        assert!(covered.budget.take(weight(100)));
+        assert!(!covered.budget.take(1));
         assert_eq!(log.plan_read(1..=8, None).cached.len(), 8);
+    }
+
+    /// One rule weighs a read, the entries `plan_read` plans and the pending
+    /// ones after them alike: it takes entries while their total stays within
+    /// the limit, and the first one whatever it weighs. A refusal ends the
+    /// read, so a lighter entry after it is refused too, and nothing follows
+    /// a first entry over the limit.
+    #[test]
+    fn a_read_budget_takes_a_prefix_within_its_limit_and_at_least_one_entry() {
+        let mut budget = ReadBudget::new(Some(10));
+        assert!(budget.take(4));
+        assert!(budget.take(6));
+        assert!(!budget.take(1));
+        let mut stopped = ReadBudget::new(Some(10));
+        assert!(stopped.take(4));
+        assert!(!stopped.take(7));
+        assert!(!stopped.take(6));
+        let mut oversized = ReadBudget::new(Some(10));
+        assert!(oversized.take(11));
+        assert!(!oversized.take(0));
+        let mut whole = ReadBudget::new(None);
+        assert!(whole.take(u64::MAX));
+        assert!(whole.take(u64::MAX));
     }
 
     #[test]

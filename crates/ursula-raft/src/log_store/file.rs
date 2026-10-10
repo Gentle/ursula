@@ -42,6 +42,7 @@ use super::disk::Disk;
 use super::disk::JournalDisk;
 use super::group_log::DiskRead;
 use super::group_log::GroupLog;
+use super::group_log::ReadBudget;
 use super::journal::JournalError;
 use super::journal::JournalOp;
 use super::journal::JournalReplayMode;
@@ -404,14 +405,13 @@ impl RaftGroupFileLogStore {
                     .collect::<Vec<_>>();
                 (plan, entries)
             };
-            let room = max_bytes.map(|max| max.saturating_sub(plan.bytes));
             let mut sample = WalReadSample {
                 cache_hits: u64::try_from(plan.cached.len()).unwrap_or(u64::MAX),
                 ..WalReadSample::default()
             };
             if plan.disk.is_empty() {
                 self.metrics.record_wal_read(self.placement, sample);
-                return Ok(merge_pending(plan.cached, pending, room));
+                return Ok(merge_pending(plan.cached, pending, plan.budget));
             }
             let dir = self.core_writer.dir().to_owned();
             let group_id = self.placement.raft_group_id.0;
@@ -430,7 +430,7 @@ impl RaftGroupFileLogStore {
                     let mut entries = read.entries;
                     entries.extend(plan.cached);
                     entries.sort_by_key(|entry| entry.log_id.index);
-                    return Ok(merge_pending(entries, pending, room));
+                    return Ok(merge_pending(entries, pending, plan.budget));
                 }
                 Err(error) if segment_gone(&error) && attempt < READ_ATTEMPTS => {
                     tracing::debug!(
@@ -446,13 +446,15 @@ impl RaftGroupFileLogStore {
 }
 
 // A limited read may stop before the pending suffix. Return only the
-// consecutive prefix in that case, and only the pending entries that fit in
-// what is left of the limit (`room`), never leaving the read empty; the
-// replication reader asks for the rest.
+// consecutive prefix in that case. The read's budget refuses the pending
+// entries then too, and this check keeps the entries consecutive whatever
+// stopped the durable ones. Otherwise the pending entries draw on what the
+// durable ones left of the read's budget; the replication reader asks for
+// the rest.
 fn merge_pending(
     mut durable: Vec<Entry>,
     pending: Vec<Entry>,
-    mut room: Option<u64>,
+    mut budget: ReadBudget,
 ) -> Vec<Entry> {
     if let (Some(last), Some(first)) = (durable.last(), pending.first())
         && last.log_id.index.checked_add(1) != Some(first.log_id.index)
@@ -460,12 +462,8 @@ fn merge_pending(
         return durable;
     }
     for entry in pending {
-        if let Some(left) = room {
-            let bytes = entry_log_bytes(&entry);
-            if bytes > left && !durable.is_empty() {
-                break;
-            }
-            room = Some(left.saturating_sub(bytes));
+        if !budget.take(entry_log_bytes(&entry)) {
+            break;
         }
         durable.push(entry);
     }

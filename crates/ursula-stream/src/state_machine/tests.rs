@@ -470,27 +470,46 @@ fn create_stream(machine: &mut StreamStateMachine, id: &str) {
 }
 
 /// #507: restoring a group replicates its whole snapshot as one Raft entry,
-/// and a log read limits what it returns, one Append call to a follower, by
-/// this weight. So the import weighs at least what it encodes to, for bodies
-/// of high bytes too.
+/// and a log read limits each Append call to a follower by this weight.
+/// Bodies make up most of a large import, and MessagePack writes a body
+/// byte from 0x80 up as two bytes, so the weight counts two bytes for each
+/// byte of a stream's hot payload and of its inline snapshot body. The rest
+/// of a stream (names, offsets, producer receipts) gets a fixed allowance
+/// only, so the weight does not bound the whole encoding. An import of many
+/// streams with small bodies encodes to about three times its weight.
 #[test]
-fn an_import_weighs_at_least_its_encoded_size() {
+fn an_import_weighs_at_least_what_its_bodies_encode_to() {
     let mut machine = machine();
-    for (id, byte) in [("import-low", 7_u8), ("import-high", 0xff)] {
-        assert_eq!(
-            machine.apply(create_cmd(stream(id), Create {
-                payload: vec![byte; 64 * 1024],
-                ..Create::default()
-            })),
-            created(stream(id), 64 * 1024)
-        );
-    }
-    let import = StreamCommand::ImportSnapshot {
-        snapshot: Box::new(machine.snapshot()),
+    let body = vec![0xff; 64 * 1024];
+    assert_eq!(
+        machine.apply(create_cmd(stream("import"), Create {
+            payload: body.clone(),
+            ..Create::default()
+        })),
+        created(stream("import"), 64 * 1024)
+    );
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(
+            stream("import"),
+            64 * 1024,
+            OCTET,
+            &body,
+            0
+        )),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let snapshot = machine.snapshot();
+    let [entry] = snapshot.streams.as_slice() else {
+        panic!("one stream");
     };
-    let encoded = rmp_serde::to_vec_named(&import).expect("encode the import");
-    assert!(encoded.len() > 3 * 64 * 1024);
-    assert!(import.log_bytes_estimate() >= u64::try_from(encoded.len()).unwrap());
+    let visible = entry.visible_snapshot.as_ref().expect("a published body");
+    let encoded = |body: &Vec<u8>| rmp_serde::to_vec_named(body).expect("encode").len();
+    let bodies = encoded(&entry.payload) + encoded(&visible.payload);
+    assert!(bodies > 4 * 64 * 1024, "each high byte encodes to two");
+    let import = StreamCommand::ImportSnapshot {
+        snapshot: Box::new(snapshot),
+    };
+    assert!(import.log_bytes_estimate() >= u64::try_from(bodies).unwrap());
 }
 
 /// D12: the `Stream-Incarnation` precondition rides in the command and is

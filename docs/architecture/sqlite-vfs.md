@@ -659,6 +659,10 @@ must say in its release notes to stop every owner of a stream before upgrading.
   MinIO locally and for fork PRs; the snapshot run's ~3.5 MB bodies go to the cold tier), plus a
   12 MiB snapshot body that exercises the multipart path, with a 64 KiB snapshot minimum so the
   benchmark's Pi workload snapshots and trims at its database size.
+- Pi Durable versions: `package.json` declares the range of `@earendil-works/pi-durable` versions
+  the package supports, and the lockfile holds the newest of them, which every suite above runs.
+  The single-node job then installs the oldest without saving it and runs the typecheck and Pi
+  conformance again.
 
 ## 9. Performance
 

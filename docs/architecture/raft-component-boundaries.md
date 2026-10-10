@@ -14,12 +14,12 @@ not open journal writers or individually wire recovery drivers.
 
 All server leadership handoffs enter through the registry. A target must be
 another voter and must not be a follower this leader knows has reverted its log.
-The destination independently rejects a transfer while it cannot campaign.
-It also rejects a transfer to itself that carries its own leader vote, such as
-a self-election on the leader, because OpenRaft would start that election while
-the node still holds its old leader state. The check reads only the vote in the
-request, and OpenRaft acts on a transfer only while the node holds that vote, so
-no leadership change can slip in between.
+The destination independently rejects a transfer to itself while it cannot
+campaign. It also rejects a transfer to itself that carries its own committed
+vote, such as a self-election on the leader, because OpenRaft would start that
+election while the node still holds its old leader state. The check reads only
+the vote in the request, and OpenRaft acts on a transfer only while the node
+holds that vote, so no leadership change can slip in between.
 These checks do not predict an undetected remote disk loss; the receiver's gate
 and Raft protocol remain necessary.
 

@@ -8782,9 +8782,10 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
 
 /// The leader gains nothing from electing itself again, and OpenRaft would
 /// run that election under its old leader state. Self-election on the leader
-/// is refused before it reaches OpenRaft, and the leader keeps its vote and
-/// commits. A follower's self-election and the campaign policy are covered
-/// with a three-voter group in `ursula-raft`.
+/// is refused before it reaches OpenRaft, as is one for a stale term, and the
+/// leader keeps its vote and commits. A follower's self-election and the
+/// campaign policy are covered with a three-voter group in `ursula-raft`,
+/// through the same registry entry point.
 #[tokio::test]
 async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
     let root = tempfile::tempdir().unwrap();
@@ -8813,17 +8814,24 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
         .unwrap();
     let admin = admin_router(HttpState::with_raft_registry(runtime.clone(), registry));
     let observed = raft.metrics().borrow_watched().clone();
-    let request = SelfElectionRequest {
-        current_term: observed.current_term,
+    let self_election = |current_term: u64| {
+        http_post(
+            &admin,
+            "/__ursula/raft/0/self-election",
+            &[("content-type", "application/json")],
+            Body::from(serde_json::to_vec(&SelfElectionRequest { current_term }).unwrap()),
+        )
     };
-    let response = http_post(
-        &admin,
-        "/__ursula/raft/0/self-election",
-        &[("content-type", "application/json")],
-        Body::from(serde_json::to_vec(&request).unwrap()),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        self_election(observed.current_term).await.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        self_election(observed.current_term.checked_sub(1).unwrap())
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
     runtime
         .create_stream(CreateStreamRequest::new(
             BucketStreamId::new("benchcmp", "after-self-election"),

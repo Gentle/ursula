@@ -228,9 +228,12 @@ impl ElectionPolicy {
     /// The check reads the vote in the request rather than this node's
     /// state, so nothing can change between the check and the core. A
     /// transfer it accepts acts only while this node holds another node's
-    /// vote or its own uncommitted vote, and OpenRaft holds leader state
-    /// under such a vote only after an election started on a leader, the
-    /// case refused here.
+    /// vote or its own uncommitted vote. OpenRaft holds leader state under
+    /// such a vote only after an election started on a leader. A transfer
+    /// starts one only with the leader's committed vote, which is refused
+    /// here. `trigger().elect()` on a leader starts one too, so its only
+    /// production caller, `abandon_stalled_transfer`, steps the leader down
+    /// first, and a new caller must do the same.
     pub(crate) fn validate_incoming_transfer(
         &self,
         group: RaftGroupId,

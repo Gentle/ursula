@@ -3187,12 +3187,63 @@ async fn a_transfer_step_down_is_not_refused_by_the_leaders_own_lease() {
     shutdown_all(&engines).await;
 }
 
-/// Self-election hands a node a leadership transfer to itself that carries
-/// the vote it observed. The leader is refused before OpenRaft could start
-/// an election under its leader state, and it keeps its vote and commits.
-/// A follower whose recovery gate is closed, or that sheds leadership, is
-/// refused. Any other follower campaigns with the vote it observed and
-/// leads in a newer term.
+/// The receive-side transfer policy decides from the request alone. A
+/// transfer to another node only drops this node's lease, so it passes even
+/// while this node sheds leadership or its recovery gate is closed. A
+/// transfer to this node is refused when it carries this node's committed
+/// vote, because this node already leads, or when this node may not
+/// campaign. Its own uncommitted vote, or another node's committed vote,
+/// passes.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn incoming_transfer_policy_refuses_only_transfers_to_this_node() {
+    let group = placement().raft_group_id;
+    let node = 1;
+    let transfer =
+        |vote: UrsulaVote, to: u64| openraft::raft::TransferLeaderRequest::new(vote, to, None);
+    let leader_vote = UrsulaVote::new_committed(5, 2);
+    let own_vote = UrsulaVote::new_committed(5, node);
+    let candidacy = UrsulaVote::new(6, node);
+
+    let policy = ElectionPolicy::default();
+    assert!(matches!(
+        policy.validate_incoming_transfer(group, node, &transfer(leader_vote, node), None),
+        Ok(())
+    ));
+    assert!(matches!(
+        policy.validate_incoming_transfer(group, node, &transfer(candidacy, node), None),
+        Ok(())
+    ));
+    assert!(matches!(
+        policy.validate_incoming_transfer(group, node, &transfer(own_vote, node), None),
+        Err(IncomingTransferError::AlreadyLeader { vote, .. }) if vote == own_vote
+    ));
+
+    let (_root, store) = fresh_journal_store();
+    let gate = GroupRejoin::durable(node, group, &store).await.unwrap();
+    assert!(!gate.vote_gate_open());
+    assert!(matches!(
+        policy.validate_incoming_transfer(group, node, &transfer(leader_vote, node), Some(&gate)),
+        Err(IncomingTransferError::MayNotCampaign { .. })
+    ));
+    let registry = RaftGroupHandleRegistry::default();
+    registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+    let shed = registry.election_policy();
+    assert!(matches!(
+        shed.validate_incoming_transfer(group, node, &transfer(leader_vote, node), None),
+        Err(IncomingTransferError::MayNotCampaign { .. })
+    ));
+    assert!(matches!(
+        shed.validate_incoming_transfer(group, node, &transfer(leader_vote, 3), Some(&gate)),
+        Ok(())
+    ));
+}
+
+/// Self-election as the admin endpoint requests it. The leader is refused
+/// before OpenRaft could start an election under its leader state, and it
+/// keeps its vote and commits. A stale term, a follower whose recovery gate
+/// is closed and a follower that sheds leadership are refused. Any other
+/// follower campaigns with the vote it observes and leads in a newer term.
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follower() {
@@ -3210,18 +3261,18 @@ async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follow
         registry.register_engine(engine(id));
         registry
     };
-    let self_election = |id: u64| {
-        let observed = engine(id).raft.metrics().borrow_watched().clone();
-        openraft::raft::TransferLeaderRequest::new(observed.vote, observed.id, None)
-    };
+    let term = |id: u64| engine(id).raft.metrics().borrow_watched().current_term;
     let gated = (1..=3).find(|id| *id != leader).unwrap();
     let eligible = (1..=3).find(|id| *id != leader && *id != gated).unwrap();
 
     let leader_raft = engine(leader).raft_handle();
     let vote = leader_raft.metrics().borrow_watched().vote;
     assert!(matches!(
-        registry(leader).handle_transfer_leader(group, self_election(leader)).await,
-        Err(IncomingTransferError::AlreadyLeader { vote: refused, .. }) if refused == vote
+        registry(leader).request_self_election(group, term(leader)).await,
+        Err(SelfElectionError::Transfer(IncomingTransferError::AlreadyLeader {
+            vote: refused,
+            ..
+        })) if refused == vote
     ));
     leader_raft
         .client_write(create_command(ursula_shard::BucketStreamId::new(
@@ -3245,27 +3296,36 @@ async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follow
         .unwrap();
     assert!(matches!(
         gated_registry
-            .handle_transfer_leader(group, self_election(gated))
+            .request_self_election(group, term(gated))
             .await,
-        Err(IncomingTransferError::MayNotCampaign { .. })
+        Err(SelfElectionError::Transfer(
+            IncomingTransferError::MayNotCampaign { .. }
+        ))
     ));
 
     let eligible_registry = registry(eligible);
+    let stale = term(eligible).checked_sub(1).unwrap();
+    assert!(matches!(
+        eligible_registry.request_self_election(group, stale).await,
+        Err(SelfElectionError::TermChanged { requested, observed, .. })
+            if requested == stale && observed == term(eligible)
+    ));
     eligible_registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     assert!(matches!(
         eligible_registry
-            .handle_transfer_leader(group, self_election(eligible))
+            .request_self_election(group, term(eligible))
             .await,
-        Err(IncomingTransferError::MayNotCampaign { .. })
+        Err(SelfElectionError::Transfer(
+            IncomingTransferError::MayNotCampaign { .. }
+        ))
     ));
     eligible_registry.clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     assert_eq!(leader_raft.metrics().borrow_watched().vote, vote);
 
     wait_matched_committed(&leader_raft, eligible).await;
     eligible_registry
-        .handle_transfer_leader(group, self_election(eligible))
+        .request_self_election(group, term(eligible))
         .await
-        .unwrap()
         .unwrap();
     engine(eligible)
         .raft
@@ -3279,6 +3339,72 @@ async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follow
         )
         .await
         .unwrap();
+    shutdown_all(&engines).await;
+}
+
+/// A handoff reaches its target through the in-process network, which
+/// applies the receiver's transfer policy as the gRPC service does. A target
+/// whose recovery gate is closed refuses it and never campaigns. The
+/// transfer stalls, and a voter other than the target leads in a newer term.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn registry_handoff_to_a_gated_follower_is_refused_by_the_follower() {
+    use openraft::rt::WatchReceiver;
+    let (network, engines, leader, _roots) =
+        build_three_node_cluster("handoff-gated-target", None).await;
+    let group = placement().raft_group_id;
+    let engine = |id: u64| {
+        engines
+            .iter()
+            .find(|engine| engine.raft.metrics().borrow_watched().id == id)
+            .unwrap()
+    };
+    let gated = (1..=3).find(|id| *id != leader).unwrap();
+    let leader_raft = engine(leader).raft_handle();
+    let vote = leader_raft.metrics().borrow_watched().vote;
+
+    // The gate keeps the target out of elections. Its vote floor lets it
+    // keep taking the leader's appends, so the leader's handoff policy
+    // still accepts it as a target.
+    let (_gate_root, gate_store) = fresh_journal_store();
+    let gate = Arc::new(
+        GroupRejoin::durable(gated, group, &gate_store)
+            .await
+            .unwrap(),
+    );
+    gate.establish_vote_floor(vote).await.unwrap();
+    assert!(!gate.vote_gate_open());
+    engine(gated)
+        .publish_recovery(gate, &RaftGroupHandleRegistry::default())
+        .unwrap();
+    network.register(gated, engine(gated));
+    leader_raft
+        .client_write(create_command(ursula_shard::BucketStreamId::new(
+            "default",
+            "handoff-gated-target",
+        )))
+        .await
+        .unwrap();
+    wait_matched_committed(&leader_raft, gated).await;
+
+    let registry = RaftGroupHandleRegistry::default();
+    registry.register_engine(engine(leader));
+    registry.transfer_leader(group, gated).await.unwrap();
+    leader_raft
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |metrics| {
+                metrics.vote.is_committed()
+                    && metrics.vote.leader_id().term() > vote.leader_id().term()
+                    && metrics.current_leader.is_some_and(|id| id != gated)
+            },
+            "a voter other than the gated target leads in a newer term",
+        )
+        .await
+        .unwrap();
+    let target = engine(gated).raft.metrics().borrow_watched().clone();
+    assert_ne!(target.state, openraft::ServerState::Leader);
+    assert_ne!(*target.vote.leader_id().node_id(), gated);
     shutdown_all(&engines).await;
 }
 

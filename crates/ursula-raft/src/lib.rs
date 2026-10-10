@@ -153,6 +153,7 @@ pub use registry::LeadershipTransferError;
 pub use registry::QuorumProofError;
 pub use registry::RaftGroupHandle;
 pub use registry::RaftGroupHandleRegistry;
+pub use registry::SelfElectionError;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
 pub use registry::SnapshotInstallError;

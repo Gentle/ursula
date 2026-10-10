@@ -126,6 +126,7 @@
 //! - `db`: attached databases and the process-wide registry.
 //! - `error`: the error type, and the classes callers act on (gone, recreated, fenced).
 //! - `extension`: the entry point and the SQL functions.
+//! - `guard`: panics stop at the C entry points instead of aborting the host process.
 //! - `host`: the host's SQLite API, the "unix" VFS and private connections.
 //! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.
@@ -143,6 +144,7 @@ mod db;
 mod error;
 mod extension;
 pub mod frame;
+mod guard;
 mod host;
 mod local;
 mod log;

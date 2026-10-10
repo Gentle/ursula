@@ -20,6 +20,10 @@ use crate::snapshot::SnapshotError;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     // Local files and the host process.
+    /// A C entry point panicked (`guard::contain`). After a file method, the extension's state for
+    /// its database may be half changed, so the database is poisoned and needs a new attach.
+    #[error("{entry} panicked inside the extension")]
+    Panicked { entry: &'static str },
     #[error("{op} {path}: {source}")]
     Io {
         op: &'static str,

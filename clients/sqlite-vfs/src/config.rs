@@ -49,6 +49,14 @@ pub(crate) fn idle_age() -> Duration {
     })
 }
 
+/// `URSULA_VFS_PANIC_IN`: the C entry point (`x_write`, `ursula_status`, ...) that panics on purpose
+/// at every call, for tests of `guard::contain`. Unset outside tests.
+pub(crate) fn panic_in() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| std::env::var("URSULA_VFS_PANIC_IN").ok())
+        .as_deref()
+}
+
 pub(crate) fn snapshot_min_bytes() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {

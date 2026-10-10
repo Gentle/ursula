@@ -498,6 +498,12 @@ attached database is a no-op, the extension's private connections run `synchrono
 sidecar is replaced by temp file + rename without fsync. So the application's `PRAGMA synchronous`
 level affects neither correctness nor commit latency (leave it as the application sets it).
 
+A panic inside the extension stops at its C entry point (`guard::contain`), because unwinding out
+of an `extern "C"` function would abort the host process. The call fails: a file method with its
+I/O error, after which the database is poisoned since the panic may have left its state half
+changed, and a SQL function with an error. The process goes on, and the log names the entry point
+(`event=panic`). The crate refuses to build with `panic = "abort"`.
+
 But the files must never be *trusted* when they do not hold the state the sidecar names: with page
 images, the owner's next commits are built on whatever pages the files hold, so a stale page would
 be written into the stream. Trust is therefore verified against the files, not inferred:

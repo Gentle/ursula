@@ -23,6 +23,7 @@ use crate::auth::set_token;
 use crate::db::Mode;
 use crate::error::Error;
 use crate::error::WriteRefusal;
+use crate::guard::contain;
 use crate::host::API;
 use crate::host::OK;
 use crate::host::UNIX;
@@ -30,7 +31,7 @@ use crate::host::api;
 use crate::status::stats;
 use crate::status::status;
 use crate::vfs::File;
-use crate::vfs::x_open;
+use crate::vfs::c_open;
 
 /// The "ursula" VFS, registered once per process (null before).
 static VFS: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(null_mut());
@@ -129,7 +130,7 @@ fn refused_code(e: &Error) -> Option<c_int> {
 
 /// `ursula_attach(path, url[, mode])`: the mode is `'owner'` (the default) or `'read_only'` (see
 /// `Mode`). An attach refused before anything reached the stream fails with `refused_code`.
-unsafe extern "C" fn fn_attach(
+unsafe fn fn_attach(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
     argv: *mut *mut ffi::sqlite3_value,
@@ -152,7 +153,7 @@ unsafe extern "C" fn fn_attach(
     }
 }
 
-unsafe extern "C" fn fn_status(
+unsafe fn fn_status(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
     argv: *mut *mut ffi::sqlite3_value,
@@ -163,7 +164,7 @@ unsafe extern "C" fn fn_status(
     unsafe { result(ctx, "ursula_status", status(&path)) };
 }
 
-unsafe extern "C" fn fn_stats(
+unsafe fn fn_stats(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
     argv: *mut *mut ffi::sqlite3_value,
@@ -176,7 +177,7 @@ unsafe extern "C" fn fn_stats(
 
 /// `ursula_set_token(token)`: the bearer token every request carries from now on; NULL or `''` goes
 /// back to `URSULA_VFS_TOKEN_FILE`.
-unsafe extern "C" fn fn_set_token(
+unsafe fn fn_set_token(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
     argv: *mut *mut ffi::sqlite3_value,
@@ -188,6 +189,42 @@ unsafe extern "C" fn fn_set_token(
     unsafe { result(ctx, "ursula_set_token", Ok::<_, Error>(String::new())) };
 }
 
+/// A SQL function's C entry point: runs the function named without `c_` through [`contain`], so a
+/// panic in it ends the call with an error instead of unwinding into SQLite, which aborts the host
+/// process.
+macro_rules! sql_entry {
+    ($entry:ident => $body:ident, $name:literal) => {
+        unsafe extern "C" fn $entry(
+            ctx: *mut ffi::sqlite3_context,
+            argc: c_int,
+            argv: *mut *mut ffi::sqlite3_value,
+        ) {
+            contain(
+                $name,
+                || {
+                    // SAFETY: SQLite calls the function with its context.
+                    unsafe {
+                        result(
+                            ctx,
+                            $name,
+                            Err::<String, _>(Error::Panicked { entry: $name }),
+                        )
+                    }
+                },
+                || {
+                    // SAFETY: SQLite's call of the function, forwarded with its arguments.
+                    unsafe { $body(ctx, argc, argv) }
+                },
+            )
+        }
+    };
+}
+
+sql_entry!(c_attach => fn_attach, "ursula_attach");
+sql_entry!(c_status => fn_status, "ursula_status");
+sql_entry!(c_stats => fn_stats, "ursula_stats");
+sql_entry!(c_set_token => fn_set_token, "ursula_set_token");
+
 /// Registers the "ursula" VFS over "unix" as the default (once per process) and the SQL functions
 /// on `db`, direct-only: a schema object of an untrusted database (a trigger, a view) cannot call
 /// them to attach a file or replace the process's token.
@@ -198,6 +235,26 @@ unsafe extern "C" fn fn_set_token(
 /// host's API routines, which outlive the process.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_extension_init(
+    db: *mut ffi::sqlite3,
+    err: *mut *mut c_char,
+    p_api: *const ffi::sqlite3_api_routines,
+) -> c_int {
+    contain(
+        "sqlite3_extension_init",
+        || ffi::SQLITE_ERROR,
+        || {
+            // SAFETY: SQLite's call of the entry point, forwarded with its arguments.
+            unsafe { init(db, err, p_api) }
+        },
+    )
+}
+
+/// [`sqlite3_extension_init`]'s body.
+///
+/// # Safety
+///
+/// As [`sqlite3_extension_init`].
+unsafe fn init(
     db: *mut ffi::sqlite3,
     _err: *mut *mut c_char,
     p_api: *const ffi::sqlite3_api_routines,
@@ -218,11 +275,11 @@ pub unsafe extern "C" fn sqlite3_extension_init(
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
     let fns: [(&CStr, c_int, SqlFn); 5] = [
-        (c"ursula_attach", 2, fn_attach),
-        (c"ursula_attach", 3, fn_attach),
-        (c"ursula_status", 1, fn_status),
-        (c"ursula_stats", 1, fn_stats),
-        (c"ursula_set_token", 1, fn_set_token),
+        (c"ursula_attach", 2, c_attach),
+        (c"ursula_attach", 3, c_attach),
+        (c"ursula_status", 1, c_status),
+        (c"ursula_stats", 1, c_stats),
+        (c"ursula_set_token", 1, c_set_token),
     ];
     for (name, n, f) in fns {
         // SAFETY: `db` is the loading connection, the name is NUL-terminated and static, and the
@@ -270,7 +327,7 @@ fn register_vfs(a: &ffi::sqlite3_api_routines) -> c_int {
         zName: c"ursula".as_ptr(),
         szOsFile: size,
         pNext: null_mut(),
-        xOpen: Some(x_open),
+        xOpen: Some(c_open),
         ..*unix
     }));
     // SAFETY: `v` is a complete VFS that is never freed (SQLite keeps it registered for the

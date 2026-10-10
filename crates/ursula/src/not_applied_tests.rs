@@ -1,18 +1,22 @@
 //! `x-ursula-not-applied`: ingress admission marks the refusals it makes
-//! before a request reaches a handler, and an answer that can follow a
-//! proposal never carries the marker. The pressure refusals are pinned with
+//! before a request reaches a handler, and each marked refusal applied
+//! nothing. The refusals left unmarked on purpose are pinned here, and so is
+//! the rule that a node never sets the gateway's vouch,
+//! `x-ursula-not-applied-checked`. The pressure refusals are pinned with
 //! their tests in `tests.rs`.
 
 use axum::Router;
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::body::to_bytes;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
-use axum::http::header::CONTENT_TYPE;
 use axum::http::header::LOCATION;
 use axum::response::Response;
 use tower::ServiceExt;
+use ursula_proto::admin::ApplyFailureKind;
+use ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER;
 use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_runtime::AppendRequest;
@@ -43,21 +47,39 @@ use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 use ursula_shard::BucketStreamId;
+use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
+use crate::HttpState;
+use crate::IngressAdmission;
 use crate::MAX_HTTP_BODY_BYTES;
+use crate::client_router_with_admission;
 use crate::router;
 use crate::router_with_static_raft_cluster;
 
-/// An in-memory engine that commits every append and then answers it with
-/// `error`, as a node does when the response to a committed proposal is
-/// lost or overtaken by a leader change.
-struct CommitThenFailEngine {
-    inner: InMemoryGroupEngine,
-    error: GroupEngineError,
+const STREAM: &str = "/benchcmp/committed";
+const PEER: &str = "http://127.0.0.1:4437";
+const TEXT: (&str, &str) = ("content-type", "text/plain");
+
+/// How the test engine answers an append.
+#[derive(Clone)]
+enum AppendFailure {
+    /// Commits the append, then answers with the error, as a node does when
+    /// the response to a committed proposal is lost or overtaken by a leader
+    /// change.
+    AfterCommit(GroupEngineError),
+    /// Answers with the error and proposes nothing.
+    BeforeProposal(GroupEngineError),
 }
 
-impl GroupEngine for CommitThenFailEngine {
+/// An in-memory engine whose appends fail as `failure` says. Everything else
+/// passes through.
+struct FailingAppendEngine {
+    inner: InMemoryGroupEngine,
+    failure: AppendFailure,
+}
+
+impl GroupEngine for FailingAppendEngine {
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,
@@ -120,9 +142,15 @@ impl GroupEngine for CommitThenFailEngine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
+        let failure = self.failure.clone();
         Box::pin(async move {
-            self.inner.append(request, placement, admission).await?;
-            Err(self.error.clone())
+            match failure {
+                AppendFailure::AfterCommit(error) => {
+                    self.inner.append(request, placement, admission).await?;
+                    Err(error)
+                }
+                AppendFailure::BeforeProposal(error) => Err(error),
+            }
         })
     }
 
@@ -138,22 +166,53 @@ impl GroupEngine for CommitThenFailEngine {
     }
 }
 
-struct CommitThenFailFactory {
-    error: GroupEngineError,
+struct FailingAppendFactory {
+    failure: AppendFailure,
 }
 
-impl GroupEngineFactory for CommitThenFailFactory {
+impl GroupEngineFactory for FailingAppendFactory {
     fn create<'a>(
         &'a self,
         _placement: ShardPlacement,
         _metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
-        let engine: Box<dyn GroupEngine> = Box::new(CommitThenFailEngine {
+        let engine: Box<dyn GroupEngine> = Box::new(FailingAppendEngine {
             inner: InMemoryGroupEngine::default(),
-            error: self.error.clone(),
+            failure: self.failure.clone(),
         });
         Box::pin(async move { Ok(engine) })
     }
+}
+
+/// A node whose appends fail as `failure` says. A clustered node knows one
+/// peer, node 1 at [`PEER`], so a forward to node 1 answers a redirect there.
+fn node_failing_appends(failure: AppendFailure, clustered: bool) -> Router {
+    let runtime =
+        ShardRuntime::spawn_with_engine_factory(RuntimeConfig::new(1, 1), FailingAppendFactory {
+            failure,
+        })
+        .expect("runtime");
+    if clustered {
+        router_with_static_raft_cluster(runtime, RaftGroupHandleRegistry::default(), [(
+            1,
+            PEER.to_owned(),
+        )])
+    } else {
+        router(runtime)
+    }
+}
+
+/// A node with the production admission and an in-flight write-body budget
+/// of `bytes`.
+fn node_with_body_budget(bytes: u64) -> Router {
+    let runtime = ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime");
+    client_router_with_admission(
+        HttpState::new(runtime),
+        IngressAdmission::new(&ursula_config::ServerConfig {
+            http_inflight_body_size: ursula_config::HumanSize::bytes(bytes),
+            ..ursula_config::ServerConfig::default()
+        }),
+    )
 }
 
 async fn send(
@@ -173,6 +232,18 @@ async fn send(
         .expect("response")
 }
 
+async fn create(app: &Router) {
+    let created = send(app, "PUT", STREAM, &[TEXT], "").await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+}
+
+/// Everything the stream holds, read from its start.
+async fn stream_content(app: &Router) -> Bytes {
+    let read = send(app, "GET", &format!("{STREAM}?offset=-1"), &[], "").await;
+    assert_eq!(read.status(), StatusCode::OK);
+    to_bytes(read.into_body(), usize::MAX).await.expect("body")
+}
+
 fn not_applied(response: &Response) -> Option<&str> {
     response
         .headers()
@@ -180,27 +251,52 @@ fn not_applied(response: &Response) -> Option<&str> {
         .map(|value| value.to_str().expect("an ASCII token"))
 }
 
+fn location(response: &Response) -> Option<&str> {
+    response
+        .headers()
+        .get(LOCATION)
+        .map(|value| value.to_str().expect("an ASCII URL"))
+}
+
 /// Admission refuses a body over the route's limit from its `Content-Length`,
 /// before reading it, so the `413` applied nothing.
 #[tokio::test]
 async fn admission_marks_an_oversized_body_as_not_applied() {
     let app = router(ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime"));
+    create(&app).await;
     let oversized = MAX_HTTP_BODY_BYTES.saturating_add(1).to_string();
 
     let response = send(
         &app,
         "POST",
-        "/benchcmp/oversized",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (CONTENT_LENGTH.as_str(), &oversized),
-        ],
-        "",
+        STREAM,
+        &[TEXT, (CONTENT_LENGTH.as_str(), &oversized)],
+        "abc",
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(not_applied(&response), Some("RequestBodyTooLarge"));
+    assert_eq!(stream_content(&app).await, "");
+}
+
+/// Admission refuses a body that the in-flight write-body budget has no room
+/// for, before the handler reads it, so the `503` applied nothing.
+#[tokio::test]
+async fn admission_marks_an_exhausted_body_budget_as_not_applied() {
+    let app = node_with_body_budget(4);
+    create(&app).await;
+
+    let refused = send(&app, "POST", STREAM, &[TEXT], "abcde").await;
+
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(not_applied(&refused), Some("IngressBodyBytesLimitReached"));
+    assert_eq!(stream_content(&app).await, "");
+    // A body that fits is appended, without the marker.
+    let appended = send(&app, "POST", STREAM, &[TEXT], "abcd").await;
+    assert_eq!(appended.status(), StatusCode::NO_CONTENT);
+    assert_eq!(not_applied(&appended), None);
+    assert_eq!(stream_content(&app).await, "abcd");
 }
 
 /// An answer that can follow a committed proposal never carries the marker:
@@ -211,12 +307,22 @@ async fn admission_marks_an_oversized_body_as_not_applied() {
 /// redirect carried one too.
 #[tokio::test]
 async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
-    const PEER: &str = "http://127.0.0.1:4437";
-    let uri = "/benchcmp/committed";
     let cases = [
         (
             "outcome unknown",
             GroupEngineError::Infra(GroupInfraError::OutcomeUnknown),
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+        (
+            "apply stopped",
+            GroupEngineError::Infra(GroupInfraError::ApplyStopped {
+                raft_group_id: RaftGroupId(0),
+                term: 1,
+                index: 1,
+                kind: ApplyFailureKind::Panic,
+            }),
             false,
             StatusCode::SERVICE_UNAVAILABLE,
             None,
@@ -236,56 +342,123 @@ async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
             GroupEngineError::forward_to_leader("client_write responder", Some(1), None),
             true,
             StatusCode::TEMPORARY_REDIRECT,
-            Some(format!("{PEER}{uri}")),
+            Some(format!("{PEER}{STREAM}")),
         ),
     ];
-    for (case, error, clustered, status, location) in cases {
-        let runtime = ShardRuntime::spawn_with_engine_factory(
-            RuntimeConfig::new(1, 1),
-            CommitThenFailFactory { error },
-        )
-        .expect("runtime");
-        let app = if clustered {
-            router_with_static_raft_cluster(runtime, RaftGroupHandleRegistry::default(), [(
-                1,
-                PEER.to_owned(),
-            )])
-        } else {
-            router(runtime)
-        };
-        let created = send(
-            &app,
-            "PUT",
-            uri,
-            &[(CONTENT_TYPE.as_str(), "text/plain")],
-            "",
-        )
-        .await;
-        assert_eq!(created.status(), StatusCode::CREATED, "{case}");
+    for (case, error, clustered, status, redirect) in cases {
+        let app = node_failing_appends(AppendFailure::AfterCommit(error), clustered);
+        create(&app).await;
 
-        let appended = send(
-            &app,
-            "POST",
-            uri,
-            &[(CONTENT_TYPE.as_str(), "text/plain")],
-            "abc",
-        )
-        .await;
+        let appended = send(&app, "POST", STREAM, &[TEXT], "abc").await;
 
         assert_eq!(appended.status(), status, "{case}");
-        assert_eq!(
-            appended
-                .headers()
-                .get(LOCATION)
-                .map(|value| value.to_str().expect("an ASCII URL")),
-            location.as_deref(),
+        assert_eq!(location(&appended), redirect.as_deref(), "{case}");
+        assert_eq!(not_applied(&appended), None, "{case}");
+        assert!(
+            !appended.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
             "{case}"
         );
-        assert_eq!(not_applied(&appended), None, "{case}");
         // The append did commit.
-        let read = send(&app, "GET", &format!("{uri}?offset=-1"), &[], "").await;
-        assert_eq!(read.status(), StatusCode::OK, "{case}");
-        let body = to_bytes(read.into_body(), usize::MAX).await.expect("body");
-        assert_eq!(&body[..], b"abc", "{case}");
+        assert_eq!(stream_content(&app).await, "abc", "{case}");
     }
+}
+
+/// Refusals the runtime makes before it proposes anything stay unmarked as
+/// well. The shared runtime-error path renders them, and it also answers
+/// handlers that issue several commands: a bucket purge proposes once per
+/// group, so a later group's refusal there can follow earlier groups'
+/// purges. Marking them needs a decision per handler.
+#[tokio::test]
+async fn runtime_refusals_before_proposal_stay_unmarked() {
+    let cases = [
+        (
+            "uncommitted backpressure",
+            GroupEngineError::raft_uncommitted_backpressure(8, 4, 10),
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+        (
+            "cold backpressure",
+            GroupEngineError::cold_backpressure(
+                BucketStreamId::new("benchcmp", "committed"),
+                8,
+                11,
+                10,
+            ),
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+        (
+            "forward before proposal, leader unknown",
+            GroupEngineError::forward_to_leader_before_proposal("not the leader", None, None),
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+        (
+            "forward before proposal, leader known",
+            GroupEngineError::forward_to_leader_before_proposal("not the leader", Some(1), None),
+            true,
+            StatusCode::TEMPORARY_REDIRECT,
+            Some(format!("{PEER}{STREAM}")),
+        ),
+    ];
+    for (case, error, clustered, status, redirect) in cases {
+        let app = node_failing_appends(AppendFailure::BeforeProposal(error), clustered);
+        create(&app).await;
+
+        let refused = send(&app, "POST", STREAM, &[TEXT], "abc").await;
+
+        assert_eq!(refused.status(), status, "{case}");
+        assert_eq!(location(&refused), redirect.as_deref(), "{case}");
+        assert_eq!(not_applied(&refused), None, "{case}");
+        assert_eq!(stream_content(&app).await, "", "{case}");
+    }
+}
+
+/// Only a gateway vouches for the marker. A node that set
+/// `x-ursula-not-applied-checked` itself would have its marker trusted after
+/// redirects that a gateway older than 0.7.3, or a client's HTTP library,
+/// follows without checking the redirect.
+#[tokio::test]
+async fn a_node_never_sets_the_vouch() {
+    let app = node_with_body_budget(4);
+    let oversized = MAX_HTTP_BODY_BYTES.saturating_add(1).to_string();
+    let responses = [
+        ("create", send(&app, "PUT", STREAM, &[TEXT], "").await),
+        ("append", send(&app, "POST", STREAM, &[TEXT], "abc").await),
+        (
+            "budget refusal",
+            send(&app, "POST", STREAM, &[TEXT], "abcde").await,
+        ),
+        (
+            "size refusal",
+            send(
+                &app,
+                "POST",
+                STREAM,
+                &[TEXT, (CONTENT_LENGTH.as_str(), &oversized)],
+                "abc",
+            )
+            .await,
+        ),
+        (
+            "missing stream",
+            send(&app, "GET", "/benchcmp/missing?offset=-1", &[], "").await,
+        ),
+    ];
+
+    let mut marked = 0;
+    for (case, response) in &responses {
+        if not_applied(response).is_some() {
+            marked += 1;
+        }
+        assert!(
+            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+            "{case}"
+        );
+    }
+    assert_eq!(marked, 2, "both refusals carry the marker");
 }

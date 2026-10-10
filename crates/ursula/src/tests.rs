@@ -5731,6 +5731,11 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
             .expect("utf8 response")
             .contains("WalDiskPressure")
     );
+    // The marked refusal created nothing. Reads pass admission under pressure.
+    assert_eq!(
+        http_head(&app, "/benchcmp/disk-pressure").await.status(),
+        StatusCode::NOT_FOUND
+    );
 
     assert_eq!(
         monitor.observe_available(200),
@@ -5740,6 +5745,16 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
         http_get(&app, READINESS_PATH).await.status(),
         StatusCode::OK
     );
+    // Admitted, the same write creates the stream.
+    let write = http_put(
+        &app,
+        "/benchcmp/disk-pressure",
+        &[(CONTENT_LENGTH.as_str(), "1")],
+        Body::from("x"),
+    )
+    .await;
+    assert_eq!(write.status(), StatusCode::CREATED);
+    assert!(!write.headers().contains_key(NOT_APPLIED_HEADER));
 }
 
 /// Format epoch 2 (E8): once a Raft protocol mismatch is recorded, readiness
@@ -5817,11 +5832,17 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
             .expect("utf8 response")
             .contains("RaftLogPressure")
     );
+    // The marked refusal created nothing.
+    assert_eq!(
+        http_head(&app, "/benchcmp/log-pressure").await.status(),
+        StatusCode::NOT_FOUND
+    );
     let bodiless = http_put(&app, "/benchcmp", &[], Body::empty()).await;
     assert_ne!(bodiless.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(!bodiless.headers().contains_key(NOT_APPLIED_HEADER));
 
     assert_eq!(coordinator.observe_log_bytes(50, 200, 100), Some(false));
+    // Admitted, the same write creates the stream.
     let write = http_put(
         &app,
         "/benchcmp/log-pressure",
@@ -5829,7 +5850,7 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
         Body::from("x"),
     )
     .await;
-    assert_ne!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(write.status(), StatusCode::CREATED);
     assert!(!write.headers().contains_key(NOT_APPLIED_HEADER));
 }
 

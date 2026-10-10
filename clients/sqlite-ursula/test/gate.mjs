@@ -6,29 +6,31 @@
 //
 // argv: the node's URL. Prints {"port": n} once it listens. Control requests, never forwarded:
 //   PUT /__gate {"refuse": body | null, "limit"?: n, "methods"?: ["POST", "PUT"], "status"?: 402,
-//                "headers"?: {name: value}, "dropNextPost"?: {"refuse": body, "limit"?: n,
-//                "status"?: n, "headers"?: {...}} | null, "forwardNextPost"?: {...} | null}
+//                "headers"?: {name: value}, "over"?: n, "dropNextPost"?: {"refuse": body,
+//                "limit"?: n, "status"?: n, "headers"?: {...}} | null, "forwardNextPost"?: {...} | null}
 //   GET /__gate -> {"refused": n, "forwarded": n, "dropped": n, "replaced": n, "droppedStatuses": [n],
 //                   "replacedStatuses": [n]}
 // While `refuse` is set, requests with one of `methods` (writes: POST and PUT by default) are answered
 // `status` (402 by default) with `headers` and that body without being forwarded, `limit` times at most
-// (then `refuse` clears). With `dropNextPost`, the next POST is forwarded but its answer is cut (its
-// outcome is unknown to the client), and its refusal is armed at once. With `forwardNextPost` (the same
-// fields), the next POST is forwarded and the node's answer is replaced by that refusal, which breaks the
-// rule for refusals (the node applied the write, and the client is told it did not), and its refusal is
-// armed at once for the writes after it. The node's status for each answer cut or replaced is kept, in
-// order (`droppedStatuses`, `replacedStatuses`).
+// (then `refuse` clears). With `over`, only those with a body of more than `over` bytes (by
+// Content-Length) are, the way a layer with a request size limit refuses them. With `dropNextPost`, the
+// next POST is forwarded but its answer is cut (its outcome is unknown to the client), and its refusal is
+// armed at once. With `forwardNextPost` (the same fields), the next POST is forwarded and the node's
+// answer is replaced by that refusal, which breaks the rule for refusals (the node applied the write, and
+// the client is told it did not), and its refusal is armed at once for the writes after it. The node's
+// status for each answer cut or replaced is kept, in order (`droppedStatuses`, `replacedStatuses`).
 import { createServer, request } from "node:http";
 
 const target = new URL(process.argv[2]);
-const state = { refuse: null, limit: Number.POSITIVE_INFINITY, methods: ["POST", "PUT"], status: 402, headers: {}, dropNextPost: null, forwardNextPost: null, refused: 0, forwarded: 0, dropped: 0, replaced: 0, droppedStatuses: [], replacedStatuses: [] };
+const state = { refuse: null, limit: Number.POSITIVE_INFINITY, methods: ["POST", "PUT"], status: 402, headers: {}, over: -1, dropNextPost: null, forwardNextPost: null, refused: 0, forwarded: 0, dropped: 0, replaced: 0, droppedStatuses: [], replacedStatuses: [] };
 
-const arm = ({ refuse, limit, methods, status, headers }) => {
+const arm = ({ refuse, limit, methods, status, headers, over }) => {
 	state.refuse = refuse;
 	state.limit = limit ?? Number.POSITIVE_INFINITY;
 	state.methods = methods ?? ["POST", "PUT"];
 	state.status = status ?? 402;
 	state.headers = headers ?? {};
+	state.over = over ?? -1;
 };
 
 const server = createServer((req, res) => {
@@ -51,7 +53,7 @@ const server = createServer((req, res) => {
 		});
 		return;
 	}
-	if (state.refuse !== null && state.methods.includes(req.method)) {
+	if (state.refuse !== null && state.methods.includes(req.method) && Number(req.headers["content-length"] ?? 0) > state.over) {
 		state.refused++;
 		const body = state.refuse;
 		state.limit--;

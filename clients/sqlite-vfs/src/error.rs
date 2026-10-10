@@ -221,6 +221,18 @@ pub(crate) enum Error {
     SnapshotOffset { at: String, reflects: String },
     #[error("the snapshot at {offset} does not read back")]
     SnapshotNotReadBack { offset: String },
+    /// A snapshot publish answered 413: its body is over the request size limit of the server or
+    /// of a layer in front of it.
+    #[error(
+        "publish snapshot {url}: 413{}: a body of {bytes} bytes is over the request size limit of \
+         the server or of a layer in front of it (ursulagw: --max-request-body-bytes)",
+        with_body(.body)
+    )]
+    SnapshotTooLarge {
+        url: String,
+        bytes: usize,
+        body: String,
+    },
     #[error(
         "read {url} at {offset}: beyond the end of the stream that acknowledged it (the server \
          lost acknowledged data?); the local files are kept (delete them to rebuild)"

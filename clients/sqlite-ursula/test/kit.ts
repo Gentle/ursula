@@ -282,9 +282,9 @@ export class Gate {
 	/**
 	 * Answers writes `status` (`402` by default) with `headers` and `body` from now on, without
 	 * forwarding them: `limit` of them at most, and only those with one of `methods` (POST and PUT by
-	 * default). `null` forwards them again.
+	 * default) and, with `over`, a body of more than `over` bytes. `null` forwards them again.
 	 */
-	async refuse(body: string | null, options: { limit?: number; methods?: string[] } & Refusal = {}): Promise<void> {
+	async refuse(body: string | null, options: { limit?: number; methods?: string[]; over?: number } & Refusal = {}): Promise<void> {
 		await this.control({ refuse: body, ...options });
 	}
 

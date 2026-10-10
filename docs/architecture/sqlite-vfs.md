@@ -416,7 +416,7 @@ API both rewrite pages, and are not). The thread:
 3. `wal_checkpoint(PASSIVE)` on the private connection, retried for up to ~100 ms while another
    connection's checkpoint keeps it busy (a passive checkpoint gets no busy handler). Unless every
    WAL frame was checkpointed (a reader pins older frames), gives up for now and retries shortly
-   (backoff from 10 ms up to 1 s; server errors back off from 100 ms up to 30 s).
+   (backoff from 10 ms up to 1 s; a failed attempt waits longer, §4.4).
 4. `BEGIN` and a read: the read transaction starts at `W`. Closes the window.
 5. Copies pages `1..n` of the db file through the private connection's own file handle (a second
    descriptor's close would drop the process's POSIX locks). While the read transaction lasts no
@@ -440,7 +440,8 @@ zombie with a higher one could then fence the new owner).
 
 ### 4.3 Publishing, retention, and attach
 
-1. `PUT {stream}/snapshot/{W}` (retried while the outcome is unknown; publishing is idempotent),
+1. `PUT {stream}/snapshot/{W}` (sent once more while the outcome is unknown: publishing is
+   idempotent, and the wait after a failed attempt covers the rest, §4.4),
    with the `Stream-Incarnation` precondition (a recreated stream answers `412`; below). 409/410: a newer snapshot
    exists; nothing to do.
 2. `GET {stream}/snapshot/{W}` until it returns exactly the published bytes.
@@ -482,8 +483,21 @@ snapshot (the server refuses).
 
 Bodies of at least `runtime.external_payload_min_size` (1 MiB) are stored in the cold tier when
 a cold backend is configured, up to 1 GiB; inline otherwise (up to 32 MiB). Through `ursulagw` a body above its
-`--max-request-body-bytes` (32 MiB) is refused: the snapshot thread logs and retries with backoff,
-and the log keeps growing. A superseded cold body stays readable for 5 minutes.
+`--max-request-body-bytes` (32 MiB) is refused with `413`, and so is one above a proxy's limit,
+though a proxy may also reset the connection or time the upload out. A superseded cold body stays
+readable for 5 minutes.
+
+A failed attempt is not repeated right away. Each attempt reads, compresses and sends the whole
+database, and a body over a size limit fails the same way every time until the database shrinks.
+So each failure doubles the wait before the next attempt, from 100 ms up to 1 h, and a snapshot
+published (or found at its offset) ends the run. A commit's request meanwhile only checks whether
+the database shrank: below three quarters of its size at the last failure (a `VACUUM`), the attempt
+starts at once. Within an attempt the body is sent twice at most, while a retention move (no body)
+is retried within `URSULA_VFS_RETRY_MS`. `ursula_status` reports the run (`snapshot_failures`, and
+`snapshot_error`, which names a `413` as over the request size limit, with the body's size) and the
+compressed size of the latest body built (`snapshot_bytes`). Each failure is logged
+(`snapshot_failed`, with the wait as `retry_ms`). The log keeps growing meanwhile, and a rebuild
+replays all of it.
 
 ## 5. Guarantees
 
@@ -692,7 +706,8 @@ What attach does in each case:
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
 - A snapshot that cannot be taken (a long reader pins WAL frames) or published (body too large):
-  the log grows, nothing is lost; retention simply does not advance.
+  the log grows, nothing is lost; retention simply does not advance. A body too large is sent
+  again at most hourly once its failures run long, and at once after the database shrinks (§4.4).
 
 A disk write-back I/O error underneath a running process (EIO from the device, a
 thin-provisioned volume out of space). The commit path never fsyncs the WAL, and the db file only
@@ -790,7 +805,8 @@ The crate refuses to build with `panic = "abort"`.
   server's limit equals the default frame limit, which the setting cannot raise past, so no frame
   the extension sends is over it. Any other `413` poisons at once.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
-  by the server at 1 GiB compressed (32 MiB inline or through the gateway).
+  by the server at 1 GiB compressed (32 MiB inline or through the gateway). `snapshot_bytes` in
+  `ursula_status` is the latest body's compressed size.
 - Producer expiry after 7 idle days; the owner reclaims only if nobody wrote meanwhile.
 - Redirects are never followed (§2), so the stream URL must reach the stream's leader by itself:
   through a gateway, or on a single-node server. A URL that names one node of a multi-node cluster
@@ -906,6 +922,11 @@ must say in its release notes to stop every owner of a stream before upgrading.
   commit is acknowledged, unless a layer refused a commit at that sequence before. A vouched 413
   leaves a layer's earlier refusal as it was too, and a due snapshot waits only while a layer's
   refusal that refuses other writes is recorded.
+- Units also cover snapshot failures: each doubles the wait before the next attempt, from 100 ms
+  up to 1 h; only a snapshot at the offset ends the run; a database below three quarters of its
+  size at the last failure is not held back, while one that grew, shrank less or was empty is;
+  and against a stand-in server a snapshot body whose outcome stays unknown is sent twice, a
+  retention move until it is accepted.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -975,6 +996,11 @@ must say in its release notes to stop every owner of a stream before upgrading.
   panic while attaching is a failed attach (the file, which has a sidecar, is refused until an
   attach succeeds, and the next attach runs), and a panic in `xClose` leaves the file attachable
   again in the same process.
+- Snapshot bodies over a request size limit (`test/snapshot-backoff.e2e.ts`, through `test/gate.mjs`
+  refusing bodies over 512 KiB, with the first wait after a failure set to a minute). A snapshot
+  refused with 413 is reported with its size, commits during the wait do not send it again, and
+  after a `VACUUM` the next commit has it published. A publish answered 503 is sent twice and then
+  waits.
 - Same-minor compatibility (`test/compat.e2e.ts`, §7): the previous published patch of the minor
   and the build take over each other's streams on a new host and on the same one, both ways.
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + S3 (AWS S3 in CI,

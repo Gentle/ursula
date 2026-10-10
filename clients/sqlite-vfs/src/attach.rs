@@ -679,8 +679,8 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         attach_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         append_retries: 0,
         snapshot_published_at: None,
-        snapshot_failures: 0,
-        snapshot_error: None,
+        snapshot_failing: None,
+        snapshot_bytes: None,
         attached_from: from,
         installed,
     }));

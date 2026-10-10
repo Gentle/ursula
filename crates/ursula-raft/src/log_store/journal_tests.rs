@@ -864,11 +864,12 @@ async fn a_limited_read_weighs_cached_entries_too() {
 
 /// OpenRaft reads a caught-up follower's range from entries the writer has
 /// not flushed yet, so the limit weighs those pending entries too. A read
-/// stops inside the pending batch, a pending entry over the whole limit
-/// comes alone rather than leaving the read empty, and a durable prefix that
-/// stops early is never followed by pending entries past the gap, which the
-/// replication reader would refuse as a fatal storage error. Here the
-/// durable prefix comes from the cache.
+/// stops inside the pending batch, after what a durable prefix left of the
+/// limit, and takes no pending entry at all when the durable prefix filled
+/// it. A pending entry over the whole limit comes alone rather than leaving
+/// the read empty, and a durable prefix that stops early is never followed by
+/// pending entries past the gap, which the replication reader would refuse as
+/// a fatal storage error. Here the durable prefix comes from the cache.
 #[tokio::test]
 async fn a_limited_read_weighs_pending_entries_after_a_cached_prefix() {
     limited_reads_of_pending_entries(64 * 1024 * 1024, false).await;
@@ -905,11 +906,17 @@ async fn limited_reads_of_pending_entries(group_cache_bytes: u64, durable_from_d
         Some(3)
     );
     let mut only_pending = core.store(&writer, 1);
+    // One durable entry, so the limit it leaves lets exactly two pending
+    // entries through.
     let mut after_durable = core.store(&writer, 2);
-    append(&mut after_durable, entries(1, 2, mib)).await;
+    append(&mut after_durable, entries(1, 1, mib)).await;
     let mut after_a_stop = core.store(&writer, 3);
     append(&mut after_a_stop, entries(1, 6, mib)).await;
     let mut oversized_first = core.store(&writer, 4);
+    // A durable prefix that fills the limit: the first pending entry is
+    // refused too, or the read would carry a whole entry past the limit.
+    let mut filled_by_durable = core.store(&writer, 5);
+    append(&mut filled_by_durable, entries(1, 3, mib)).await;
 
     let (entered, wait_entered) = tokio::sync::oneshot::channel();
     let (release, wait_release) = std::sync::mpsc::channel::<()>();
@@ -929,13 +936,14 @@ async fn limited_reads_of_pending_entries(group_cache_bytes: u64, durable_from_d
     let mut flushes = Vec::new();
     for (store, pending) in [
         (&mut only_pending, entries(1, 10, mib)),
-        (&mut after_durable, entries(3, 12, mib)),
+        (&mut after_durable, entries(2, 12, mib)),
         // Small enough to fit in what the durable prefix leaves of the limit.
         (&mut after_a_stop, entries(7, 12, 1024)),
         (&mut oversized_first, vec![
             payload_entry(1, oversized),
             payload_entry(2, 16),
         ]),
+        (&mut filled_by_durable, entries(4, 12, mib)),
     ] {
         let (flushed, result) = UrsulaRaftTypeConfig::oneshot();
         store
@@ -947,12 +955,8 @@ async fn limited_reads_of_pending_entries(group_cache_bytes: u64, durable_from_d
 
     for (label, store, expected, from_disk) in [
         ("only_pending", &only_pending, &[1, 2, 3][..], false),
-        (
-            "after_durable",
-            &after_durable,
-            &[1, 2, 3][..],
-            durable_from_disk,
-        ),
+        // A single 1 MiB durable entry stays cached even in a 2 MiB cache.
+        ("after_durable", &after_durable, &[1, 2, 3][..], false),
         (
             "after_a_stop",
             &after_a_stop,
@@ -960,6 +964,12 @@ async fn limited_reads_of_pending_entries(group_cache_bytes: u64, durable_from_d
             durable_from_disk,
         ),
         ("oversized_first", &oversized_first, &[1][..], false),
+        (
+            "filled_by_durable",
+            &filled_by_durable,
+            &[1, 2, 3][..],
+            durable_from_disk,
+        ),
     ] {
         let misses = core.metrics.snapshot().wal_cache_misses;
         let mut reader = store.clone();

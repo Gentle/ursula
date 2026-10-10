@@ -104,7 +104,9 @@ enum Taken {
 }
 
 impl ReadBudget {
-    pub(crate) fn new(max: Option<u64>) -> Self {
+    // Private: a read starts its budget in `plan_read`, and `merge_pending`
+    // can only spend what the plan left, never a fresh or unlimited budget.
+    fn new(max: Option<u64>) -> Self {
         Self {
             max,
             taken: Taken::Nothing,

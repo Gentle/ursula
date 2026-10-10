@@ -2374,7 +2374,9 @@ mod reconnect_tests {
     /// as the encoded bytes of its calls before compression. The gauge is process-wide, and no
     /// other test sends a frame anywhere near 1 MiB through a live session, so it reads less than
     /// one such frame before this test sends any. After two of them it reads the size of one,
-    /// where a sum would read two, and a smaller frame after them does not lower it.
+    /// where a sum would read two, and a smaller frame after them does not lower it. That no
+    /// other test sends such a frame is a convention nothing enforces: one that does would break
+    /// this test, and should then read the gauge in a process of its own.
     #[tokio::test]
     async fn append_stream_frame_bytes_max_reports_the_largest_frame_sent() {
         let gauge = || raft_grpc_metrics_snapshot().raft_grpc_append_stream_frame_bytes_max;

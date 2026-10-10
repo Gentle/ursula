@@ -1525,13 +1525,13 @@ async fn the_gateway_vouches_for_every_response() {
             Some("RequestBodyTooLarge"),
         ),
         (
-            "own error before sending",
+            "own error, upstream unreachable",
             gateway_for_url(gone).handle(post_path("/bucket/ok")).await,
             StatusCode::SERVICE_UNAVAILABLE,
             Some("UpstreamUnreachable"),
         ),
         (
-            "own error after building",
+            "own error, request not built",
             gateway_for_url("not a url")
                 .handle(post_path("/bucket/ok"))
                 .await,

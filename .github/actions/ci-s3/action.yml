@@ -3,8 +3,10 @@ description: >-
   Real AWS S3 through GitHub OIDC when this run may assume the CI role, otherwise MinIO on
   127.0.0.1:9000. Exports the URSULA_S3_* contract the tests read.
 inputs:
-  role-arn: { description: "vars.URSULA_CI_AWS_ROLE_ARN (empty selects MinIO)", required: false, default: "" }
-  bucket: { description: "vars.URSULA_CI_S3_BUCKET", required: false, default: "" }
+  # Pass secrets, never variables: GitHub masks secret values wherever a log prints them (step
+  # headers, the env of later steps), and it prints variables as they are.
+  role-arn: { description: "secrets.URSULA_CI_AWS_ROLE_ARN (empty selects MinIO)", required: false, default: "" }
+  bucket: { description: "secrets.URSULA_CI_S3_BUCKET", required: false, default: "" }
   region: { description: "vars.URSULA_CI_S3_REGION", required: false, default: us-east-1 }
   job-key: { description: "Unique per job in the run (github.job plus matrix values)", required: true }
   duration-seconds: { description: "Credential lifetime; must outlive the rest of the job", required: false, default: "3600" }
@@ -30,6 +32,14 @@ runs:
           *) echo "::error title=S3 backend::event '$EVENT' must not run a job that can assume the CI role"; exit 1 ;;
         esac
         case "$JOB_KEY" in '' | *[!A-Za-z0-9._-]*) echo "::error title=S3 backend::bad job-key '$JOB_KEY'"; exit 1 ;; esac
+        # The account id and the role name reach the log in forms the secrets do not cover (an
+        # assumed-role ARN, an error message): mask them too, before anything can print them.
+        if [ -n "$ROLE_ARN" ]; then
+          account="$(printf '%s' "$ROLE_ARN" | cut -d: -f5)"
+          for value in "$ROLE_ARN" "$account" "${ROLE_ARN##*/}" "$BUCKET"; do
+            [ -z "$value" ] || echo "::add-mask::$value"
+          done
+        fi
         prefix="ci/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${JOB_KEY}"
         # The OIDC request URL exists only when GitHub issues this job a token (absent on fork and
         # Dependabot PRs), so the choice does not depend on predicting GitHub's rules.
@@ -38,7 +48,7 @@ runs:
             echo "::error title=S3 backend::URSULA_S3_ENDPOINT / AWS_ENDPOINT_URL must be unset for AWS mode"; exit 1
           fi
           mode=aws
-          echo "S3 backend: aws (s3://$BUCKET/$prefix/)" >> "$GITHUB_STEP_SUMMARY"
+          echo "S3 backend: aws (prefix $prefix/)" >> "$GITHUB_STEP_SUMMARY"
         else
           mode=minio
           if [ "$TRUSTED" = true ]; then

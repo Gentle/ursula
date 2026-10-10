@@ -24,7 +24,7 @@ const storage = await openUrsulaPiStorage("/data/harness-1.db", "https://ursula.
 
 Hand `storage` to the Pi harness, and close it with `storage.close(ctx)` on shutdown. `openUrsulaPiStorage` attaches the file to the stream, which claims the stream for this process, and then opens the file with Pi's node driver.
 
-It supports `@earendil-works/pi-durable` 1.0 and 1.1 (`>=1.0.0 <1.2.0`, the package's dependency range). CI runs Pi's storage conformance suite through the extension on the oldest and the newest version in that range. Keep your application's `@earendil-works/pi-durable` in the same range. With a version outside it, npm installs a second copy for this package, and `openUrsulaPiStorage` returns that copy's `SqliteStorage`.
+This package supports `@earendil-works/pi-durable` 1.0 and 1.1, the range `>=1.0.0 <1.2.0` it declares as its dependency. On 1.0.0 and on 1.1.0, CI runs Pi's storage conformance suite through the extension, and the tests of how `openUrsulaPiStorage` reports fenced and refused commits. Keep your application's `@earendil-works/pi-durable` in the same range, so that npm installs one copy for both. With a version outside it, npm installs a second copy for this package without a warning, and `openUrsulaPiStorage` returns that copy's `SqliteStorage`. That `SqliteStorage` implements the `Storage` contract of its own version, so a harness from another version can get wrong results from it. `npm ls @earendil-works/pi-durable` lists the copies.
 
 With plain `node:sqlite`, attach the file first and then open it as usual:
 

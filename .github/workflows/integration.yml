@@ -307,10 +307,12 @@ jobs:
           URSULA_COLD=none URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/snapshot.e2e.ts
 
       # package.json declares the @earendil-works/pi-durable versions the package supports as
-      # ">=oldest <first-unsupported". The lockfile holds the newest of them, which the steps above
-      # test. This one installs the oldest without saving it, then runs the typecheck and Pi's
-      # storage conformance (three modes) against it.
-      - name: Pi conformance on the oldest supported pi-durable
+      # ">=oldest <first-unsupported", and the steps above test the version in the lockfile. This one
+      # installs the oldest without saving it, then runs the typecheck, Pi's storage conformance
+      # (three modes), and the fencing and 402 suites: their Pi cases reach openUrsulaPiStorage's
+      # mapping of the errors the node driver throws for a failed commit, which conformance never
+      # triggers.
+      - name: Pi conformance, fencing and 402 on the oldest supported pi-durable
         timeout-minutes: 10
         run: |
           cd clients/sqlite-ursula
@@ -322,10 +324,10 @@ jobs:
           ' "$range")
           npm install --no-save "@earendil-works/pi-durable@$oldest"
           installed=$(node -p 'require("@earendil-works/pi-durable/package.json").version')
-          echo "Pi conformance on @earendil-works/pi-durable $installed, the oldest of $range"
+          echo "Pi suites on @earendil-works/pi-durable $installed, the oldest of $range"
           [ "$installed" = "$oldest" ]
           npm run typecheck
-          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts
+          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts test/fencing.e2e.ts test/payment.e2e.ts
 
   sqlite-vfs-e2e-cluster:
     name: sqlite-vfs e2e (3 nodes + gateway + S3)

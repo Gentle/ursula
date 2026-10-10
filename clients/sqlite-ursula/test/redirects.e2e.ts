@@ -1,0 +1,199 @@
+// Leader redirects through a gateway that checks tokens, while every group's leadership moves
+// (3 nodes only). This gateway reaches the nodes as `localhost`, while the peer URLs that leader
+// redirects name say `127.0.0.1`, so it cannot follow a redirect itself: it passes each one on with
+// a path-only Location, as it passes on a second redirect after following the first. The extension
+// never follows a redirect. It sends the request again to the same URL with its token, like a 503
+// (followed, the request would go out without the token, and the gateway would hide the stream
+// behind a 404). Meanwhile a loop hands every group's leadership to the next node, again and again,
+// through the nodes' admin API: during an owner's attach, its commits and snapshot read-backs, a
+// second host's attach from the snapshot, and the owner's attach of its own files again. Nothing
+// is poisoned, every commit goes through, and every host reads the same rows.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, request, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, expect, inject, it } from "vitest";
+import { freshFile } from "./helpers.ts";
+import { AuthGateway, type Child, type ChildLine, runChild, streamPath } from "./kit.ts";
+
+const nodes = inject("ursulaNodes");
+const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-redirects-"));
+let gateway: AuthGateway | undefined;
+let proxy: RedirectCounter | undefined;
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** A node's view of its Raft groups (`/__ursula/metrics` on its admin listener). */
+interface NodeView {
+	process_incarnation: string;
+	raft_groups: { raft_group_id: number; current_leader: number | null; voter_ids: number[] }[];
+}
+
+/**
+ * Hands every group to the next voter after its leader, once (the views are taken before any move),
+ * through the leader's admin API: the moves the leaders accepted.
+ */
+async function moveLeaderships(): Promise<number> {
+	const views = await Promise.all(
+		nodes.map(async (node) => {
+			const metrics = await fetch(`${node.admin}/__ursula/metrics`, { signal: AbortSignal.timeout(5000) });
+			return { node, view: (await metrics.json()) as NodeView };
+		}),
+	);
+	let moved = 0;
+	for (const { node, view } of views) {
+		for (const group of view.raft_groups) {
+			if (group.current_leader !== node.id) continue;
+			const voters = [...group.voter_ids].sort((a, b) => a - b);
+			const next = voters[(voters.indexOf(node.id) + 1) % voters.length];
+			const r = await fetch(`${node.admin}/__ursula/raft/${group.raft_group_id}/leader/transfer/${next}`, {
+				method: "POST",
+				headers: { "x-ursula-process-incarnation": view.process_incarnation },
+				signal: AbortSignal.timeout(5000),
+			});
+			const answer = (await r.json().catch(() => ({}))) as { transferred?: boolean };
+			if (r.ok && answer.transferred === true) moved++;
+		}
+	}
+	return moved;
+}
+
+/** Moves every group's leadership, then waits `pauseMs`, until `stop`, which returns the moves made. */
+function moveLeadershipsUntilStopped(pauseMs: number): { stop(): Promise<number> } {
+	let running = true;
+	let moved = 0;
+	const loop = (async () => {
+		while (running) {
+			moved += await moveLeaderships().catch(() => 0);
+			await sleep(pauseMs);
+		}
+	})();
+	return {
+		stop: async () => {
+			running = false;
+			await loop;
+			return moved;
+		},
+	};
+}
+
+/** An HTTP proxy in front of the gateway that counts the redirects it passes on, by method. */
+class RedirectCounter {
+	private readonly server: Server;
+	private readonly seen = new Map<string, number>();
+	readonly url: string;
+
+	private constructor(server: Server, url: string) {
+		this.server = server;
+		this.url = url;
+	}
+
+	static async start(target: string): Promise<RedirectCounter> {
+		const t = new URL(target);
+		let counter: RedirectCounter | undefined;
+		const server = createServer((req, res) => {
+			const up = request({ host: t.hostname, port: t.port, method: req.method, path: req.url, headers: req.headers }, (answer) => {
+				const status = answer.statusCode ?? 502;
+				if (status === 307 || status === 308) {
+					const kind = `${req.method}${req.url?.includes("/snapshot/") === true ? " snapshot" : ""}`;
+					counter?.seen.set(kind, (counter.seen.get(kind) ?? 0) + 1);
+				}
+				res.writeHead(status, answer.headers);
+				answer.pipe(res);
+			});
+			up.on("error", () => res.destroy());
+			req.pipe(up);
+		});
+		const port = await new Promise<number>((res) => server.listen(0, "127.0.0.1", () => res((server.address() as AddressInfo).port)));
+		counter = new RedirectCounter(server, `http://127.0.0.1:${port}`);
+		return counter;
+	}
+
+	/** Redirects passed on to requests of `method` (to a snapshot, with `snapshot`). */
+	count(method: string, snapshot = false): number {
+		return this.seen.get(snapshot ? `${method} snapshot` : method) ?? 0;
+	}
+
+	summary(): string {
+		return JSON.stringify(Object.fromEntries(this.seen));
+	}
+
+	async close(): Promise<void> {
+		this.server.closeAllConnections();
+		await new Promise<void>((r) => this.server.close(() => r()));
+	}
+}
+
+beforeAll(async () => {
+	if (nodes.length !== 3) return;
+	const unresolvable = nodes.map((node) => {
+		const url = new URL(node.url);
+		url.hostname = "localhost";
+		return url.origin;
+	});
+	gateway = await AuthGateway.start(unresolvable, dir);
+	proxy = await RedirectCounter.start(gateway.url);
+});
+
+afterAll(async () => {
+	gateway?.close();
+	await proxy?.close();
+	rmSync(dir, { recursive: true, force: true });
+});
+
+const ROWS = "@query:SELECT k, hex(substr(v, 1, 16)) AS head FROM t ORDER BY k";
+
+/** The child's last `done` line, once every step went through and it exited cleanly. */
+async function finished(child: Child, ms: number): Promise<{ done: ChildLine; rows: unknown }> {
+	const done = await child.waitFor((l) => l.done === true, ms);
+	expect(child.lines.filter((l) => l.ok === false), child.stderr()).toEqual([]);
+	expect(done, child.stderr()).toMatchObject({ poisoned: false, fenced: false });
+	expect((await child.exited).code, child.stderr()).toBe(0);
+	return { done, rows: child.lines.find((l) => l.rows !== undefined)?.rows };
+}
+
+it.runIf(nodes.length === 3)(
+	"attach, commits and snapshot read-backs retry the redirects a gateway that checks tokens passes on while leaderships move",
+	async () => {
+		const url = (proxy as RedirectCounter).url + streamPath();
+		const token = join(dir, "token");
+		writeFileSync(token, `${(gateway as AuthGateway).mint()}\n`);
+		// A snapshot whenever the log outgrows the database (about 80 KiB): every few commits, which
+		// are paced so that the snapshot thread keeps up.
+		const env = { URSULA_VFS_TOKEN_FILE: token, URSULA_VFS_SNAPSHOT_MIN_BYTES: "65536", CHILD_EXIT: "1" };
+		const moving = moveLeadershipsUntilStopped(2000);
+		let moved = 0;
+		let snapshots = 0;
+		try {
+			const steps = ["CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB)"];
+			for (let i = 0; i < 40; i++) steps.push(`INSERT OR REPLACE INTO t VALUES (${i % 4}, randomblob(16384))`, "@sleep:100");
+			steps.push("@sleep:2000", ROWS);
+			const file = freshFile();
+			const owner = await finished(runChild(file, url, steps, env), 180_000);
+			snapshots = owner.done.snapshots ?? 0;
+			expect(snapshots).toBeGreaterThanOrEqual(2);
+			expect(owner.rows).toHaveLength(4);
+
+			// A second host installs the latest snapshot and replays the tail, then claims the stream.
+			const host = await finished(runChild(freshFile(), url, [ROWS], env), 90_000);
+			expect(host.done.installed).not.toBe("-1");
+			expect(host.rows).toEqual(owner.rows);
+
+			// The owner attaches its own files again (they hold data: a stream hidden behind a 404
+			// would be refused as missing), takes the stream back and commits.
+			const again = await finished(runChild(file, url, ["INSERT INTO t VALUES (4, x'00')", ROWS], env), 90_000);
+			expect(again.done.local).not.toBe("-1");
+			expect(again.rows).toEqual([...(owner.rows as object[]), { k: 4, head: "00" }]);
+		} finally {
+			moved = await moving.stop();
+		}
+		const counter = proxy as RedirectCounter;
+		console.log(`leadership moves: ${moved}; redirects passed on: ${counter.summary()}; snapshots: ${snapshots}`);
+		expect(moved).toBeGreaterThanOrEqual(4);
+		// The gateway passed redirects on to appends, and to snapshot read-backs or installs.
+		expect(counter.count("POST")).toBeGreaterThan(0);
+		expect(counter.count("GET", true)).toBeGreaterThan(0);
+	},
+	600_000,
+);

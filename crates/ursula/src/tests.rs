@@ -17,6 +17,7 @@ use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use serde_json::json;
 use tower::ServiceExt;
+use ursula_proto::http::NOT_APPLIED_HEADER;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftLogProgressSnapshot;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
@@ -5244,6 +5245,15 @@ async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
     assert_eq!(header_str(&response, HEADER_STREAM_INCARNATION), current);
 }
 
+/// Ingress admission as the server builds it, with an in-flight body budget
+/// of `bytes`.
+fn admission_with_body_budget(bytes: u64) -> IngressAdmission {
+    IngressAdmission::new(&ursula_config::ServerConfig {
+        http_inflight_body_size: ursula_config::HumanSize::bytes(bytes),
+        ..ursula_config::ServerConfig::default()
+    })
+}
+
 // Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
@@ -5253,11 +5263,7 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
             post(|_body: Bytes| async { StatusCode::NO_CONTENT }),
         )
         .layer(middleware::from_fn_with_state(
-            IngressAdmission {
-                body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
-                wal_disk: WalDiskMonitor::default(),
-                raft_log: None,
-            },
+            admission_with_body_budget(4),
             ingress_admission_middleware,
         ));
 
@@ -5308,11 +5314,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
             }),
         )
         .layer(middleware::from_fn_with_state(
-            IngressAdmission {
-                body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
-                wal_disk: WalDiskMonitor::default(),
-                raft_log: None,
-            },
+            admission_with_body_budget(4),
             ingress_admission_middleware,
         ));
 

@@ -36,16 +36,34 @@ pub(crate) const START: &str = "-1";
 
 fn agent() -> &'static ureq::Agent {
     static A: OnceLock<ureq::Agent> = OnceLock::new();
-    A.get_or_init(|| new_agent(Duration::from_secs(10)))
+    A.get_or_init(|| new_agent(Duration::from_secs(10), MAX_IDLE_AGE))
 }
 
 /// Snapshot transfers move whole databases: a longer timeout than appends.
 fn bulk_agent() -> &'static ureq::Agent {
     static A: OnceLock<ureq::Agent> = OnceLock::new();
-    A.get_or_init(|| new_agent(Duration::from_secs(120)))
+    A.get_or_init(|| new_agent(Duration::from_secs(120), MAX_IDLE_AGE))
 }
 
-fn new_agent(timeout: Duration) -> ureq::Agent {
+/// How long an agent keeps a connection after its last request, for the next request to reuse.
+/// ureq's default is 15 s, so a writer that commits less often opened a new TCP and TLS connection
+/// for almost every commit, which behind a reverse proxy or a CDN sometimes costs about a second
+/// more.
+///
+/// Before it reuses a pooled connection, ureq reads its socket once without blocking (ureq 3.4.2,
+/// `Pool::get` and `probe_tcp_stream`, under TLS too). A connection the server or a proxy closed
+/// while it sat idle (its FIN or RST arrived meanwhile) is dropped, and the request goes out on
+/// another one or a new one. A connection that a NAT, a load balancer or a firewall dropped without
+/// telling either end still looks open. A request sent on it fails, after its whole timeout when
+/// nothing answers (10 s for an append, which `append` then sends again), and ureq never sends it
+/// again on a new connection. Many of these drop a connection idle for about 4 minutes, so the age
+/// stays well below that.
+const MAX_IDLE_AGE: Duration = Duration::from_secs(90);
+
+/// An agent whose requests time out after `timeout` and that keeps a connection for
+/// `max_idle_age` after its last request (`MAX_IDLE_AGE`). The pool keeps ureq's bounds: at most 3
+/// idle connections per host and 10 in all.
+fn new_agent(timeout: Duration, max_idle_age: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
@@ -54,6 +72,7 @@ fn new_agent(timeout: Duration) -> ureq::Agent {
         // the token (ureq drops it on every redirect, to the same host too), and a 301, 302 or 303
         // would turn an append into a GET.
         .max_redirects(0)
+        .max_idle_age(max_idle_age)
         .tls_config(tls())
         .build()
         .into()
@@ -809,15 +828,20 @@ mod tests {
     use std::io::Read as _;
     use std::io::Write as _;
     use std::net::TcpListener;
+    use std::net::TcpStream;
     use std::sync::Mutex;
     use std::sync::PoisonError;
+    use std::time::Duration;
 
     use super::Append;
+    use super::agent;
     use super::append;
+    use super::bulk_agent;
     use super::create_stream;
     use super::get_snapshot;
     use super::head;
     use super::in_clear;
+    use super::new_agent;
     use super::put_idempotent;
     use super::read_from;
     use crate::auth::set_token;
@@ -1342,5 +1366,106 @@ mod tests {
             matches!(last, Attempt::Status { status: 402, ref body } if body == "quota exhausted")
         );
         assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    /// Answers `answers` in order, each on the connection its request came on, and returns the
+    /// number (from 1) of that connection for each request. A connection stays open for the next
+    /// request until the client closes it, or until the server closes it the given time after the
+    /// answer (as a server or a proxy that drops idle connections does).
+    fn serve_pooled(
+        answers: Vec<(&'static str, Option<Duration>)>,
+    ) -> (String, std::thread::JoinHandle<Vec<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut accepted: usize = 0;
+            let mut open: Option<TcpStream> = None;
+            let mut on = Vec::new();
+            for (answer, close) in answers {
+                let mut conn = loop {
+                    let mut conn = match open.take() {
+                        Some(conn) => conn,
+                        None => {
+                            accepted = accepted.saturating_add(1);
+                            listener.accept().unwrap().0
+                        }
+                    };
+                    // Unless the client closed it: then the request comes on a new one.
+                    if read_head(&mut conn) {
+                        break conn;
+                    }
+                };
+                conn.write_all(answer.as_bytes()).unwrap();
+                on.push(accepted);
+                match close {
+                    Some(after) => {
+                        std::thread::sleep(after);
+                        drop(conn);
+                    }
+                    None => open = Some(conn),
+                }
+            }
+            on
+        });
+        (url, server)
+    }
+
+    /// Reads a request head from `conn`: false when the client closed the connection instead.
+    fn read_head(conn: &mut TcpStream) -> bool {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match conn.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// An answer that leaves the connection open for the next request.
+    const KEPT: &str = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+
+    // Both agents keep a connection for 90 s after its last request, not ureq's 15 s: a writer that
+    // commits every 15 to 90 s reuses its connection instead of opening a new TCP and TLS
+    // connection for almost every commit. Longer, a NAT or a load balancer may have dropped it
+    // without telling either end. The pool keeps ureq's bounds.
+    #[test]
+    fn agents_keep_idle_connections_for_90_s() {
+        for agent in [agent(), bulk_agent()] {
+            let config = agent.config();
+            assert_eq!(config.max_idle_age(), Duration::from_secs(90));
+            assert_eq!(config.max_idle_connections_per_host(), 3);
+            assert_eq!(config.max_idle_connections(), 10);
+        }
+    }
+
+    // A connection idle for less than the agent's idle age carries the next request, and one idle
+    // for longer is closed and replaced. 2 s here, well below ureq's 15 s, to keep the test short
+    // (`agents_keep_idle_connections_for_90_s` pins the agents' age).
+    #[test]
+    fn connections_are_reused_until_their_idle_age() {
+        let (url, server) = serve_pooled(vec![(KEPT, None), (KEPT, None), (KEPT, None)]);
+        let agent = new_agent(Duration::from_secs(10), Duration::from_secs(2));
+        let get = || agent.get(url.as_str()).call().unwrap().status().as_u16();
+        assert_eq!(get(), 200);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(get(), 200);
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert_eq!(get(), 200);
+        assert_eq!(server.join().unwrap(), [1, 1, 2]);
+    }
+
+    // ureq reads a pooled connection's socket before it reuses it: one the server closed while it
+    // sat idle is dropped, and the request goes out on a new connection instead of failing (a
+    // `HEAD` gets no retry after a transport error).
+    #[test]
+    fn a_connection_closed_while_idle_is_not_reused() {
+        let (url, server) =
+            serve_pooled(vec![(KEPT, Some(Duration::from_millis(100))), (KEPT, None)]);
+        head(&url, &|| false).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        head(&url, &|| false).unwrap();
+        assert_eq!(server.join().unwrap(), [1, 2]);
     }
 }

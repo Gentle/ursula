@@ -595,6 +595,14 @@ rebuild, delete `<db>`.
   without one, a request is concealed as a missing stream (404), which poisons at once. A token
   sent over `http://` to a host that is not loopback is logged once (`token_in_clear`). The SQL
   functions are direct-only: a trigger or view of an untrusted database cannot call them.
+- Connections are kept for 90 s after their last request (ureq's default is 15 s), so a writer
+  that commits every 15 to 90 s reuses its connection instead of opening a new TCP and TLS
+  connection per commit, which behind a reverse proxy or a CDN sometimes costs about a second more.
+  Before reusing a connection, the client reads its socket once without blocking and drops one the
+  server or a proxy closed while it sat idle. A connection that a NAT, a load balancer or a
+  firewall dropped without telling either end still looks open: a request sent on it fails after
+  its timeout (10 s for an append, which is then sent again). Many such devices drop connections
+  idle for about 4 minutes, so the 90 s stays well below that.
 
 ### Versions
 

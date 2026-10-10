@@ -446,8 +446,10 @@ impl RaftGroupFileLogStore {
 }
 
 // A limited read may stop before the pending suffix. Return only the
-// consecutive prefix in that case. Otherwise the pending entries draw on what
-// the durable ones left of the read's budget; the replication reader asks for
+// consecutive prefix in that case. The read's budget refuses the pending
+// entries then too, and this check keeps the entries consecutive whatever
+// stopped the durable ones. Otherwise the pending entries draw on what the
+// durable ones left of the read's budget; the replication reader asks for
 // the rest.
 fn merge_pending(
     mut durable: Vec<Entry>,

@@ -75,7 +75,8 @@ pub(crate) struct ReadPlan {
     pub(crate) disk: Vec<DiskRead>,
     pub(crate) cached: Vec<Entry>,
     /// What the planned entries, cached or not, left of the read's budget,
-    /// for the pending entries the store adds after them.
+    /// for the pending entries the store adds after them. A plan that
+    /// stopped before the end of its range leaves nothing.
     pub(crate) budget: ReadBudget,
 }
 
@@ -84,31 +85,45 @@ pub(crate) struct ReadPlan {
 /// at most the limit, and never less than one entry, as OpenRaft forbids an
 /// empty read. One budget covers the entries [`GroupLog::plan_read`] plans
 /// and the pending ones the store adds after them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct ReadBudget {
     /// The limit, or `None` to read the whole range.
     max: Option<u64>,
-    /// Weight of the entries taken so far, `None` before the first.
-    taken: Option<u64>,
+    taken: Taken,
+}
+
+/// What a [`ReadBudget`] has taken so far.
+#[derive(Debug)]
+enum Taken {
+    /// No entry yet, so the next one is taken whatever it weighs.
+    Nothing,
+    /// Entries of this total weight.
+    Bytes(u64),
+    /// The budget refused an entry, which ends the read.
+    Ended,
 }
 
 impl ReadBudget {
     pub(crate) fn new(max: Option<u64>) -> Self {
-        Self { max, taken: None }
+        Self {
+            max,
+            taken: Taken::Nothing,
+        }
     }
 
-    /// Takes the read's next entry, which weighs `bytes`, unless that would
-    /// carry the read past its limit, and says whether it did. The first
-    /// entry is always taken, whatever it weighs.
+    /// Takes the read's next entry, which weighs `bytes`, and says whether it
+    /// did. The first entry is always taken, whatever it weighs. A later one
+    /// is refused if it would carry the read past its limit, and so is every
+    /// entry after a refusal, so what a read takes is a prefix of its range.
     pub(crate) fn take(&mut self, bytes: u64) -> bool {
-        let total = self
-            .taken
-            .map_or(bytes, |taken| taken.saturating_add(bytes));
-        let fits = self.taken.is_none() || self.max.is_none_or(|max| total <= max);
-        if fits {
-            self.taken = Some(total);
-        }
-        fits
+        let total = match self.taken {
+            Taken::Nothing => Some(bytes),
+            Taken::Bytes(taken) => Some(taken.saturating_add(bytes))
+                .filter(|total| self.max.is_none_or(|max| *total <= max)),
+            Taken::Ended => None,
+        };
+        self.taken = total.map_or(Taken::Ended, Taken::Bytes);
+        total.is_some()
     }
 }
 
@@ -1171,7 +1186,7 @@ mod tests {
             at(1, 32),
             ApplyMode::Live,
         );
-        let plan = log.plan_read(1..=8, Some(3 * weight(100)));
+        let mut plan = log.plan_read(1..=8, Some(3 * weight(100)));
         assert!(plan.disk.is_empty());
         assert_eq!(
             plan.cached
@@ -1180,25 +1195,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        // The pending entries after the plan draw on what it left.
-        let mut left = ReadBudget::new(Some(3 * weight(100)));
-        for _ in 1..=3 {
-            assert!(left.take(weight(100)));
-        }
-        assert_eq!(plan.budget, left);
+        // The plan stopped before entry 4, so no pending entry may follow it.
+        assert!(!plan.budget.take(0));
+        // A plan that covers its range leaves the rest of the limit to the
+        // pending entries after it.
+        let mut covered = log.plan_read(1..=2, Some(3 * weight(100)));
+        assert!(covered.budget.take(weight(100)));
+        assert!(!covered.budget.take(1));
         assert_eq!(log.plan_read(1..=8, None).cached.len(), 8);
     }
 
     /// One rule weighs a read, the entries `plan_read` plans and the pending
     /// ones after them alike: it takes entries while their total stays within
-    /// the limit, and the first one whatever it weighs. Nothing follows a
-    /// first entry over the limit.
+    /// the limit, and the first one whatever it weighs. A refusal ends the
+    /// read, so a lighter entry after it is refused too, and nothing follows
+    /// a first entry over the limit.
     #[test]
     fn a_read_budget_takes_a_prefix_within_its_limit_and_at_least_one_entry() {
         let mut budget = ReadBudget::new(Some(10));
         assert!(budget.take(4));
         assert!(budget.take(6));
         assert!(!budget.take(1));
+        let mut stopped = ReadBudget::new(Some(10));
+        assert!(stopped.take(4));
+        assert!(!stopped.take(7));
+        assert!(!stopped.take(6));
         let mut oversized = ReadBudget::new(Some(10));
         assert!(oversized.take(11));
         assert!(!oversized.take(0));

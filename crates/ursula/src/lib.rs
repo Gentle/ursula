@@ -85,6 +85,7 @@ use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
+use ursula_proto::http::NOT_APPLIED_HEADER;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::OwnerRaftHandle;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
@@ -1215,6 +1216,53 @@ impl IngressAdmission {
     }
 }
 
+/// Why ingress admission refused a write. Admission answers before the request
+/// reaches a handler, so nothing of a refused request was proposed or applied,
+/// and every refusal carries [`NOT_APPLIED_HEADER`] with its [`code`].
+///
+/// [`code`]: AdmissionRefusal::code
+#[derive(Debug, Clone, Copy)]
+enum AdmissionRefusal {
+    /// The body is larger than admission admits on the route (`413`).
+    BodyTooLarge,
+    /// The WAL filesystem is below its free-space floor (`503`).
+    WalDiskPressure,
+    /// The node's unsnapshotted Raft log is over its hard limit (`503`).
+    RaftLogPressure,
+    /// The process-wide in-flight write-body budget is spent (`503`).
+    IngressBodyBytesLimitReached,
+}
+
+impl AdmissionRefusal {
+    /// The refusal's token: the value of [`NOT_APPLIED_HEADER`], and the JSON
+    /// `error` of a `503`.
+    fn code(self) -> &'static str {
+        match self {
+            Self::BodyTooLarge => "RequestBodyTooLarge",
+            Self::WalDiskPressure => "WalDiskPressure",
+            Self::RaftLogPressure => "RaftLogPressure",
+            Self::IngressBodyBytesLimitReached => "IngressBodyBytesLimitReached",
+        }
+    }
+}
+
+impl IntoResponse for AdmissionRefusal {
+    fn into_response(self) -> Response {
+        let mut response = match self {
+            Self::BodyTooLarge => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response()
+            }
+            Self::WalDiskPressure | Self::RaftLogPressure | Self::IngressBodyBytesLimitReached => {
+                retry_after_json(self.code())
+            }
+        };
+        response
+            .headers_mut()
+            .insert(NOT_APPLIED_HEADER, HeaderValue::from_static(self.code()));
+        response
+    }
+}
+
 async fn ingress_admission_middleware(
     State(admission): State<IngressAdmission>,
     request: Request<Body>,
@@ -1227,10 +1275,10 @@ async fn ingress_admission_middleware(
         return next.run(request).await;
     };
     if body_bytes > cold_snapshot::max_admitted_body_bytes(request.method(), request.uri()) {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+        return AdmissionRefusal::BodyTooLarge.into_response();
     }
     if admission.wal_disk.is_pressured() {
-        return retry_after_json("WalDiskPressure");
+        return AdmissionRefusal::WalDiskPressure.into_response();
     }
     // Every write that carries a body grows the Raft log; bodiless ones
     // (retention advances, deletes) only shrink state.
@@ -1240,7 +1288,7 @@ async fn ingress_admission_middleware(
             .as_ref()
             .is_some_and(ursula_raft::SnapshotBuildCoordinator::log_pressured)
     {
-        return retry_after_json("RaftLogPressure");
+        return AdmissionRefusal::RaftLogPressure.into_response();
     }
     // A snapshot body above the inline cap streams to the cold store in
     // bounded parts (F16), so it holds at most the inline cap in memory.
@@ -1249,11 +1297,13 @@ async fn ingress_admission_middleware(
 
     let _body_permits = if body_bytes > 0 {
         let Ok(permits) = u32::try_from(body_bytes) else {
-            return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+            return AdmissionRefusal::BodyTooLarge.into_response();
         };
         match admission.body_bytes.clone().try_acquire_many_owned(permits) {
             Ok(permit) => Some(permit),
-            Err(_) => return retry_after_json("IngressBodyBytesLimitReached"),
+            Err(_no_permits) => {
+                return AdmissionRefusal::IngressBodyBytesLimitReached.into_response();
+            }
         }
     } else {
         None
@@ -4172,5 +4222,7 @@ mod tests;
 mod base_contract_tests;
 #[cfg(test)]
 mod cold_snapshot_tests;
+#[cfg(test)]
+mod not_applied_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;

@@ -5271,6 +5271,11 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(header_str(&response, axum::http::header::RETRY_AFTER), "1");
+    // Refused before the handler ran: nothing was applied.
+    assert_eq!(
+        header_str(&response, NOT_APPLIED_HEADER),
+        "IngressBodyBytesLimitReached"
+    );
     let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
         .await
         .expect("body");
@@ -5717,6 +5722,7 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
     )
     .await;
     assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(header_str(&write, NOT_APPLIED_HEADER), "WalDiskPressure");
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)
@@ -5802,6 +5808,7 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
             .headers()
             .contains_key(axum::http::header::RETRY_AFTER)
     );
+    assert_eq!(header_str(&write, NOT_APPLIED_HEADER), "RaftLogPressure");
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)
@@ -5810,6 +5817,7 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
     );
     let bodiless = http_put(&app, "/benchcmp", &[], Body::empty()).await;
     assert_ne!(bodiless.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!bodiless.headers().contains_key(NOT_APPLIED_HEADER));
 
     assert_eq!(coordinator.observe_log_bytes(50, 200, 100), Some(false));
     let write = http_put(
@@ -5820,6 +5828,7 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
     )
     .await;
     assert_ne!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!write.headers().contains_key(NOT_APPLIED_HEADER));
 }
 
 /// Shared fixture for the governance unit-test modules below: one

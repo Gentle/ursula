@@ -322,10 +322,16 @@ jobs:
             if (bounds === null) throw new Error("pi-durable range is not >=oldest <first-unsupported: " + process.argv[1]);
             console.log(bounds[1]);
           ' "$range")
-          npm install --no-save "@earendil-works/pi-durable@$oldest"
-          installed=$(node -p 'require("@earendil-works/pi-durable/package.json").version')
-          echo "Pi suites on @earendil-works/pi-durable $installed, the oldest of $range"
-          [ "$installed" = "$oldest" ]
+          # pi-durable, pi-ai and chord are released together: test the oldest version of all three,
+          # the set an application on that release has, not the oldest pi-durable with newer siblings.
+          pkgs=(@earendil-works/pi-durable @earendil-works/pi-ai @earendil-works/chord)
+          npm install --no-save "${pkgs[@]/%/@$oldest}"
+          for pkg in "${pkgs[@]}"; do
+            # By path: pi-ai's exports map does not expose its package.json.
+            installed=$(node -p "require(\"./node_modules/$pkg/package.json\").version")
+            echo "Pi suites on $pkg $installed, the oldest of $range"
+            [ "$installed" = "$oldest" ]
+          done
           npm run typecheck
           URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts test/fencing.e2e.ts test/payment.e2e.ts
 

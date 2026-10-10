@@ -736,10 +736,10 @@ must say in its release notes to stop every owner of a stream before upgrading.
 - Pi Durable versions: `package.json` declares the range of `@earendil-works/pi-durable` versions
   the package supports, and the e2e suites above run the version in the lockfile. The single-node
   job then installs the oldest version in the range without saving it, and runs the typecheck, Pi
-  conformance, `test/fencing.e2e.ts` and `test/payment.e2e.ts` again. Their Pi cases reach
-  `openUrsulaPiStorage`'s mapping of the errors the node driver throws for a failed commit, which
-  conformance never triggers. CI runs no other version in the range, such as a patch published after
-  the lockfile was last updated.
+  conformance, `test/fencing.e2e.ts`, `test/payment.e2e.ts` and `test/refused.e2e.ts` again. Their
+  Pi cases reach `openUrsulaPiStorage`'s mapping of the errors the node driver throws for a failed
+  commit, which conformance never triggers. CI runs no other version in the range, such as a patch
+  published after the lockfile was last updated.
 
 ## 9. Performance
 

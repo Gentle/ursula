@@ -70,12 +70,46 @@ pub(crate) enum ApplyMode {
 
 /// What a read of a range needs: entries the cache holds, and the frames of
 /// the ones before them, oldest first.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ReadPlan {
     pub(crate) disk: Vec<DiskRead>,
     pub(crate) cached: Vec<Entry>,
-    /// Read weight of the entries planned, cached or not.
-    pub(crate) bytes: u64,
+    /// What the planned entries, cached or not, left of the read's budget,
+    /// for the pending entries the store adds after them.
+    pub(crate) budget: ReadBudget,
+}
+
+/// The weight limit of one read, with entries weighed by [`entry_log_bytes`].
+/// A limited read takes the longest prefix of its range whose entries weigh
+/// at most the limit, and never less than one entry, as OpenRaft forbids an
+/// empty read. One budget covers the entries [`GroupLog::plan_read`] plans
+/// and the pending ones the store adds after them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadBudget {
+    /// The limit, or `None` to read the whole range.
+    max: Option<u64>,
+    /// Weight of the entries taken so far, `None` before the first.
+    taken: Option<u64>,
+}
+
+impl ReadBudget {
+    pub(crate) fn new(max: Option<u64>) -> Self {
+        Self { max, taken: None }
+    }
+
+    /// Takes the read's next entry, which weighs `bytes`, unless that would
+    /// carry the read past its limit, and says whether it did. The first
+    /// entry is always taken, whatever it weighs.
+    pub(crate) fn take(&mut self, bytes: u64) -> bool {
+        let total = self
+            .taken
+            .map_or(bytes, |taken| taken.saturating_add(bytes));
+        let fits = self.taken.is_none() || self.max.is_none_or(|max| total <= max);
+        if fits {
+            self.taken = Some(total);
+        }
+        fits
+    }
 }
 
 /// Entries to read from one frame.
@@ -485,7 +519,7 @@ impl GroupLog {
     /// What reading `range` needs: the cached entries, and the frames of the
     /// entries before the cache. With `max_bytes`, the read covers the
     /// longest prefix of the range whose entries weigh at most that much,
-    /// cached or not, and never less than one entry.
+    /// cached or not, and never less than one entry ([`ReadBudget`]).
     pub(crate) fn plan_read(
         &self,
         range: impl RangeBounds<u64>,
@@ -501,16 +535,16 @@ impl GroupLog {
             Bound::Excluded(end) => Bound::Excluded(*end),
             Bound::Unbounded => Bound::Unbounded,
         };
-        let mut plan = ReadPlan::default();
+        let mut plan = ReadPlan {
+            disk: Vec::new(),
+            cached: Vec::new(),
+            budget: ReadBudget::new(max_bytes),
+        };
         let cache_first = self.cache.first_index();
-        let mut planned = false;
         for entry in self.index.range((start, end)) {
-            let bytes = plan.bytes.saturating_add(u64::from(entry.bytes));
-            if planned && max_bytes.is_some_and(|max| bytes > max) {
+            if !plan.budget.take(u64::from(entry.bytes)) {
                 break;
             }
-            planned = true;
-            plan.bytes = bytes;
             let index = entry.log_id.index;
             if cache_first.is_some_and(|first| index >= first)
                 && let Some(cached) = self.cache.get(index)
@@ -867,6 +901,7 @@ mod tests {
     use super::LogId as GroupLogId;
     use super::MARKER_BYTES;
     use super::RaftGroupLogRecord;
+    use super::ReadBudget;
     use super::SegmentId;
     use super::entry_log_bytes;
 
@@ -1145,8 +1180,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        assert_eq!(plan.bytes, 3 * weight(100));
+        // The pending entries after the plan draw on what it left.
+        let mut left = ReadBudget::new(Some(3 * weight(100)));
+        for _ in 1..=3 {
+            assert!(left.take(weight(100)));
+        }
+        assert_eq!(plan.budget, left);
         assert_eq!(log.plan_read(1..=8, None).cached.len(), 8);
+    }
+
+    /// One rule weighs a read, the entries `plan_read` plans and the pending
+    /// ones after them alike: it takes entries while their total stays within
+    /// the limit, and the first one whatever it weighs. Nothing follows a
+    /// first entry over the limit.
+    #[test]
+    fn a_read_budget_takes_a_prefix_within_its_limit_and_at_least_one_entry() {
+        let mut budget = ReadBudget::new(Some(10));
+        assert!(budget.take(4));
+        assert!(budget.take(6));
+        assert!(!budget.take(1));
+        let mut oversized = ReadBudget::new(Some(10));
+        assert!(oversized.take(11));
+        assert!(!oversized.take(0));
+        let mut whole = ReadBudget::new(None);
+        assert!(whole.take(u64::MAX));
+        assert!(whole.take(u64::MAX));
     }
 
     #[test]

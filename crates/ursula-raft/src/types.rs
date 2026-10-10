@@ -40,8 +40,9 @@ openraft::declare_raft_types!(
 );
 
 /// The Raft log bytes an entry is counted as: what the snapshot cadence
-/// adds when the entry is applied, and what it weighs in the WAL's entry
-/// cache.
+/// adds when the entry is applied, what it weighs in the WAL's entry cache,
+/// and what it counts toward the limit of a log read, which bounds each
+/// Append call to a follower (#507).
 pub(crate) fn entry_log_bytes(entry: &openraft::alias::EntryOf<UrsulaRaftTypeConfig>) -> u64 {
     match &entry.payload {
         openraft::EntryPayload::Normal(command) => command.log_bytes_estimate(),

@@ -97,15 +97,17 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   epoch, producer sequence and offset, so the next commit is sent as usual, with the sequence the
   refused append never used, and is acknowledged once the refusals stop, without a new attach.
   `ursula_status` reports `writes_refused`, with `refused_kind` (`payment_required`,
-  `unauthorized`, `forbidden`, `rate_limited` or `not_applied`) and `refused_reason` (the marker's
-  value, or the refusing layer's response body cut to 256 bytes), until a commit is acknowledged
-  or the database is poisoned (it then needs an attach whatever the layer does). A 402 also shows
-  in `payment_required` and `payment_reason`, its fields since 0.7.1. The extension logs
-  `writes_refused` (`payment_required` for a 402) when refusals of a kind start, and
-  `writes_resumed` at the first acknowledged commit after them.
+  `unauthorized`, `forbidden`, `rate_limited` or `not_applied`, the last for any status but 401,
+  402, 403 and 429) and `refused_reason` (the refusing layer's response body, its first 256 bytes
+  followed by `...` when it is longer, or the marker's value when the body is empty, and always the
+  marker's value for `not_applied`), until a commit is acknowledged or the database is poisoned
+  (it then needs an attach whatever the layer does). A 402 also shows in `payment_required` and
+  `payment_reason`, its fields since 0.7.1. The extension logs `writes_refused`
+  (`payment_required` for a 402) when refusals of a kind start, and `writes_resumed` at the first
+  acknowledged commit after them.
 - This holds only while no attempt of the append can have reached the stream. After an attempt
   whose outcome is unknown (no answer, or a 5xx without a vouched marker) the append may be in the
-  stream, and the next commit, sent with the same sequence, would be acknowledged as its duplicate,
+  stream, and the next commit, sent with the same sequence, would be answered as its duplicate,
   its pages never sent. Refusals after that attempt say nothing about it. So a 402 there is retried
   like an unknown outcome, until an answer settles it (the duplicate's receipt, once the layer
   forwards the append again) or the budget runs out, a 403 there fails the write, and a budget that
@@ -119,8 +121,15 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   redirect, and relays such an answer to a later exchange, since an earlier exchange may have
   applied the request. Such a layer may relay it only if every exchange was refused that way, so
   turn off retries and redirect following for writes in any proxy or service mesh in front of
-  Ursula. When the rule breaks, the stream holds the refused transaction, which the local file
-  lacks, and the next commit goes out with the producer sequence the refused one used.
+  Ursula. A service mesh retries unless told not to: Istio's default retry policy for a
+  VirtualService route retries a 503 twice, POSTs included, and Envoy does the same when a retry
+  policy is configured. A retry in front of the gateway can hide an applied first exchange behind
+  the refusal of the retry, such as the gateway's vouched 503 while the servers are under
+  pressure, and a retry between the gateway and the servers hides it from the gateway too. Set
+  `retries: attempts: 0` on the Istio routes that carry stream writes (or leave Envoy's retry
+  policy off for them). When the rule breaks, the stream holds the refused transaction, which the
+  local file lacks, and the next commit goes out with the producer sequence the refused one used.
+  The check in the next item catches most of what slips through.
 - **A false refusal is caught at the next commit.** The server answers a fresh producer append 200
   and a duplicate 204 with the receipt of the append it duplicates. The next commit after a
   refused one goes out with the same epoch and sequence, so when the refused commit was applied
@@ -154,11 +163,25 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   applies nothing and carries `Producer-Epoch`, and 429 only to a new producer over the stream's
   producer limit, which applies nothing. It sets the marker on writes its ingress admission
   refuses, before it proposes them.
-- The upgrade order is a recommendation, not a requirement. Upgrade gateways before servers, and
-  roll back servers before gateways, where the deployment allows it: the gateway's own refusals
-  then keep failing alone while the versions are mixed. A Helm upgrade or rollback changes both at
-  once and can leave servers of 0.7.3 behind older gateways for a while. That is safe: their
-  markers count for nothing there, and their refusals poison, as before 0.7.3.
+- A 401, 402 or 429 counts by its status alone, so the redirect rule does not guard it: a gateway
+  that follows a leader redirect relays the leader's answer as it is, and the node that redirected
+  may have proposed the write before it did. Such an answer is still safe to trust, because of
+  what the servers send. A server never answers 401 or 402. Its only 429 is the producer limit,
+  which refuses the first append (sequence 0) of a producer the stream does not hold, and a replay
+  of an append whose first exchange was committed finds the producer held, so it is answered as
+  that exchange's duplicate (204), never 429. So no layer between `ursula gateway` and the servers
+  may answer 401, 402 or 429. Ursula's own components never do. A third-party layer there that did
+  (a rate limiter or an authorizer behind the gateway) would have such an answer trusted after the
+  gateway followed a redirect that carried no marker, and only the check of the next commit (above)
+  would catch it.
+- The upgrade order is a recommendation, not a requirement. Proofs by marker count from the moment
+  the gateways run 0.7.3, whatever the servers run, since the vouch comes from the gateway and so
+  do the markers of its own refusals. Upgrade gateways before servers, and roll back servers before
+  gateways, where the deployment allows it: the gateway's own refusals then keep failing alone
+  while the versions are mixed. A Helm upgrade or rollback changes both at once, and the mix can
+  last until the voters are rolled, which can leave servers of 0.7.3 behind older gateways for a
+  while. That is safe: their markers count for nothing there, and their refusals poison, as before
+  0.7.3.
 - **A 2xx is accepted only with a `Stream-Next-Offset` past the owner's offset**, which becomes the
   owner's offset; another poisons. The VFS does not check where its frame landed (that would need
   offset arithmetic). A duplicate answered without one (its receipt is beyond the server's
@@ -593,9 +616,18 @@ What attach does in each case:
   meanwhile cannot attach as the owner, because its claim is refused. It attaches read-only to read
   (§3).
 - A proxy or service mesh in front of Ursula that retries writes, or follows redirects for them,
-  can relay a refusal to a retry after an earlier exchange applied the write (§2). The next commit
-  is then acknowledged as a duplicate and its pages never reach the stream. Turn such retries off
-  for writes.
+  can relay a refusal to a retry after an earlier exchange applied the write (§2). A mesh retries
+  by default: Istio retries a 503 twice, POSTs included, unless a route sets `retries: attempts:
+  0`. The next commit is then answered as the refused commit's duplicate, and it poisons with a
+  reason that says so (§2): attach again, and the database holds the refused transaction. If an
+  attempt of that next commit got no answer, or an answer that proves nothing, before the
+  duplicate's answer, the next commit is acknowledged instead and its pages never reach the stream.
+  Turn such retries off for writes, on the routes to the gateway and on those from the gateway to
+  the servers.
+- A layer between the gateway and the servers that answers 401, 402 or 429 is trusted by status
+  even after the gateway followed a redirect that carried no marker, since only the marker passes
+  the gateway's redirect rule. Ursula's components never answer so there, and such a third-party
+  layer is unsupported (§2). The check of the next commit is the safety net.
 - A gateway older than 0.7.3 in front of a server of 0.7.3 or later passes on the marker of an
   answer it got by following a leader redirect, which can follow a proposal. It never vouches for
   it, so the VFS ignores that marker and the commit poisons, as before 0.7.3. No upgrade or

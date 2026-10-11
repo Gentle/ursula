@@ -1166,7 +1166,7 @@ mod tests {
     // offset, so the next commit goes out with the same producer sequence and is acknowledged once
     // the refusals stop. A 401, 402 or 429 proves it by its status, any other answer by a marker
     // with a gateway's vouch. One attempt whose outcome is unknown among the refusals poisons
-    // instead: the append may be in the stream, and the next commit would be acknowledged as its
+    // instead: the append may be in the stream, and the next commit would be answered as its
     // duplicate. So does a 403 that does not say it applied nothing (a filtering proxy may have
     // sent it after the stream applied the append).
     #[test]

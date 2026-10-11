@@ -425,7 +425,7 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// final answer (any other 4xx, an authorizer's 403 among them) ends it as [`Append::Refused`] at
 /// once, and the retried ones (401, 429, a proven 5xx) end it so once the budget runs out. After
 /// an attempt whose outcome is unknown (no answer, or a 5xx that proves nothing), the append may be
-/// in the stream, and the next commit, sent with the same sequence, would be acknowledged as its
+/// in the stream, and the next commit, sent with the same sequence, would be answered as its
 /// duplicate. Its refusals then prove nothing: a 402 is retried like an unknown outcome, until an
 /// answer settles it or the budget runs out ([`Error::AppendUnknown`]), and a 403 fails it.
 pub(crate) fn append(

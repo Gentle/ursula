@@ -1213,7 +1213,7 @@ pub(crate) unsafe extern "C" fn c_open(
     contain(
         "x_open",
         || {
-            // SAFETY: `not_open` set `file` up above, and `x_open` ran on it.
+            // SAFETY: `not_open` set `file` up above, and `x_open`, if it started, stopped midway.
             unsafe { failed_open(file) }
         },
         || {
@@ -1902,7 +1902,19 @@ mod tests {
         assert!(file.ext.is_null());
         assert_eq!(Arc::strong_count(&db), 1, "the file's state is freed");
 
-        let mut fresh = unopened();
+        // SQLite's allocation for a new file holds whatever was there before: stale methods here,
+        // which `c_open` clears (`not_open`) before anything can panic. So the fallback leaves the
+        // file without methods and closes no "unix" file, which never opened.
+        let mut fresh = File {
+            base: ffi::sqlite3_file {
+                pMethods: &raw const METHODS,
+            },
+            ext: null_mut(),
+            inner: ffi::sqlite3_file {
+                pMethods: &raw const COUNTING,
+            },
+        };
+        UNIX_CLOSES.set(0);
         set_panic_in_for_tests(Some("x_open"));
         let mut out: c_int = 0;
         // SAFETY: a `File` as SQLite allocates one; `c_open` sets it up as not open, then panics
@@ -1914,6 +1926,11 @@ mod tests {
         assert!(
             fresh.base.pMethods.is_null(),
             "a failed xOpen leaves no methods"
+        );
+        assert_eq!(
+            UNIX_CLOSES.get(),
+            0,
+            "no \"unix\" file opened, so none is closed"
         );
     }
 
@@ -1990,7 +2007,8 @@ mod tests {
     #[test]
     fn a_close_closes_the_unix_file_even_after_a_panic() {
         UNIX_CLOSES.set(0);
-        let mut file = File {
+        // An open file of this VFS without state, over a stand-in "unix" file. Each is closed once.
+        let over_counting = || File {
             base: ffi::sqlite3_file {
                 pMethods: &raw const METHODS,
             },
@@ -1999,15 +2017,20 @@ mod tests {
                 pMethods: &raw const COUNTING,
             },
         };
-        let f = (&raw mut file).cast::<ffi::sqlite3_file>();
-        // SAFETY: an open file of this VFS without state, over a stand-in "unix" file.
-        let closed = unsafe { METHODS.xClose.unwrap()(f) };
+        let mut closed_normally = over_counting();
+        // SAFETY: an open file of this VFS, closed once.
+        let closed = unsafe { METHODS.xClose.unwrap()((&raw mut closed_normally).cast()) };
         assert_eq!((closed, UNIX_CLOSES.get()), (ffi::SQLITE_OK, 1));
+        let mut panicking = over_counting();
         set_panic_in_for_tests(Some("x_close"));
-        // SAFETY: as above; `c_close` panics before its body.
-        let closed = unsafe { METHODS.xClose.unwrap()(f) };
+        // SAFETY: another open file of this VFS, closed once; `c_close` panics before its body.
+        let closed = unsafe { METHODS.xClose.unwrap()((&raw mut panicking).cast()) };
         set_panic_in_for_tests(None);
-        assert_eq!((closed, UNIX_CLOSES.get()), (ffi::SQLITE_IOERR_CLOSE, 2));
+        assert_eq!(
+            (closed, UNIX_CLOSES.get()),
+            (ffi::SQLITE_IOERR_CLOSE, 2),
+            "each of the two files closed its \"unix\" file"
+        );
     }
 
     // An open that panicked closes the "unix" file whose own open succeeded, frees the state

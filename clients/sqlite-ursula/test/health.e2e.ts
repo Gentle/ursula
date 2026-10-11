@@ -2,7 +2,7 @@
 // latest snapshot against the size a snapshot is taken at, the snapshot's age and failures, and the
 // attach time; `instrument()` turns them into OpenTelemetry-shaped metrics; and the extension logs
 // one logfmt line per event on stderr.
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { attach, instrument, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
 import { openPlain, recordingMeter, runChild, streamPath, ursulaUrl } from "./kit.ts";
@@ -35,21 +35,29 @@ it("status reports an owner's health, and instrument() reports it as metrics", (
 	expect(callbacks.size).toBe(0);
 });
 
-// Without `intervalMs`, instrument() drains every second: a commit reaches the histograms without a
-// stop.
-it("instrument() drains every second by default", async () => {
+// Without `intervalMs`, instrument() drains every second: a commit reaches the histograms at the
+// first tick, a second after the start, without a stop. The interval timer is faked, so the second
+// is exact: a default of 2 s would leave the histograms empty at the first second.
+it("instrument() drains every second by default", () => {
 	const file = freshFile();
 	attach(file, ursulaUrl() + streamPath());
 	const { meter, records } = recordingMeter();
-	const stop = instrument(file, meter);
+	vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
 	try {
-		const db = openPlain(file);
-		db.exec("CREATE TABLE t(x INTEGER)");
-		db.close();
-		for (let i = 0; i < 30 && records.get("sqlite_ursula.commit.duration") === undefined; i++) await new Promise((r) => setTimeout(r, 100));
-		expect(records.get("sqlite_ursula.commit.duration")).toHaveLength(1);
+		const stop = instrument(file, meter);
+		try {
+			const db = openPlain(file);
+			db.exec("CREATE TABLE t(x INTEGER)");
+			db.close();
+			vi.advanceTimersByTime(999);
+			expect(records.get("sqlite_ursula.commit.duration")).toBeUndefined();
+			vi.advanceTimersByTime(1);
+			expect(records.get("sqlite_ursula.commit.duration")).toHaveLength(1);
+		} finally {
+			stop();
+		}
 	} finally {
-		stop();
+		vi.useRealTimers();
 	}
 });
 

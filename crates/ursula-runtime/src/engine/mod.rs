@@ -1136,11 +1136,17 @@ impl GroupEngineError {
         self.infra().is_some_and(GroupInfraError::is_backpressure)
     }
 
-    /// The refusal this error reports when the engine raised it before it
-    /// proposed the write's command, so that nothing of the write can apply.
-    /// Every other error, a forward OpenRaft reports after `client_write`
-    /// among them, can follow a proposal or is no refusal to retry. The HTTP
-    /// layer marks exactly these answers as applying nothing.
+    /// The refusal a write's error reports when the runtime raised it before
+    /// the write's command was proposed, so that nothing of the write can
+    /// apply: the engine's own leadership check, the core worker's check of
+    /// the group's unapplied bytes (before any engine sees the command), or
+    /// the engine's cold-tier admission. Every other error, a forward OpenRaft
+    /// reports after `client_write` among them, can follow a proposal or is no
+    /// refusal to retry. It classifies a write's error only: a read's forward
+    /// is raised before any proposal as well (on a follower, or on a leader
+    /// that could not confirm it leads) and is no refusal of a write. The HTTP
+    /// layer marks exactly these answers to single-command writes as applying
+    /// nothing.
     pub fn refused_before_proposal(&self) -> Option<RefusedBeforeProposal> {
         if self.is_forward_before_proposal() {
             return Some(RefusedBeforeProposal::NotLeader);
@@ -1157,15 +1163,18 @@ impl GroupEngineError {
     }
 }
 
-/// What the engine refused a write for before it proposed the write's command
-/// ([`GroupEngineError::refused_before_proposal`]).
+/// What the runtime refused a write for before the write's command was
+/// proposed ([`GroupEngineError::refused_before_proposal`]). It classifies a
+/// write's error only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusedBeforeProposal {
     /// The engine's own leadership check found that the node does not lead
     /// the group (RT1).
     NotLeader,
-    /// The group's proposed but unapplied bytes would exceed their limit.
+    /// The core worker found that the group's proposed but unapplied bytes
+    /// would exceed their limit, before any engine saw the command.
     RaftUncommittedBackpressure,
-    /// The group's hot bytes would exceed the cold-tier limit.
+    /// The engine's cold-tier admission found that the group's hot bytes
+    /// would exceed their limit.
     ColdBackpressure,
 }

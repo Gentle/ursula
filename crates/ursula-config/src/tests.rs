@@ -885,4 +885,40 @@ heal_ticks = 4
         assert_eq!(s3.unhealthy_ticks, 1);
         assert_eq!(s3.heal_ticks, 4);
     }
+
+    #[test]
+    fn a_zero_s3_health_gate_setting_fails_to_load() {
+        use crate::validate::S3HealthSetting;
+        use crate::validate::ValidationError;
+
+        for (key, value, expected) in [
+            ("probe_timeout", r#""0s""#, S3HealthSetting::ProbeTimeout),
+            ("unhealthy_ticks", "0", S3HealthSetting::UnhealthyTicks),
+            ("heal_ticks", "0", S3HealthSetting::HealTicks),
+        ] {
+            let tmp = temp_config(
+                ".toml",
+                &format!(
+                    r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+{key} = {value}
+"#
+                ),
+            );
+            let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::ConfigError::Validation(ValidationError::ZeroS3HealthSetting {
+                        setting
+                    }) if setting == expected
+                ),
+                "{key}: {err}"
+            );
+        }
+    }
 }

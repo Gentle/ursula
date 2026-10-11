@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt;
 
 use thiserror::Error;
 
@@ -26,8 +27,31 @@ pub enum ValidationError {
     MissingGroup(u32, usize),
     #[error("raft.wal.segment_size ({segment_size} bytes) must be at least {minimum} bytes")]
     WalSegmentTooSmall { segment_size: u64, minimum: u64 },
+    #[error("storage.cold.s3.{setting} must be non-zero")]
+    ZeroS3HealthSetting { setting: S3HealthSetting },
     #[error("{0}")]
     Other(String),
+}
+
+/// A setting of the snapshot-store health gate in `[storage.cold.s3]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3HealthSetting {
+    /// `probe_timeout`: a zero deadline fails every probe.
+    ProbeTimeout,
+    /// `unhealthy_ticks`.
+    UnhealthyTicks,
+    /// `heal_ticks`.
+    HealTicks,
+}
+
+impl fmt::Display for S3HealthSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ProbeTimeout => "probe_timeout",
+            Self::UnhealthyTicks => "unhealthy_ticks",
+            Self::HealTicks => "heal_ticks",
+        })
+    }
 }
 
 impl UrsulaConfig {
@@ -72,6 +96,7 @@ impl UrsulaConfig {
                 return Err(ValidationError::ColdS3BucketRequired);
             }
         }
+        self.validate_s3_health_gate()?;
         self.validate_peers()?;
         if !self.raft.groups.is_empty() {
             let peer_ids: BTreeSet<u64> = self.raft.peers.iter().map(|p| p.node_id).collect();
@@ -116,6 +141,28 @@ impl UrsulaConfig {
                 "governance.cold_health.hot_size_high ({high} bytes) must be lower than storage.cold.max_hot_size_per_group ({} bytes)",
                 max_hot.as_bytes(),
             )));
+        }
+        Ok(())
+    }
+
+    /// The snapshot-store health gate's settings must be non-zero. A zero
+    /// probe deadline fails every probe, and zero tick counts would read as
+    /// one.
+    fn validate_s3_health_gate(&self) -> Result<(), ValidationError> {
+        let Some(s3) = self.storage.cold.s3.as_ref() else {
+            return Ok(());
+        };
+        for (setting, zero) in [
+            (
+                S3HealthSetting::ProbeTimeout,
+                s3.probe_timeout.as_duration().is_zero(),
+            ),
+            (S3HealthSetting::UnhealthyTicks, s3.unhealthy_ticks == 0),
+            (S3HealthSetting::HealTicks, s3.heal_ticks == 0),
+        ] {
+            if zero {
+                return Err(ValidationError::ZeroS3HealthSetting { setting });
+            }
         }
         Ok(())
     }
@@ -226,8 +273,48 @@ impl UrsulaConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::S3HealthSetting;
+    use super::ValidationError;
+    use crate::HumanDuration;
+    use crate::S3Config;
     use crate::UrsulaConfig;
     use crate::human::HumanSize;
+
+    #[test]
+    fn s3_health_gate_settings_must_be_non_zero() {
+        let validate = |s3: S3Config| {
+            let mut config = UrsulaConfig::default();
+            config.raft.node_id = 1;
+            config.storage.cold.s3 = Some(s3);
+            config.validate()
+        };
+        validate(S3Config::default()).expect("the defaults are valid");
+
+        for (setting, s3) in [
+            (S3HealthSetting::ProbeTimeout, S3Config {
+                probe_timeout: HumanDuration::sec(0),
+                ..S3Config::default()
+            }),
+            (S3HealthSetting::UnhealthyTicks, S3Config {
+                unhealthy_ticks: 0,
+                ..S3Config::default()
+            }),
+            (S3HealthSetting::HealTicks, S3Config {
+                heal_ticks: 0,
+                ..S3Config::default()
+            }),
+        ] {
+            let err = validate(s3).expect_err("a zero setting is rejected");
+            assert!(
+                matches!(err, ValidationError::ZeroS3HealthSetting { setting: found } if found == setting),
+                "{err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("storage.cold.s3.{setting} must be non-zero")
+            );
+        }
+    }
 
     #[test]
     fn cold_health_watermarks_leave_room_between_flush_and_backpressure() {

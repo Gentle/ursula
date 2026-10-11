@@ -234,11 +234,20 @@ the response also carries `x-ursula-not-applied-checked`, which a gateway
 at 0.7.3 or newer adds. See
 [refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing).
 
-Other errors indicate cold-write backpressure for that group. Either the hot
-ring exceeds `storage.cold.max_hot_size_per_group` (cold flush isn't keeping
-up), or the cold backend is slow or erroring out.
+Other `503`s come from the stream's Raft group, and their text names the
+cause. `ColdBackpressure` means that the group's hot ring would exceed
+`storage.cold.max_hot_size_per_group`: cold flush isn't keeping up, or the
+cold backend is slow or erroring out. Raise the per-group ceiling, lower
+`storage.cold.flush_interval`, raise `storage.cold.flush_max_concurrency`, or
+fix the cold backend. `RaftUncommittedBackpressure` means that the group's
+write bytes that are proposed but not yet applied would exceed
+`raft.max_uncommitted_size_per_group`.
 
-Raise the per-group ceiling, lower `storage.cold.flush_interval`, raise `storage.cold.flush_max_concurrency`, or fix the cold backend.
+The node refuses both before it proposes the append, so from 0.7.3 their
+responses also carry the name in `x-ursula-not-applied`, like the admission
+refusals above. A `503` while the group has no known leader, for example
+during an election, carries `NotLeader` when the node found that before it
+proposed the append.
 
 ### `409 Conflict` with `producer-expected-seq` / `producer-received-seq`
 
@@ -346,6 +355,10 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 | `RaftLogPressure` | The server's Raft log is over its hard limit under sustained write load. Writes resume once snapshots catch up |
 | `WalDiskPressure` | The server's WAL filesystem is below `raft.wal.min_available_size`. Free space or expand the volume |
 | `IngressBodyBytesLimitReached` | The server holds as many request bytes in flight as it admits |
+| `RaftUncommittedBackpressure` | The stream's Raft group holds more proposed but unapplied write bytes than `raft.max_uncommitted_size_per_group` allows |
+| `ColdBackpressure` | The stream's Raft group holds more hot bytes than `storage.cold.max_hot_size_per_group` allows, because cold flush is behind or the cold backend is slow |
+| `NotLeader` | The server does not lead the stream's Raft group and knows no leader yet, for example during an election. Writes resume once the group has a leader |
+| `GroupNotHosted` | The server does not host the stream's Raft group and knows no server that does |
 | `RequestBodyTooLarge` | The commit is over the server's or the gateway's request limit. Commit smaller transactions |
 | `RequestBodyUnreadable` | The gateway could not read the request body, so it sent nothing on |
 | `NotFound` | The gateway's access policy does not serve the stream to these credentials: no token, or one the policy does not allow. The cause is the credentials or the policy, not load |

@@ -99,7 +99,11 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   carries. The marker says that the request was refused before it reached the
   stream, and its value names why. The server's ingress admission sets it on the writes it refuses
   (`503` with `RaftLogPressure`, `WalDiskPressure` or `IngressBodyBytesLimitReached`, and
-  `Retry-After`, and `413` with `RequestBodyTooLarge`). A gateway sets it on refusals it makes
+  `Retry-After`, and `413` with `RequestBodyTooLarge`). From 0.7.3 the server also sets it on a
+  create, append, close or delete it refuses before it proposes the write: a `503` with
+  `NotLeader` (no leader known), `GroupNotHosted`, `RaftUncommittedBackpressure` or
+  `ColdBackpressure`, and a redirect with `NotLeader` or `GroupNotHosted`, which proves nothing
+  to the VFS like any redirect. A gateway sets it on refusals it makes
   before it forwards a request, and Ursula's gateway does on all of them, its authorizer's 403
   included. The vouch says that a gateway checked the marker. Ursula's gateway sets it from 0.7.3
   on, on every answer it returns: its own refusals and errors, and the answers it forwards, after
@@ -198,7 +202,8 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   ignores that marker. The server never answers 401 or 402. It answers 403 only as the fence, which
   applies nothing and carries `Producer-Epoch`, and 429 only to a new producer over the stream's
   producer limit, which applies nothing. It sets the marker on writes its ingress admission
-  refuses, before it proposes them.
+  refuses, and from 0.7.3 on creates, appends, closes and deletes it refuses before it proposes
+  them, redirects included.
 - A 401, 402 or 429 counts by its status alone, so the redirect rule does not guard it: a gateway
   that follows a leader redirect relays the leader's answer as it is, and the node that redirected
   may have proposed the write before it did. Such an answer is still safe to trust, because of
@@ -646,7 +651,8 @@ What attach does in each case:
   above. That is every refusal of the server when no gateway runs in front of it, or only one
   before 0.7.3: the server never vouches, and a gateway before 0.7.3 neither marks nor vouches. A
   gateway with several upstreams drops the marker when it reaches the refusing node by following a
-  leader redirect that carries none.
+  leader redirect that carries none. From 0.7.3 a follower marks the redirect it sends before it
+  proposes an append, so in that case the leader's marker stays.
 - A layer in front of the stream that refuses writes with 402 (an exhausted quota, a suspended
   account), or an authorizer that denies them with a 403 marked `x-ursula-not-applied` and vouched
   for (Ursula's gateway from 0.7.3): commits fail alone with `SQLITE_IOERR_AUTH` and nothing of

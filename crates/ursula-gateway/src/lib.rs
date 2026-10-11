@@ -891,8 +891,10 @@ enum Hop {
     /// The upstream picked for the request. No node received the request
     /// before it.
     First,
-    /// The leader that a node's Raft redirect named. The node that redirected
-    /// may have proposed the request before it redirected.
+    /// The leader that a node's Raft redirect named. Every failure of this
+    /// exchange stays unmarked, whether or not the redirect carried the
+    /// marker: the gateway does not combine a redirect's marker with a failed
+    /// second exchange.
     RedirectedLeader,
 }
 
@@ -1317,8 +1319,8 @@ pub enum GatewayError {
         source: reqwest::Error,
     },
     /// No connection to the leader that a node's Raft redirect named. The
-    /// request was never sent there, but the node that redirected may have
-    /// proposed it.
+    /// request was never sent there, but the answer stays unmarked, like
+    /// every failure of the leader hop.
     #[error("redirect leader {upstream} is unreachable")]
     LeaderUnreachable {
         upstream: String,
@@ -1359,9 +1361,10 @@ impl GatewayError {
     /// `Retry-After`, as Ursula answers while a group has no reachable
     /// leader: the request was never sent there. The first upstream's answer
     /// is marked, because no node received the request. An unreachable
-    /// leader's is not, because the node that redirected may have proposed
-    /// it. The other failures may follow a request the upstream received.
-    /// The bodies name no internal address.
+    /// leader's is not: the gateway leaves every failure of the leader hop
+    /// unmarked and does not combine a redirect's marker with a failed second
+    /// exchange. The other failures may follow a request the upstream
+    /// received. The bodies name no internal address.
     fn into_response(self) -> AxumResponse {
         match self {
             Self::UpstreamUnreachable { .. } => {

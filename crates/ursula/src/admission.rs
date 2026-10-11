@@ -2,7 +2,9 @@
 //! handler, so nothing of a refused request is ever proposed.
 //!
 //! Every refusal carries [`NOT_APPLIED_HEADER`], set by [`mark_not_applied`],
-//! the only place the server sets it. The server never sets
+//! the only place the server sets it. The handlers of the writes that propose
+//! one command use it too, for the runtime's refusals raised before that
+//! command was proposed. The server never sets
 //! [`NOT_APPLIED_CHECKED_HEADER`]: only a gateway vouches for the marker,
 //! after it applied its redirect rule.
 //!
@@ -143,8 +145,9 @@ impl IntoResponse for AdmissionRefusal {
 /// Marks `response` as refusing a request of which nothing was proposed, with
 /// `token` naming the refusal. The only place the server sets
 /// [`NOT_APPLIED_HEADER`]. Call it only on a response sent before anything of
-/// the request was proposed.
-fn mark_not_applied(response: &mut Response, token: &'static str) {
+/// the request was proposed: an admission refusal here, or a refusal the
+/// runtime raised before it proposed a write's one command.
+pub(crate) fn mark_not_applied(response: &mut Response, token: &'static str) {
     response
         .headers_mut()
         .insert(NOT_APPLIED_HEADER, HeaderValue::from_static(token));

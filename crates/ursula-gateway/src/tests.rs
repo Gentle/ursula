@@ -1433,8 +1433,8 @@ async fn a_redirect_the_gateway_passes_through_keeps_its_marker() {
 
 /// A connect failure on the first hop means that no node received the
 /// request, so its `503` is marked. On the leader hop of a followed redirect
-/// it is not, whether or not the redirect was marked: the node that
-/// redirected may have proposed the write.
+/// it is not, whether or not the redirect was marked: the gateway does not
+/// combine a redirect's marker with a failed second exchange.
 #[tokio::test]
 async fn a_first_hop_connect_failure_is_marked_and_a_leader_hop_one_is_not() {
     let gone = refusing_upstream().await;

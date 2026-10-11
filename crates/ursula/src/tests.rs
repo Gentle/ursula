@@ -2397,6 +2397,226 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     assert!(location.ends_with(&format!("/{}", stream_id)));
     assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
 
+    // The node hosts no replica of the group, so it refuses every write
+    // before any engine could propose it, a delete included, and marks the
+    // redirect. Only a gateway adds the vouch.
+    let target = format!("{}/{}", peers[0].1, stream_id);
+    let writes = [
+        ("create", response),
+        (
+            "append",
+            no_redirect_client
+                .post(&target)
+                .header(CONTENT_TYPE, "text/plain")
+                .body("abc")
+                .send()
+                .await
+                .expect("append on the non-voter"),
+        ),
+        (
+            "close",
+            no_redirect_client
+                .post(&target)
+                .header(HEADER_STREAM_CLOSED, "true")
+                .send()
+                .await
+                .expect("close on the non-voter"),
+        ),
+        (
+            "delete",
+            no_redirect_client
+                .delete(&target)
+                .send()
+                .await
+                .expect("delete on the non-voter"),
+        ),
+    ];
+    for (write, response) in &writes {
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{write}");
+        assert_eq!(
+            response
+                .headers()
+                .get(NOT_APPLIED_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("GroupNotHosted"),
+            "{write}"
+        );
+        assert!(
+            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+            "{write}"
+        );
+    }
+    assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+/// A follower finds that it does not lead the group before it proposes an
+/// append or a close, so its redirect applied nothing and carries
+/// `x-ursula-not-applied`. A delete goes straight to `client_write`, and so
+/// does a create on these nodes, which run without cold admission. A forward
+/// that OpenRaft reports from there can follow a committed entry, so those
+/// redirects carry no marker, although here too nothing was proposed. No
+/// redirect carries the vouch: only a gateway adds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                node_id == 1,
+                1,
+                StaticGrpcTestNodeStorage::default(),
+            )
+            .await,
+        );
+    }
+    for (index, node) in nodes.iter().enumerate().skip(1) {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .unwrap_or_else(|_| panic!("warm follower node {} groups timed out", index + 1))
+            .expect("warm follower groups");
+    }
+    tokio::time::timeout(Duration::from_secs(10), nodes[0].runtime.warm_all_groups())
+        .await
+        .expect("warm initializing leader groups timed out")
+        .expect("warm initializing leader groups");
+    for node in &nodes {
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "static gRPC Raft cluster should elect node 1")
+            .await
+            .expect("wait for shared leader");
+    }
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build no-redirect reqwest client");
+    let (leader, follower) = (&peers[0].1, &peers[1].1);
+    let not_applied = |response: &reqwest::Response| {
+        response
+            .headers()
+            .get(NOT_APPLIED_HEADER)
+            .map(|value| value.to_str().expect("an ASCII token").to_owned())
+    };
+    let created = client
+        .put(format!("{leader}/benchcmp/marked"))
+        .header(CONTENT_TYPE, "text/plain")
+        .send()
+        .await
+        .expect("create on the leader");
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let appended = client
+        .post(format!("{follower}/benchcmp/marked"))
+        .header(CONTENT_TYPE, "text/plain")
+        .body("abc")
+        .send()
+        .await
+        .expect("append on a follower");
+    let closed = client
+        .post(format!("{follower}/benchcmp/marked"))
+        .header(HEADER_STREAM_CLOSED, "true")
+        .send()
+        .await
+        .expect("close on a follower");
+    let leader_target = format!("{leader}/benchcmp/marked");
+    for (write, response) in [("append", &appended), ("close", &closed)] {
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{write}");
+        assert_eq!(
+            response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(leader_target.as_str()),
+            "{write}"
+        );
+        assert_eq!(
+            not_applied(response).as_deref(),
+            Some("NotLeader"),
+            "{write}"
+        );
+        assert!(
+            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+            "{write}"
+        );
+    }
+
+    let create = client
+        .put(format!("{follower}/benchcmp/unmarked"))
+        .header(CONTENT_TYPE, "text/plain")
+        .body("abc")
+        .send()
+        .await
+        .expect("create on a follower");
+    let delete = client
+        .delete(format!("{follower}/benchcmp/marked"))
+        .send()
+        .await
+        .expect("delete on a follower");
+    for (write, response, target) in [
+        ("create", &create, format!("{leader}/benchcmp/unmarked")),
+        ("delete", &delete, leader_target.clone()),
+    ] {
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{write}");
+        assert_eq!(
+            response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(target.as_str()),
+            "{write}"
+        );
+        assert_eq!(not_applied(response), None, "{write}");
+        assert!(
+            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+            "{write}"
+        );
+    }
+
+    // The follower proposed none of them: the stream is still there, empty
+    // and open, and the create made nothing.
+    let head = client
+        .head(leader_target.as_str())
+        .send()
+        .await
+        .expect("head on the leader");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(HEADER_STREAM_NEXT_OFFSET)
+            .and_then(|value| value.to_str().ok()),
+        Some("00000000000000000000")
+    );
+    assert!(!head.headers().contains_key(HEADER_STREAM_CLOSED));
+    let head = client
+        .head(format!("{leader}/benchcmp/unmarked"))
+        .send()
+        .await
+        .expect("head on the leader");
+    assert_eq!(head.status(), StatusCode::NOT_FOUND);
+
     for node in nodes {
         node.shutdown().await;
     }

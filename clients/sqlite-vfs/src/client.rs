@@ -1477,8 +1477,8 @@ mod tests {
     // Answers that applied nothing (401, 429, or a refusal marked `x-ursula-not-applied` with a
     // gateway's vouch) leave the outcome known: when the budget runs out on them, the append is
     // refused, with the last answer's reason (the marker's token when there is one, cut like a
-    // body; an empty marker still marks), and the producer sequence is free. A marked final answer
-    // refuses it at once.
+    // body, and never the body beside it; an empty marker still marks), and the producer sequence
+    // is free. A marked final answer refuses it at once.
     #[test]
     fn refusals_that_applied_nothing_refuse_the_append_when_the_budget_runs_out() {
         let marked = |status: &str, token: &str, last: &str| {
@@ -1514,6 +1514,14 @@ mod tests {
             // A marker without a token, and one with a token too long to show whole.
             marked("503 Service Unavailable", "", LAST),
             marked("503 Service Unavailable", &"x".repeat(300), LAST),
+            // A body besides the marker: the reason is the marker's token all the same.
+            answer_with_body(
+                &format!(
+                    "503 Service Unavailable\r\n{}\r\n{LAST}",
+                    vouched("RaftLogPressure")
+                ),
+                "{\"error\":\"RaftLogPressure\"}",
+            ),
         ]);
         let unauthorized = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
@@ -1556,7 +1564,12 @@ mod tests {
             &long,
             Append::Refused(WriteRefusal::NotApplied { status: 503, reason }) if *reason == "x".repeat(256)
         ));
-        assert_eq!(server.join().unwrap().len(), 12);
+        let with_body = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            &with_body,
+            Append::Refused(WriteRefusal::NotApplied { status: 503, reason }) if reason == "RaftLogPressure"
+        ));
+        assert_eq!(server.join().unwrap().len(), 13);
     }
 
     // A 401, 402, 403 or 429 keeps its own kind, marked or not, with the layer's explanation, or
@@ -1706,8 +1719,9 @@ mod tests {
     // of it can have reached the stream is a duplicate that no attempt of it explains: a commit
     // refused before it at the same sequence may have been applied after all (`Db::append_commit`
     // decides). A refused attempt of the same append does not explain it either. A 200 is an
-    // acknowledgement, a 204 after an attempt that may have reached the stream is that attempt's
-    // duplicate, and a claim's 204 is verified separately.
+    // acknowledgement, a 204 after an attempt that may have reached the stream (no answer, or a 307,
+    // marked and vouched for or not: a redirect proves nothing) is that attempt's duplicate, and a
+    // claim's 204 is verified separately. A 307 to the end of the budget leaves the outcome unknown.
     #[test]
     fn a_duplicate_that_no_attempt_explains_is_told_apart() {
         let pressure = |last: &str| {
@@ -1717,6 +1731,12 @@ mod tests {
             ))
         };
         let duplicate = || answer("204 No Content\r\nstream-next-offset: 12");
+        let redirect = |last: &str| {
+            answer(&format!(
+                "307 Temporary Redirect\r\nlocation: /b/s\r\n{}\r\n{last}",
+                vouched("RaftLogPressure")
+            ))
+        };
         let (url, server) = serve(vec![
             // Refused to the end, then a duplicate's answer to the next commit at its sequence.
             pressure(LAST),
@@ -1730,6 +1750,12 @@ mod tests {
             // No answer, then a duplicate's answer: the lost attempt's.
             String::new(),
             duplicate(),
+            // A redirect, marked and vouched for, then a duplicate's answer: the redirected
+            // attempt's.
+            redirect("retry-after: 0"),
+            duplicate(),
+            // The same redirect to the end of the budget.
+            redirect(LAST),
             // A claim's duplicate.
             duplicate(),
         ]);
@@ -1760,9 +1786,21 @@ mod tests {
         assert!(
             matches!(retried, Append::Acked { next: Some(ref n), attempts: 2, duplicate: true } if n == "12")
         );
+        let redirected = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(
+            matches!(redirected, Append::Acked { next: Some(ref n), attempts: 2, duplicate: true } if n == "12")
+        );
+        let unknown = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(
+            unknown,
+            Append::Failed(Error::AppendUnknown {
+                attempts: 1,
+                last: Attempt::Status { status: 307, .. }
+            })
+        ));
         let claim = append(&url, "i1", "p", b"x", 1, 0);
         assert!(matches!(claim, Append::Acked { attempts: 1, .. }));
-        assert_eq!(server.join().unwrap().len(), 9);
+        assert_eq!(server.join().unwrap().len(), 12);
     }
 
     // A marker counts only with a gateway's vouch (`applied_nothing`), and the vouch alone proves

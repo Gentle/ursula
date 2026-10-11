@@ -1330,11 +1330,12 @@ mod tests {
     // A layer that refused a commit after the stream applied it breaks the rule of design doc §2:
     // the next commit, sent with the same sequence, is answered as the refused commit's duplicate.
     // Acknowledged, the stream would hold the refused transaction and the local file the next one,
-    // with no error: it poisons instead. A fresh append's 200 after the refusal is acknowledged, and
-    // so is a duplicate's answer at a sequence no refused commit used (this commit, applied by an
-    // exchange that a gateway made and answered for itself). After an attempt whose outcome is
-    // unknown a duplicate's answer is taken for that attempt's, which hides a refused commit applied
-    // after all (the gap design doc §2 names).
+    // with no error: it poisons instead, also when the refused commit was the first after the
+    // claim. A fresh append's 200 after the refusal is acknowledged, and so is a duplicate's answer
+    // at a sequence no refused commit used (this commit, applied by an exchange that a gateway made
+    // and answered for itself): one refused at an older epoch, or a refused snapshot publish, leaves
+    // no sequence. After an attempt whose outcome is unknown a duplicate's answer is taken for that
+    // attempt's, which hides a refused commit applied after all (the gap design doc §2 names).
     #[test]
     fn the_commit_after_a_refused_one_that_was_applied_poisons() {
         let duplicate = || answer("204 No Content\r\nstream-next-offset: 00000000000000000012");
@@ -1346,6 +1347,10 @@ mod tests {
             duplicate(),
             pressure("RaftLogPressure", LAST),
             String::new(),
+            duplicate(),
+            duplicate(),
+            duplicate(),
+            pressure("RaftLogPressure", LAST),
             duplicate(),
         ]);
         let mut d = owner(url.clone());
@@ -1370,15 +1375,49 @@ mod tests {
         let mut unrefused = owner(url.clone());
         assert_eq!(unrefused.append_commit(b"frame"), Ok(1));
         assert_eq!(at(&unrefused), (2, 5, "00000000000000000012"));
-        let mut lost = owner(url);
+        let mut lost = owner(url.clone());
         assert_eq!(lost.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
         assert_eq!(lost.append_commit(b"frame"), Ok(2));
         assert!(lost.poisoned.is_none());
+        // A commit refused at epoch 1, before a re-claim moved the owner to epoch 2, left no
+        // sequence at this epoch.
+        let mut reclaimed = owner(url.clone());
+        reclaimed.refused_at = Some((1, 5));
+        assert_eq!(reclaimed.append_commit(b"frame"), Ok(1));
+        assert!(reclaimed.poisoned.is_none() && reclaimed.refused_at.is_none());
+        // A refused snapshot publish records a refusal but no commit's sequence.
+        let mut snapshot = owner(url.clone());
+        snapshot.writes_refused(
+            WriteRefusal::PaymentRequired {
+                body: "quota".into(),
+            },
+            "snapshot publish",
+        );
+        assert!(snapshot.refused.is_some() && snapshot.refused_at.is_none());
+        assert_eq!(snapshot.append_commit(b"frame"), Ok(1));
+        assert!(snapshot.poisoned.is_none() && snapshot.refused.is_none());
+        // The first commit after the claim (sequence 1), refused, then answered for at the next.
+        let mut first = owner(url);
+        first.seq = 0;
+        assert_eq!(first.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
+        assert_eq!(first.refused_at, Some((2, 1)));
+        assert_eq!(first.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_WRITE));
+        assert!(matches!(
+            first.poisoned.as_ref().map(|p| &p.first),
+            Some(Error::RefusedCommitApplied {
+                epoch: 2,
+                seq: 1,
+                ..
+            })
+        ));
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 8);
-        for request in &requests {
-            assert_eq!(request_header(request, "producer-seq"), Some("5"));
-        }
+        let seqs: Vec<&str> = requests
+            .iter()
+            .map(|r| request_header(r, "producer-seq").unwrap())
+            .collect();
+        assert_eq!(seqs, [
+            "5", "5", "5", "5", "5", "5", "5", "5", "5", "5", "1", "1"
+        ]);
     }
 
     // The server expired the owner's producer: the owner takes the stream back before the commit

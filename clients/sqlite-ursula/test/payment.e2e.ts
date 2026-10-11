@@ -6,7 +6,7 @@
 // the stream at all. The layer here is `gate.mjs`: the server never answers 402 itself.
 import { writeFileSync } from "node:fs";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { attach, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError } from "../src/index.ts";
+import { attach, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
 import { openHarness, textTurn } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
 import { type Child, type ChildLine, Gate, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
@@ -71,12 +71,14 @@ it("a commit refused with 402 fails alone: reads go on, and the next commit succ
 	expect(step(child, 6)?.rows).toEqual([{ x: "a1" }]);
 	const refused = step(child, 7)?.status;
 	expect(refused).toMatchObject({ poisoned: false, fenced: false, read_only: false, payment_required: true, payment_reason: REASON });
+	// A 402 is one of the refusals that applied nothing: it shows in their fields too.
+	expect(refused).toMatchObject({ writes_refused: true, refused_kind: "payment_required", refused_reason: REASON });
 	// Nothing of the refused commit moved the owner: same epoch, same offset.
 	expect([refused?.epoch, refused?.offset]).toEqual([before?.epoch, before?.offset]);
 	expect(step(child, 8)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
 	expect(step(child, 10)?.ok).toBe(true);
 	expect(step(child, 11)?.rows).toEqual([{ x: "a1" }, { x: "a5" }]);
-	expect(done).toMatchObject({ poisoned: false, fenced: false, payment_required: false, payment_reason: null, epoch: before?.epoch });
+	expect(done).toMatchObject({ poisoned: false, fenced: false, payment_required: false, payment_reason: null, writes_refused: false, epoch: before?.epoch });
 	expect(done.attempts).toEqual([1, 1, 1]);
 	expect(child.stderr()).toMatch(/event=payment_required file=\S+ stream=\S+ during=commit reason=/);
 	expect(child.stderr()).toMatch(/event=writes_resumed file=\S+ stream=\S+$/m);
@@ -205,6 +207,8 @@ it("an attach the layer refuses throws UrsulaPaymentRequiredError, and a read-on
 		error = e;
 	}
 	expect(error).toBeInstanceOf(UrsulaPaymentRequiredError);
+	expect(error).toBeInstanceOf(UrsulaWriteRefusedError);
+	expect(error).toMatchObject({ name: "UrsulaPaymentRequiredError", kind: "payment_required", reason: null });
 	expect((error as Error).message).toMatch(/claim \S+: 402 Payment Required/);
 	expect((error as Error).message).toContain(REASON);
 	// The failed attach leaves the file refused, as any failed attach does.
@@ -290,7 +294,7 @@ it("Pi: a refused commit rejects with UrsulaPaymentRequiredError, and the storag
 	await gate.refuse(null);
 	expect(error).toBeInstanceOf(UrsulaPaymentRequiredError);
 	expect(error).not.toBeInstanceOf(UrsulaReplicationError);
-	expect((error as UrsulaPaymentRequiredError).reason).toBe(REASON);
+	expect(error).toMatchObject({ name: "UrsulaPaymentRequiredError", kind: "payment_required", reason: REASON });
 	const { harness, root } = await openHarness(storage);
 	await textTurn(root, 1);
 	await harness.close(ctx);

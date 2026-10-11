@@ -1,9 +1,11 @@
 //! `ursula_status` and `ursula_stats` as JSON.
 
+use crate::db::Db;
 use crate::db::Mode;
 use crate::db::attached;
 use crate::db::lock;
 use crate::error::Error;
+use crate::error::WriteRefusal;
 use crate::host::full_pathname;
 
 fn json_str(s: &str) -> String {
@@ -24,7 +26,17 @@ pub(crate) fn status(path: &str) -> Result<String, Error> {
     let path = full_pathname(path)?;
     let db = attached(&path)?;
     let db = lock(&db);
+    Ok(status_json(&db))
+}
+
+/// `ursula_status` of an attached database.
+fn status_json(db: &Db) -> String {
     let null = || "null".to_owned();
+    // A 402 shows in the fields 0.7.1 introduced for it too.
+    let payment = match &db.refused {
+        Some(WriteRefusal::PaymentRequired { body }) => Some(body.as_str()),
+        _ => None,
+    };
     let fields = [
         ("offset", json_str(&db.offset)),
         ("epoch", db.epoch.to_string()),
@@ -37,15 +49,25 @@ pub(crate) fn status(path: &str) -> Result<String, Error> {
                 .map_or_else(null, |p| json_str(&p.first.to_string())),
         ),
         ("read_only", (db.mode == Mode::ReadOnly).to_string()),
-        (
-            "payment_required",
-            db.payment_required.is_some().to_string(),
-        ),
+        ("payment_required", payment.is_some().to_string()),
         (
             "payment_reason",
-            db.payment_required
-                .as_deref()
+            payment
                 .filter(|reason| !reason.is_empty())
+                .map_or_else(null, json_str),
+        ),
+        ("writes_refused", db.refused.is_some().to_string()),
+        (
+            "refused_kind",
+            db.refused
+                .as_ref()
+                .map_or_else(null, |refusal| json_str(refusal.kind())),
+        ),
+        (
+            "refused_reason",
+            db.refused
+                .as_ref()
+                .and_then(WriteRefusal::reason)
                 .map_or_else(null, json_str),
         ),
         ("snapshot", json_str(&db.snapshot)),
@@ -72,7 +94,7 @@ pub(crate) fn status(path: &str) -> Result<String, Error> {
         .iter()
         .map(|(key, value)| format!("\"{key}\":{value}"))
         .collect();
-    Ok(format!("{{{}}}", body.join(",")))
+    format!("{{{}}}", body.join(","))
 }
 
 pub(crate) fn stats(path: &str) -> Result<String, Error> {
@@ -119,4 +141,53 @@ pub(crate) fn stats(path: &str) -> Result<String, Error> {
         checkpoints.join(","),
         snapshots.join(",")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_json;
+    use crate::db::Db;
+    use crate::error::WriteRefusal;
+
+    // A write refused before it reached the stream shows in `writes_refused`, with its kind and
+    // reason, until a commit is acknowledged; a 402 also shows in the fields 0.7.1 introduced.
+    #[test]
+    fn refused_writes_show_their_kind_and_reason() {
+        let shows = |d: &Db, fields: &str| {
+            let status = status_json(d);
+            assert!(status.contains(fields), "{status}");
+        };
+        let mut d = Db::for_tests();
+        shows(
+            &d,
+            r#""payment_required":false,"payment_reason":null,"writes_refused":false,"refused_kind":null,"refused_reason":null,"#,
+        );
+        d.refuse(WriteRefusal::NotApplied {
+            status: 503,
+            reason: "RaftLogPressure".into(),
+        });
+        shows(
+            &d,
+            r#""payment_required":false,"payment_reason":null,"writes_refused":true,"refused_kind":"not_applied","refused_reason":"RaftLogPressure","#,
+        );
+        d.refuse(WriteRefusal::Unauthorized {
+            body: String::new(),
+        });
+        shows(
+            &d,
+            r#""writes_refused":true,"refused_kind":"unauthorized","refused_reason":null,"#,
+        );
+        d.refuse(WriteRefusal::PaymentRequired {
+            body: r#"{"detail":"quota"}"#.into(),
+        });
+        shows(
+            &d,
+            r#""payment_required":true,"payment_reason":"{\"detail\":\"quota\"}","writes_refused":true,"refused_kind":"payment_required","refused_reason":"{\"detail\":\"quota\"}","#,
+        );
+        d.writes_accepted();
+        shows(
+            &d,
+            r#""payment_required":false,"payment_reason":null,"writes_refused":false,"refused_kind":null,"refused_reason":null,"#,
+        );
+    }
 }

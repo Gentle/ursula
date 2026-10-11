@@ -17,7 +17,9 @@
 //!   `SELECT ursula_attach(path, stream_url, 'read_only')` catches the file up the same way but
 //!   claims nothing and never writes the stream (no claim, commit, snapshot or retention move): it
 //!   fences no owner, works while a layer in front of the stream refuses writes, and every write to
-//!   the file fails with SQLITE_READONLY. An attach refused with 402 fails with SQLITE_AUTH.
+//!   the file fails with SQLITE_READONLY. An attach refused with 402 fails with SQLITE_AUTH, and
+//!   one whose claim is refused before it reached the stream in any other way (see below) with
+//!   SQLITE_IOERR_AUTH: nothing was claimed.
 //! * Stream: `application/octet-stream`, one self-delimiting frame per append (see [`frame`]):
 //!   a commit carries the db size after it and the transaction's final page images; a claim carries
 //!   the owner's producer epoch. Appends use the idempotent producer (`Producer-Id`
@@ -40,14 +42,28 @@
 //!   ends (the WAL write lock is released) the sidecar `<db>-ursula` (stream offset and epoch
 //!   reflected locally) advances. On a rejection or an exhausted retry budget the overlay is
 //!   dropped, the write fails with SQLITE_IOERR_WRITE (SQLite rolls the transaction back) and the
-//!   database is poisoned until it is re-attached. A 402 from a layer in front of the stream (an
-//!   authorizer, a quota or billing service) fails the transaction alone with SQLITE_IOERR_AUTH:
-//!   nothing of it reached the stream, so the database is not poisoned, reads go on from the local
+//!   database is poisoned until it is re-attached. A commit refused before it reached the stream
+//!   fails the transaction alone with SQLITE_IOERR_AUTH: a 402 from a layer in front of the stream
+//!   (an authorizer, a quota or billing service) or a 4xx marked `x-ursula-not-applied` (an
+//!   authorizer's 403 among them) at once, and 401s, 429s and 5xx marked `x-ursula-not-applied`
+//!   (the server's ingress admission under pressure, a gateway that refused it before passing it
+//!   on) once the retry budget runs out on them. A marker counts only with the vouch
+//!   `x-ursula-not-applied-checked`, which Ursula's gateway adds from 0.7.3 on and a node never
+//!   sends (see `client::applied_nothing`): without a gateway, only a 401, 402 or 429 counts.
+//!   Nothing of it reached the stream, so the database is not poisoned, reads go on from the local
 //!   files, and the next commit is sent as usual (the epoch and the claim stay valid). Unless an
-//!   earlier attempt of the append may have reached the stream: its outcome is then unknown, and
-//!   the 402 is retried like one (see `client::append`). The overlay belongs to the write
-//!   transaction: it is cleared whenever the WAL write lock is taken or released, so a
-//!   rolled-back transaction's spilled frames never shadow a later one's.
+//!   attempt of the append may have reached the stream (no answer, a 307, or a 5xx without a
+//!   vouched marker): its outcome is then unknown, and the commit poisons as on an exhausted
+//!   budget (see `client::append`). So does a 403 without `Producer-Epoch` or a vouched marker,
+//!   which a filtering proxy may send in place of the stream's own answer. A refused commit that
+//!   was applied after all (a layer in front of the stream broke the rule of design doc §2) is
+//!   usually caught at the next commit, which goes out with its sequence and is answered as its
+//!   duplicate: that commit poisons (`Db::append_commit`). Unless an attempt of that commit got no
+//!   answer, or an answer that proves nothing, first: it is then acknowledged, with a warning
+//!   (`refused_commit_unchecked`). Design doc §2 lists what else the check misses, such as an
+//!   attach before the next commit. The overlay belongs to the write transaction: it is
+//!   cleared whenever the WAL write lock is taken or released, so a rolled-back transaction's
+//!   spilled frames never shadow a later one's.
 //! * Durability is the stream's acknowledgement alone: the local files (db, -wal, -shm, sidecar)
 //!   are a cache, not fsynced on the commit path (`xSync` of an attached database is a no-op,
 //!   whatever `PRAGMA synchronous` says). The sidecar records the kernel's boot id, the stream's
@@ -68,20 +84,25 @@
 //!   db file's pages, fsyncs the WAL and the db file (a write-back error poisons the database, and
 //!   nothing is published), publishes the pages at the stream offset they reflect, reads the
 //!   snapshot back and only then advances the stream's retention to the *previous* snapshot's
-//!   offset. A publish or retention move refused with 402 waits for the next acknowledged commit.
+//!   offset. A publish or retention move refused with 402, like a commit refused before it reached
+//!   the stream, holds snapshots until the next acknowledged commit.
 //!   Attach installs the latest snapshot when the local file is missing or behind it, then replays
 //!   the tail.
 //! * `SELECT ursula_status(path)` returns
 //!   `{"offset","epoch","poisoned","fenced","reason","read_only","payment_required",
-//!   "payment_reason","snapshot","retained","local","installed","attach_ms","commits",
-//!   "append_retries","log_bytes","snapshot_due_bytes","snapshot_age_ms","snapshot_failures",
-//!   "snapshot_error"}` (offsets as strings; `reason`: the first poison's, which a later one never
-//!   replaces; `fenced`: a fence was seen since, first or later, never reset; `payment_required`:
-//!   the latest write was refused with 402, until a commit is acknowledged (never while poisoned),
-//!   with the layer's explanation in `payment_reason`; `local`: the stream offset of the local
-//!   state attach started from, `-1` when it rebuilt the file; `installed`: the offset of the
-//!   snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none; the rest are
-//!   the owner's health, see `status`);
+//!   "payment_reason","writes_refused","refused_kind","refused_reason","snapshot","retained",
+//!   "local","installed","attach_ms","commits","append_retries","log_bytes","snapshot_due_bytes",
+//!   "snapshot_age_ms","snapshot_failures","snapshot_error"}` (offsets as strings; `reason`: the
+//!   first poison's, which a later one never replaces; `fenced`: a fence was seen since, first or
+//!   later, never reset; `writes_refused`: the latest write was refused before it reached the
+//!   stream, until a commit is acknowledged (never while poisoned), with what refused it in
+//!   `refused_kind` (`payment_required`, `unauthorized`, `forbidden`, `rate_limited` or
+//!   `not_applied`) and why in `refused_reason` (the layer's explanation, or the marker's token
+//!   when it sent no body, and always for `not_applied`);
+//!   `payment_required`, `payment_reason`: the same for a 402 alone; `local`: the stream offset of
+//!   the local state attach started from, `-1` when it rebuilt the file; `installed`: the offset of
+//!   the snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none; the rest
+//!   are the owner's health, see `status`);
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged

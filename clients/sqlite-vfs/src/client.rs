@@ -23,6 +23,7 @@ use crate::config::retry_budget;
 use crate::error::Attempt;
 use crate::error::Error;
 use crate::error::Gone;
+use crate::error::WriteRefusal;
 use crate::log;
 use crate::log::Level;
 
@@ -215,6 +216,9 @@ enum Refused {
     /// nothing of it reached the stream (unless an earlier attempt of an append did: `append`).
     PaymentRequired,
     /// A 403 without `Producer-Epoch`: an authorizer denied the request. Final, and never a fence.
+    /// Nothing of it reached the stream only when the answer proves it (`applied_nothing`: marked
+    /// `x-ursula-not-applied`, with a gateway's vouch): a filtering proxy can answer 403 in place
+    /// of the stream's own answer (see `append`).
     Denied,
     /// A 403 with `Producer-Epoch`: the server's fence, which names the epoch that owns the stream
     /// (only an append can meet it).
@@ -233,13 +237,103 @@ fn refused(r: &ureq::http::Response<ureq::Body>) -> Option<Refused> {
     }
 }
 
+/// The response header with which a layer (the server's ingress admission, a gateway, a proxy in
+/// front of either) marks its refusal (a 4xx or 5xx) of a request it refused before passing it on:
+/// the stream applied nothing of it. The value is a short token naming why (`RaftLogPressure`,
+/// say). Older layers never send it. It counts only on a refusal status and with a gateway's vouch
+/// (`NOT_APPLIED_CHECKED`): see `applied_nothing`.
+const NOT_APPLIED: &str = "x-ursula-not-applied";
+
+/// The response header with which a gateway vouches for `NOT_APPLIED`. Ursula's gateway sets it
+/// (to `1`) from 0.7.3 on, on every answer it returns: the answers it forwards, after it applied
+/// its own rule to their marker (an answer it got by following a leader redirect keeps the marker
+/// only if the redirect carried it too), and its own refusals and errors. It removes any copy that
+/// comes from upstream before it adds its own, and a node never sets it. A gateway before 0.7.3
+/// relays the marker of an answer it got by following a redirect, which a node can send after it
+/// proposed the write, and it never vouches: through it, and without a gateway, a marker proves
+/// nothing.
+const NOT_APPLIED_CHECKED: &str = "x-ursula-not-applied-checked";
+
+/// How an answer proves that the stream applied nothing of the request it answers (see
+/// `applied_nothing`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Proof {
+    /// Its status: 401, 402 or 429.
+    Status,
+    /// A refusal status (4xx or 5xx) with `x-ursula-not-applied` and a gateway's vouch: the
+    /// marker's token, cut to `BODY_SHOWN` bytes like a body. A marker with an empty value still
+    /// marks.
+    Marked(String),
+}
+
+impl Proof {
+    /// The refusal that an answer with `status` and `body`, proven this way, stands for: a 401,
+    /// 402, 403 or 429 keeps its own kind, marked or not, and a vouched marker names any other
+    /// (`NotApplied`, with the marker's token). A kind of its own carries the layer's explanation:
+    /// its body, or the marker's token when the body is empty (Ursula's gateway answers its
+    /// refusals without a body).
+    pub(crate) fn refusal(self, status: u16, body: String) -> WriteRefusal {
+        let token = match self {
+            Proof::Marked(token) => token,
+            Proof::Status => String::new(),
+        };
+        let explained = if body.trim().is_empty() {
+            token.clone()
+        } else {
+            body
+        };
+        match status {
+            401 => WriteRefusal::Unauthorized { body: explained },
+            402 => WriteRefusal::PaymentRequired { body: explained },
+            403 => WriteRefusal::Forbidden { body: explained },
+            429 => WriteRefusal::RateLimited { body: explained },
+            _ => WriteRefusal::NotApplied {
+                status,
+                reason: token,
+            },
+        }
+    }
+}
+
+/// Whether an answer proves that the stream applied nothing of the request it answers, and how: the
+/// one place that decides it (design doc §2). It does when its status is 401 or 402 (a layer in
+/// front of the stream refused the request before passing it on) or 429 (the same, or the server's
+/// limit on a stream's producers, which refuses only the first append of a producer the stream does
+/// not hold: an attempt sent after an earlier one was applied is answered as its duplicate), or
+/// when a refusal status (4xx or 5xx) carries both `x-ursula-not-applied` and the vouch
+/// `x-ursula-not-applied-checked`. Any other answer proves nothing: a 403, 413 or 503 with only one
+/// of the two headers, and a redirect or a success whatever headers it carries (`None`). It reads
+/// the status and the headers only, never the body.
+pub(crate) fn applied_nothing<B>(r: &ureq::http::Response<B>) -> Option<Proof> {
+    let status = r.status();
+    let headers = r.headers();
+    if let Some(marker) = headers.get(NOT_APPLIED).filter(|_| {
+        headers.contains_key(NOT_APPLIED_CHECKED)
+            && (status.is_client_error() || status.is_server_error())
+    }) {
+        let value = marker.as_bytes();
+        let shown = value.get(..BODY_SHOWN).unwrap_or(value);
+        return Some(Proof::Marked(
+            String::from_utf8_lossy(shown).trim().to_owned(),
+        ));
+    }
+    matches!(status.as_u16(), 401 | 402 | 429).then_some(Proof::Status)
+}
+
+/// The refusal a 402 stands for (`Proof::refusal`): its status proves that nothing was applied,
+/// and a vouched marker gives the reason when the body is empty.
+fn payment_refusal(r: &mut ureq::http::Response<ureq::Body>) -> WriteRefusal {
+    let proof = applied_nothing(r).unwrap_or(Proof::Status);
+    proof.refusal(402, body_text(r))
+}
+
 /// The error of request `op` to `url` that a layer in front of the stream refused (a refused
 /// token, a denial, or a 402), never a fence; `None` for any other answer.
 fn refusal(op: &'static str, url: &str, r: &mut ureq::http::Response<ureq::Body>) -> Option<Error> {
     let status = r.status().as_u16();
     match refused(r)? {
         Refused::Token | Refused::Denied => Some(unauthorized(op, url, status)),
-        Refused::PaymentRequired => Some(payment_required(op, url, body_text(r))),
+        Refused::PaymentRequired => Some(refused_request(op, url, payment_refusal(r))),
         Refused::Fenced { .. } => None,
     }
 }
@@ -252,11 +346,11 @@ fn unauthorized(op: &'static str, url: &str, status: u16) -> Error {
     }
 }
 
-fn payment_required(op: &'static str, url: &str, body: String) -> Error {
-    Error::PaymentRequired {
+fn refused_request(op: &'static str, url: &str, refusal: WriteRefusal) -> Error {
+    Error::Refused {
         op,
         url: url.to_owned(),
-        body,
+        refusal,
     }
 }
 
@@ -383,8 +477,27 @@ fn send_retrying(
 }
 
 pub(crate) enum Append {
-    /// Applied (or a duplicate of an applied append); the stream offset after it when known.
-    Acked { next: Option<String>, attempts: u32 },
+    /// Applied, or answered as a duplicate of an earlier attempt of this append (or, for a claim,
+    /// of any append at its epoch and sequence 0, verified separately); the stream offset after it
+    /// when known. `duplicate`: the answer was a duplicate's (204), which a commit gets only after
+    /// an attempt that may have reached the stream (see `append`).
+    Acked {
+        next: Option<String>,
+        attempts: u32,
+        duplicate: bool,
+    },
+    /// A commit's attempt answered 204, the server's answer to a duplicate, while no earlier
+    /// attempt of it can have reached the stream (see `append`): the stream held an append at this
+    /// epoch and sequence before that attempt reached it, which no attempt of this append put
+    /// there as far as their answers tell. This owner alone writes its producer at its epoch, so
+    /// that append is its own: an earlier commit at this sequence that was refused as never
+    /// applied ([`Append::Refused`]) but was applied after all, or this commit, applied by an
+    /// exchange whose answer said otherwise (an earlier attempt refused falsely, or an exchange
+    /// that a layer in front of the stream made and answered for itself, such as a gateway that
+    /// followed a leader redirect the leader sent after it proposed the commit). `next` is that
+    /// append's receipt. `Db::append_commit` tells them apart by whether a commit at this sequence
+    /// was refused.
+    UnexplainedDuplicate { next: Option<String>, attempts: u32 },
     /// 403 with `Producer-Epoch`: a newer epoch owns the stream.
     Fenced { current: Option<u64> },
     /// 412: the stream is no longer the incarnation the append was sent to (deleted and
@@ -396,10 +509,9 @@ pub(crate) enum Append {
     /// 409 refusing the commit's `Stream-Seq` (not above the stream's last one): another writer
     /// appended with a higher one (see `stream_seq`). `body` is the server's explanation.
     SeqConflict { body: String },
-    /// 402: a layer in front of the stream refused the append, and no attempt of it reached the
-    /// stream (each earlier one was refused in front of it too, or rate limited): nothing was
-    /// appended, and the producer sequence is still free. `body` is the layer's explanation.
-    PaymentRequired { body: String },
+    /// Refused before it reached the stream, and so was every earlier attempt of it (see
+    /// `append`): nothing was appended, and the producer sequence is still free.
+    Refused(WriteRefusal),
     /// A definite rejection, or no answer within the retry budget.
     Failed(Error),
 }
@@ -415,20 +527,39 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// `Stream-Incarnation` precondition): retried with the same producer sequence until the outcome
 /// is known.
 ///
-/// A duplicate answer is taken as proof of *our* earlier attempt only for commits (seq >= 1), and
-/// only with its receipt (`Stream-Next-Offset`, checked by `commit`): they are sent after a
-/// verified claim (see `claim_once`), which makes this owner the only writer of its incarnation's
-/// producer at its epoch, so whatever holds (epoch, seq) there is ours. A claim's answer is
-/// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
+/// A duplicate answer is taken as proof of *our* earlier append only for commits (seq >= 1), and
+/// only with its receipt (`Stream-Next-Offset`, checked by `Db::append_commit`): they are sent
+/// after a verified claim (see `claim_once`), which makes this owner the only writer of its
+/// incarnation's producer at its epoch, so whatever holds (epoch, seq) there is ours: an earlier
+/// attempt of this append, or an earlier commit at this sequence that was refused as never applied
+/// (a refusal leaves the sequence to the next commit) but was applied after all. So a duplicate's
+/// answer (204) while no earlier attempt of this append can have reached the stream ends the
+/// append as [`Append::UnexplainedDuplicate`], which `Db::append_commit` takes for such a refused
+/// commit when one was refused at this sequence. After an attempt that may have reached the
+/// stream, a duplicate's answer is taken for that attempt's ([`Append::Acked`], `duplicate`), so a
+/// refused commit applied after all goes unchecked when an attempt of the next commit got no
+/// answer, or an answer that proves nothing (a 307, a 5xx without a vouched marker), before the
+/// duplicate's (design doc §2): `Db::append_commit` only logs it. A claim's answer is verified
+/// separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
 ///
-/// A 402 ends the append as [`Append::PaymentRequired`] only while no attempt of it can have
-/// reached the stream. After an attempt whose outcome is unknown (no answer, a 5xx, or a 307), the
-/// append may be in the stream, and the next commit, sent with the same sequence, would
-/// be acknowledged as its duplicate: the 402 is then retried like an unknown outcome, until an
-/// answer settles it or the budget runs out ([`Error::AppendUnknown`]). An attempt answered 401,
-/// 402 or 429 is taken to have applied nothing, which every layer in front of the stream must
-/// ensure (design doc §2): one that passed the append on and then answered so would have the next
-/// commit acknowledged as this one's duplicate, its pages never appended.
+/// An attempt whose answer proves that it applied nothing (`applied_nothing`: a 401, 402 or 429, or
+/// a refusal marked `x-ursula-not-applied` that a gateway vouched for with
+/// `x-ursula-not-applied-checked`) is taken to have applied nothing, which every layer in front of
+/// the stream must ensure (design doc §2): one that passed the append on and then answered so would
+/// have the next commit, sent with the same sequence, answered as this one's duplicate. That poisons
+/// the next commit (see above) instead of acknowledging it without its pages, unless one of its
+/// attempts got no answer, or an answer that proves nothing, before the duplicate's. A marker
+/// without the vouch proves nothing: a gateway before 0.7.3 relays the marker of an answer it got
+/// by following a leader redirect, which a node can send after it proposed the append. A 403
+/// without `Producer-Epoch` counts only when proven: a filtering proxy can answer 403 in place of
+/// the stream's own answer, after the stream applied the append, so any other fails the append, as
+/// before 0.7.3. While no attempt of the append can have reached the stream, a 402 or a proven
+/// final answer (any other 4xx, an authorizer's 403 among them) ends it as [`Append::Refused`] at
+/// once, and the retried ones (401, 429, a proven 5xx) end it so once the budget runs out. After
+/// an attempt whose outcome is unknown (no answer, a 307, or a 5xx that proves nothing), the append
+/// may be in the stream, and the next commit, sent with the same sequence, would be answered as its
+/// duplicate. Its refusals then prove nothing: a 402 is retried like an unknown outcome, until an
+/// answer settles it or the budget runs out ([`Error::AppendUnknown`]), and a 403 fails it.
 ///
 /// A 307 is an unknown outcome, sent again to the same URL with the same sequence
 /// (`redirect_retried`); any other redirect (a 308 among them) fails the append
@@ -462,50 +593,70 @@ pub(crate) fn append(
         }
         let sent = req.send(body);
         let mut retry_after = None;
-        let unknown = match sent {
+        // The attempt retried (for the log and the error), and why it applied nothing: `None`
+        // when it may have reached the stream.
+        let (unknown, refusal) = match sent {
             Ok(mut r) => {
                 let status = r.status().as_u16();
                 // Rate limiting (429, e.g. ursulagw), overload (503) and a redirect for the leader
                 // (307) are transient: retried with the same producer sequence, no sooner than
                 // Retry-After (seconds).
                 retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
+                // Whether the attempt applied nothing: every branch below takes it from here.
+                let proof = applied_nothing(&r);
                 match refused(&r) {
                     Some(Refused::Fenced { current }) => return Append::Fenced { current },
+                    // Unproven, the denial may have replaced the stream's answer (see above).
                     Some(Refused::Denied) => {
-                        return Append::Failed(unauthorized("append", url, status));
-                    }
-                    Some(Refused::PaymentRequired) if !reached => {
-                        return Append::PaymentRequired {
-                            body: body_text(&mut r),
+                        return match proof {
+                            Some(proof) if !reached => {
+                                Append::Refused(proof.refusal(status, body_text(&mut r)))
+                            }
+                            _ => Append::Failed(unauthorized("append", url, status)),
                         };
                     }
-                    // An earlier attempt may be in the stream: the outcome is still unknown.
-                    Some(Refused::PaymentRequired) => Attempt::Status {
-                        status,
-                        body: body_text(&mut r),
-                    },
-                    Some(Refused::Token) => {
-                        resend.refresh = true;
-                        Attempt::Status {
-                            status,
-                            body: body_text(&mut r),
+                    Some(Refused::PaymentRequired) => {
+                        let body = body_text(&mut r);
+                        match proof.map(|proof| proof.refusal(status, body.clone())) {
+                            Some(refusal) if !reached => return Append::Refused(refusal),
+                            // An earlier attempt may be in the stream: the outcome is still
+                            // unknown.
+                            refusal => (Attempt::Status { status, body }, refusal),
                         }
                     }
+                    Some(Refused::Token) => {
+                        resend.refresh = true;
+                        let body = body_text(&mut r);
+                        let refusal = proof.map(|proof| proof.refusal(status, body.clone()));
+                        (Attempt::Status { status, body }, refusal)
+                    }
                     None => match status {
-                        200..=299 => {
-                            return Append::Acked {
+                        // A duplicate's answer that no attempt of this commit explains (see
+                        // above): the server answers a fresh producer append 200.
+                        204 if seq > 0 && !reached => {
+                            return Append::UnexplainedDuplicate {
                                 next: header_offset(&r, "stream-next-offset"),
                                 attempts,
                             };
                         }
+                        200..=299 => {
+                            return Append::Acked {
+                                next: header_offset(&r, "stream-next-offset"),
+                                attempts,
+                                duplicate: status == 204,
+                            };
+                        }
                         // Never followed (`new_agent`): a 307 is sent again, its outcome unknown
-                        // (`redirect_retried`), and any other redirect fails the append.
+                        // (`redirect_retried`: a redirect proves nothing, whatever headers it
+                        // carries), and any other redirect fails the append.
                         300..=399 => match redirected("append", url, &r) {
                             Some(e) => return Append::Failed(e),
-                            None => Attempt::Status {
-                                status,
-                                body: body_text(&mut r),
-                            },
+                            None => {
+                                let body = body_text(&mut r);
+                                let refusal =
+                                    proof.map(|proof| proof.refusal(status, body.clone()));
+                                (Attempt::Status { status, body }, refusal)
+                            }
                         },
                         // The stream was deleted and recreated: nothing was appended.
                         412 => return Append::Recreated,
@@ -522,37 +673,35 @@ pub(crate) fn append(
                                 body: body_text(&mut r),
                             };
                         }
-                        429 => Attempt::Status {
-                            status,
-                            body: body_text(&mut r),
-                        },
-                        400..=499 => {
-                            return Append::Failed(Error::AppendRejected {
-                                status,
-                                body: body_text(&mut r),
-                            });
+                        // A definite rejection (429 is retried, below), final: the append fails
+                        // alone when the answer proves it applied nothing and no earlier attempt
+                        // can have reached the stream.
+                        400..=499 if status != 429 => {
+                            let body = body_text(&mut r);
+                            return match proof {
+                                Some(proof) if !reached => {
+                                    Append::Refused(proof.refusal(status, body))
+                                }
+                                _ => Append::Failed(Error::AppendRejected { status, body }),
+                            };
                         }
-                        _ => Attempt::Status {
-                            status,
-                            body: body_text(&mut r),
-                        },
+                        _ => {
+                            let body = body_text(&mut r);
+                            let refusal = proof.map(|proof| proof.refusal(status, body.clone()));
+                            (Attempt::Status { status, body }, refusal)
+                        }
                     },
                 }
             }
             Err(e) => {
                 resend.fresh = true;
-                Attempt::Transport(Box::new(e))
+                (Attempt::Transport(Box::new(e)), None)
             }
         };
-        // Refusals in front of the stream (401, 402) and rate limiting (429) apply nothing (a
-        // requirement on every layer in front of it, see above); any other answer (a 307 too:
-        // `redirect_retried`), or none, may come after the stream applied the append.
-        if !matches!(unknown, Attempt::Status {
-            status: 401 | 402 | 429,
-            ..
-        }) {
-            reached = true;
-        }
+        // An answer that does not prove the attempt applied nothing (`refusal` is set exactly
+        // when `applied_nothing` proved it: never for a 307), or none, may come after the stream
+        // applied the append (see above).
+        reached |= refusal.is_none();
         // A retried commit is a stall the application sees: say why, attempt by attempt, and
         // whether another attempt follows.
         let wait = next_wait(retry_after, backoff, deadline);
@@ -568,14 +717,15 @@ pub(crate) fn append(
             ("reason", &unknown),
         ]);
         let Some(wait) = wait else {
-            return Append::Failed(if resend.refresh {
-                unauthorized("append", url, 401)
-            } else {
-                Error::AppendUnknown {
+            return match refusal {
+                // Every attempt was refused before it reached the stream: nothing was appended.
+                Some(refusal) if !reached => Append::Refused(refusal),
+                _ if resend.refresh => Append::Failed(unauthorized("append", url, 401)),
+                _ => Append::Failed(Error::AppendUnknown {
                     attempts,
                     last: unknown,
-                }
-            });
+                }),
+            };
         };
         back_off(wait, &mut backoff);
     }
@@ -813,9 +963,12 @@ pub(crate) fn get_snapshot(
 /// `PUT` to stream incarnation `incarnation` (a 412 when it is not) with retries while the outcome
 /// is unknown (transport errors, 5xx, a 307: `redirect_retried`), no sooner than
 /// Retry-After (seconds): both publishing a snapshot and advancing retention are idempotent, so a
-/// 402 fails the request alone ([`Error::PaymentRequired`]), whatever an earlier attempt did, and
-/// so does any other redirect ([`Error::Redirected`]). Returns the status and response. Gives up
-/// once `stopped` (a re-attach is waiting for the snapshot thread).
+/// 402 fails the request alone ([`Error::Refused`]), whatever an earlier attempt did, and so does
+/// any other redirect ([`Error::Redirected`]). No other answer refuses it, whatever headers it
+/// carries: no answer here decides a producer sequence, so none needs `applied_nothing`, and a
+/// marked 413 for a snapshot body over a gateway's limit stays a snapshot failure, which the
+/// snapshot thread counts. Returns the status and response. Gives up once `stopped` (a re-attach is
+/// waiting for the snapshot thread).
 pub(crate) fn put_idempotent(
     url: &str,
     incarnation: &str,
@@ -847,7 +1000,7 @@ pub(crate) fn put_idempotent(
                         return Err(unauthorized("put", url, status));
                     }
                     (Some(Refused::PaymentRequired), _) => {
-                        return Err(payment_required("put", url, body_text(&mut r)));
+                        return Err(refused_request("put", url, payment_refusal(&mut r)));
                     }
                     (_, status) if status < 500 && !redirect_retried(status) => {
                         return match redirected("put", url, &r) {
@@ -898,6 +1051,83 @@ pub(crate) fn stream_seq((epoch, seq): (u64, u64)) -> String {
     format!("{epoch:020}{seq:020}")
 }
 
+/// A stand-in for the stream in tests: canned answers, in order.
+#[cfg(test)]
+pub(crate) mod mock {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+
+    /// Ends an append's retry budget with the answer that carries it: a Retry-After too large to
+    /// wait for (or even add to now).
+    pub(crate) const LAST: &str = "retry-after: 18446744073709551615";
+
+    /// Answers one connection per answer, in order, and returns each request's head. An empty
+    /// answer closes the connection without one: the attempt's outcome is unknown. The request's
+    /// body is read whole before the answer: a connection closed with unread bytes is reset, which
+    /// can drop the answer before the client reads it.
+    pub(crate) fn serve(answers: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            answers
+                .into_iter()
+                .map(|answer| {
+                    let (mut conn, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        conn.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&request).into_owned();
+                    let len =
+                        request_header(&head, "content-length").map_or(0, |n| n.parse().unwrap());
+                    conn.read_exact(&mut vec![0u8; len]).unwrap();
+                    conn.write_all(answer.as_bytes()).unwrap();
+                    head
+                })
+                .collect()
+        });
+        (url, server)
+    }
+
+    /// An answer without a body: `head` is the status and the headers.
+    pub(crate) fn answer(head: &str) -> String {
+        format!("HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+    }
+
+    pub(crate) fn answer_with_body(head: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A gateway's vouch for the marker, as a header line of an answer: alone, it proves nothing.
+    pub(crate) const VOUCH: &str = "x-ursula-not-applied-checked: 1";
+
+    /// The header line that marks an answer as applying nothing, with `token`, as a node or a
+    /// gateway before 0.7.3 sends it: alone, it proves nothing.
+    pub(crate) fn marker(token: &str) -> String {
+        format!("x-ursula-not-applied: {token}")
+    }
+
+    /// The header lines of an answer marked as applying nothing, with `token`, and vouched for by a
+    /// gateway from 0.7.3 on: the marker counts.
+    pub(crate) fn vouched(token: &str) -> String {
+        format!("{}\r\n{VOUCH}", marker(token))
+    }
+
+    /// The value of header `name` in a request head `serve` returned.
+    pub(crate) fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.split("\r\n").find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read as _;
@@ -914,19 +1144,29 @@ mod tests {
     use std::time::Instant;
 
     use super::Append;
+    use super::Proof;
     use super::agent;
     use super::append;
+    use super::applied_nothing;
     use super::bulk_agent;
     use super::create_stream;
     use super::get_snapshot;
     use super::head;
     use super::in_clear;
+    use super::mock::LAST;
+    use super::mock::VOUCH;
+    use super::mock::answer;
+    use super::mock::answer_with_body;
+    use super::mock::marker;
+    use super::mock::serve;
+    use super::mock::vouched;
     use super::new_agent;
     use super::put_idempotent;
     use super::read_from;
     use crate::auth::set_token;
     use crate::error::Attempt;
     use crate::error::Error;
+    use crate::error::WriteRefusal;
 
     /// Held by each test that sets the process-wide token (`set_token`): tests run in parallel.
     static TOKEN: Mutex<()> = Mutex::new(());
@@ -1004,48 +1244,30 @@ mod tests {
         ]);
     }
 
-    /// Answers one connection per answer, in order, and returns each request's head.
-    fn serve(answers: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/b/s", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            answers
-                .into_iter()
-                .map(|answer| {
-                    let (mut conn, _) = listener.accept().unwrap();
-                    let mut request = Vec::new();
-                    let mut byte = [0u8; 1];
-                    while !request.ends_with(b"\r\n\r\n") {
-                        conn.read_exact(&mut byte).unwrap();
-                        request.push(byte[0]);
-                    }
-                    conn.write_all(answer.as_bytes()).unwrap();
-                    String::from_utf8_lossy(&request).into_owned()
-                })
-                .collect()
-        });
-        (url, server)
-    }
-
-    fn answer(head: &str) -> String {
-        format!("HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
-    }
-
     // Every request carries the token. A 401 is an authorizer refusing it: the request is sent
     // again (with the token read again) within the retry budget, a create too. A 403 is a fence
     // only with the epoch that owns the stream (the server's); without it, an authorizer's final
-    // denial, never taken for a fence.
+    // denial, never taken for a fence. Marked `x-ursula-not-applied` with a gateway's vouch, it
+    // refuses an append none of whose attempts can have reached the stream (nothing was appended).
+    // Unmarked (a filtering proxy may have answered it after the stream applied the append), or
+    // after an attempt whose outcome is unknown, it fails the append.
     #[test]
     fn auth_refusals_are_retried_or_final_never_fences() {
         let _token = TOKEN.lock().unwrap_or_else(PoisonError::into_inner);
         set_token(Some("t1"));
+        let denied =
+            |headers: &str| answer_with_body(&format!("403 Forbidden{headers}"), "read only");
+        let marked = format!("\r\n{}", vouched("Forbidden"));
         let (url, server) = serve(vec![
             answer("401 Unauthorized\r\nwww-authenticate: Bearer error=\"invalid_token\""),
             answer("200 OK\r\nstream-next-offset: 9"),
             answer("401 Unauthorized"),
             answer("200 OK\r\nstream-incarnation: i1"),
             answer("403 Forbidden\r\nproducer-epoch: 4"),
-            answer("403 Forbidden"),
+            denied(&marked),
+            denied(""),
+            answer("503 Service Unavailable\r\nretry-after: 0"),
+            denied(&marked),
             answer("401 Unauthorized"),
             answer("201 Created"),
         ]);
@@ -1058,14 +1280,23 @@ mod tests {
         let fenced = append(&url, "i1", "p", b"x", 1, 2);
         assert!(matches!(fenced, Append::Fenced { current: Some(4) }));
         let denied = append(&url, "i1", "p", b"x", 1, 2);
+        assert!(
+            matches!(&denied, Append::Refused(WriteRefusal::Forbidden { body }) if body == "read only")
+        );
+        let unmarked = append(&url, "i1", "p", b"x", 1, 2);
         assert!(matches!(
-            denied,
+            unmarked,
+            Append::Failed(Error::Unauthorized { status: 403, .. })
+        ));
+        let after_unknown = append(&url, "i1", "p", b"x", 1, 2);
+        assert!(matches!(
+            after_unknown,
             Append::Failed(Error::Unauthorized { status: 403, .. })
         ));
         create_stream(&url).unwrap();
         set_token(None);
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 8);
+        assert_eq!(requests.len(), 11);
         for request in &requests {
             assert!(
                 request
@@ -1074,6 +1305,50 @@ mod tests {
                 "{request}"
             );
         }
+    }
+
+    // `applied_nothing` alone decides whether an answer proves that the stream applied nothing: a
+    // 401, 402 or 429 by its status, and a refusal (a 4xx or 5xx) by the marker with a gateway's
+    // vouch, which then names it. A redirect or a success proves nothing whatever headers it
+    // carries, and neither does the marker or the vouch alone.
+    #[test]
+    fn only_a_refusal_proves_that_nothing_was_applied() {
+        let response = |status: u16, headers: &[(&str, &str)]| {
+            let mut r = ureq::http::Response::builder().status(status);
+            for &(name, value) in headers {
+                r = r.header(name, value);
+            }
+            r.body(()).unwrap()
+        };
+        let marker = ("x-ursula-not-applied", "RaftLogPressure");
+        let vouch = ("x-ursula-not-applied-checked", "1");
+        let marked = Some(Proof::Marked("RaftLogPressure".to_owned()));
+        for status in [503, 413, 403, 404, 502, 504, 401, 402, 429] {
+            let proof = applied_nothing(&response(status, &[marker, vouch]));
+            assert_eq!(proof, marked, "{status}");
+        }
+        for status in [307, 308, 301, 303, 200, 201, 204] {
+            let proof = applied_nothing(&response(status, &[marker, vouch]));
+            assert_eq!(proof, None, "{status}");
+        }
+        for status in [401, 402, 429] {
+            for headers in [&[][..], &[marker], &[vouch]] {
+                let proof = applied_nothing(&response(status, headers));
+                assert_eq!(proof, Some(Proof::Status), "{status} {headers:?}");
+            }
+        }
+        for status in [503, 413, 403, 404, 400, 500] {
+            for headers in [&[][..], &[marker], &[vouch]] {
+                let proof = applied_nothing(&response(status, headers));
+                assert_eq!(proof, None, "{status} {headers:?}");
+            }
+        }
+        // An empty marker still marks, and a long one is cut like a body.
+        let empty = applied_nothing(&response(503, &[("x-ursula-not-applied", ""), vouch]));
+        assert_eq!(empty, Some(Proof::Marked(String::new())));
+        let long = "x".repeat(300);
+        let cut = applied_nothing(&response(503, &[("x-ursula-not-applied", &long), vouch]));
+        assert_eq!(cut, Some(Proof::Marked("x".repeat(256))));
     }
 
     // A token crosses the network in clear only over plain HTTP to a host other than this one.
@@ -1106,22 +1381,19 @@ mod tests {
         server.join().unwrap();
     }
 
-    fn answer_with_body(head: &str, body: &str) -> String {
-        format!(
-            "HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        )
-    }
-
     // A 402 is a layer in front of the stream refusing the request: it fails that request alone,
     // with the layer's explanation, and is never retried, except by an append one of whose earlier
-    // attempts may have reached the stream (no answer, or a 5xx): its outcome is still unknown, so
-    // it is sent again until an answer settles it. Refusals in front of the stream (401, 402) and
-    // rate limiting (429) leave the outcome known.
+    // attempts may have reached the stream (no answer, a 5xx or a 307): its outcome is still
+    // unknown, so it is sent again until an answer settles it. Refusals in front of the stream
+    // (401, 402) and rate limiting (429) leave the outcome known.
     #[test]
     fn payment_refusals_fail_the_request_alone() {
         let reason = "{\"detail\":\"quota exhausted\"}";
         let refused = || answer_with_body("402 Payment Required", reason);
+        let payment = |r: &Error| match r.refusal() {
+            Some(WriteRefusal::PaymentRequired { body }) => body == reason,
+            _ => false,
+        };
         let (url, server) = serve(vec![
             refused(),
             answer("429 Too Many Requests"),
@@ -1139,25 +1411,35 @@ mod tests {
             refused(),
         ]);
         let first = append(&url, "i1", "p", b"x", 1, 1);
-        assert!(matches!(&first, Append::PaymentRequired { body } if body == reason));
+        assert!(
+            matches!(&first, Append::Refused(WriteRefusal::PaymentRequired { body }) if body == reason)
+        );
         let after_429 = append(&url, "i1", "p", b"x", 1, 1);
-        assert!(matches!(after_429, Append::PaymentRequired { .. }));
+        assert!(matches!(
+            after_429,
+            Append::Refused(WriteRefusal::PaymentRequired { .. })
+        ));
         let after_401 = append(&url, "i1", "p", b"x", 1, 1);
-        assert!(matches!(after_401, Append::PaymentRequired { .. }));
+        assert!(matches!(
+            after_401,
+            Append::Refused(WriteRefusal::PaymentRequired { .. })
+        ));
         let settled = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
-            matches!(settled, Append::Acked { next: Some(ref n), attempts: 5 } if n == "9"),
+            matches!(settled, Append::Acked { next: Some(ref n), attempts: 5, duplicate: false } if n == "9"),
             "a 402 after an unknown outcome is retried"
         );
         let create = create_stream(&url).unwrap_err();
-        assert!(matches!(
-            &create,
-            Error::PaymentRequired { op: "create", body, .. } if body == reason
-        ));
+        assert!(matches!(create, Error::Refused { op: "create", .. }) && payment(&create));
+        // A HEAD answer has no body: no explanation.
         let head = head(&url, &|| false).err().unwrap();
-        assert!(matches!(head, Error::PaymentRequired { op: "head", .. }));
+        assert!(matches!(head, Error::Refused {
+            op: "head",
+            refusal: WriteRefusal::PaymentRequired { .. },
+            ..
+        }));
         let put = put_idempotent(&url, "i1", b"", &|| false).err().unwrap();
-        assert!(matches!(put, Error::PaymentRequired { op: "put", .. }));
+        assert!(matches!(put, Error::Refused { op: "put", .. }) && payment(&put));
         let requests = server.join().unwrap();
         let methods: Vec<&str> = requests
             .iter()
@@ -1174,11 +1456,10 @@ mod tests {
     // producer sequence for free.
     #[test]
     fn a_payment_refusal_after_an_unknown_outcome_stays_unknown() {
-        // The budget ends once a wait would pass it: a Retry-After too large to wait for.
         let (url, server) = serve(vec![
             answer("503 Service Unavailable"),
             answer_with_body(
-                "402 Payment Required\r\nretry-after: 18446744073709551615",
+                &format!("402 Payment Required\r\n{LAST}"),
                 "quota exhausted",
             ),
         ]);
@@ -1191,6 +1472,425 @@ mod tests {
             matches!(last, Attempt::Status { status: 402, ref body } if body == "quota exhausted")
         );
         assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    // Answers that applied nothing (401, 429, or a refusal marked `x-ursula-not-applied` with a
+    // gateway's vouch) leave the outcome known: when the budget runs out on them, the append is
+    // refused, with the last answer's reason (the marker's token when there is one, cut like a
+    // body, and never the body beside it; an empty marker still marks), and the producer sequence
+    // is free. A marked final answer refuses it at once.
+    #[test]
+    fn refusals_that_applied_nothing_refuse_the_append_when_the_budget_runs_out() {
+        let marked = |status: &str, token: &str, last: &str| {
+            answer(&format!("{status}\r\n{}\r\n{last}", vouched(token)))
+        };
+        let (url, server) = serve(vec![
+            // The token refused to the end, read again before every attempt.
+            answer("401 Unauthorized\r\nretry-after: 0"),
+            answer_with_body(&format!("401 Unauthorized\r\n{LAST}"), "expired"),
+            // The server under pressure, to the end.
+            marked(
+                "503 Service Unavailable",
+                "RaftLogPressure",
+                "retry-after: 0",
+            ),
+            marked("503 Service Unavailable", "RaftLogPressure", LAST),
+            // Kinds mixed: the last answer names the refusal.
+            marked(
+                "503 Service Unavailable",
+                "AuthorizationUnavailable",
+                "retry-after: 0",
+            ),
+            answer("429 Too Many Requests\r\nretry-after: 0"),
+            answer_with_body(&format!("429 Too Many Requests\r\n{LAST}"), "slow down"),
+            // A marked 429 stays rate limiting, with the marker's token for the body it lacks.
+            marked("429 Too Many Requests", "TenantRateLimited", LAST),
+            // A marked final answer: refused at once. Unmarked: rejected (poisons).
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                vouched("RequestBodyTooLarge")
+            )),
+            answer("413 Payload Too Large"),
+            // A marker without a token, and one with a token too long to show whole.
+            marked("503 Service Unavailable", "", LAST),
+            marked("503 Service Unavailable", &"x".repeat(300), LAST),
+            // A body besides the marker: the reason is the marker's token all the same.
+            answer_with_body(
+                &format!(
+                    "503 Service Unavailable\r\n{}\r\n{LAST}",
+                    vouched("RaftLogPressure")
+                ),
+                "{\"error\":\"RaftLogPressure\"}",
+            ),
+        ]);
+        let unauthorized = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&unauthorized, Append::Refused(WriteRefusal::Unauthorized { body }) if body == "expired")
+        );
+        let pressure = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            &pressure,
+            Append::Refused(WriteRefusal::NotApplied { status: 503, reason }) if reason == "RaftLogPressure"
+        ));
+        let limited = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&limited, Append::Refused(WriteRefusal::RateLimited { body }) if body == "slow down")
+        );
+        let marked_429 = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            &marked_429,
+            Append::Refused(WriteRefusal::RateLimited { body }) if body == "TenantRateLimited"
+        ));
+        let too_large = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            &too_large,
+            Append::Refused(WriteRefusal::NotApplied { status: 413, reason }) if reason == "RequestBodyTooLarge"
+        ));
+        let rejected = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            rejected,
+            Append::Failed(Error::AppendRejected { status: 413, .. })
+        ));
+        let Append::Refused(empty) = append(&url, "i1", "p", b"x", 1, 1) else {
+            panic!("an empty marker does not mark");
+        };
+        assert_eq!(empty.to_string(), "503 (not applied)");
+        assert!(
+            matches!(empty, WriteRefusal::NotApplied { status: 503, .. })
+                && empty.reason().is_none()
+        );
+        let long = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            &long,
+            Append::Refused(WriteRefusal::NotApplied { status: 503, reason }) if *reason == "x".repeat(256)
+        ));
+        let with_body = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            &with_body,
+            Append::Refused(WriteRefusal::NotApplied { status: 503, reason }) if reason == "RaftLogPressure"
+        ));
+        assert_eq!(server.join().unwrap().len(), 13);
+    }
+
+    // A 401, 402, 403 or 429 keeps its own kind, marked or not, with the layer's explanation, or
+    // the marker's token when the answer has no body. Only a 401, 402 or 429 proves anything by its
+    // status: a 502 or a 504 with only the vouch is an unknown outcome, and a 404 with only the
+    // marker a rejection. A snapshot publish decides no producer sequence, so a vouched 413 stays
+    // its status there, and a vouched 402 without a body is refused with the marker's token.
+    #[test]
+    fn refusals_keep_their_kind_and_no_other_status_proves_anything() {
+        let (url, server) = serve(vec![
+            answer(&format!(
+                "401 Unauthorized\r\n{}\r\n{LAST}",
+                vouched("InvalidCredential")
+            )),
+            answer_with_body(
+                &format!("402 Payment Required\r\n{}", vouched("QuotaExhausted")),
+                "quota",
+            ),
+            answer(&format!(
+                "402 Payment Required\r\n{}",
+                vouched("QuotaExhausted")
+            )),
+            answer(&format!("403 Forbidden\r\n{}", vouched("Forbidden"))),
+            answer(&format!(
+                "429 Too Many Requests\r\n{}\r\n{LAST}",
+                vouched("TenantRateLimited")
+            )),
+            answer(&format!("502 Bad Gateway\r\n{VOUCH}\r\n{LAST}")),
+            answer(&format!("504 Gateway Timeout\r\n{VOUCH}\r\n{LAST}")),
+            answer(&format!("404 Not Found\r\n{}", marker("NotFound"))),
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                vouched("RequestBodyTooLarge")
+            )),
+            answer(&format!(
+                "402 Payment Required\r\n{}",
+                vouched("QuotaExhausted")
+            )),
+        ]);
+        let refused = |expected: WriteRefusal| {
+            let outcome = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(
+                matches!(&outcome, Append::Refused(refusal) if *refusal == expected),
+                "{expected:?}"
+            );
+        };
+        refused(WriteRefusal::Unauthorized {
+            body: "InvalidCredential".into(),
+        });
+        refused(WriteRefusal::PaymentRequired {
+            body: "quota".into(),
+        });
+        refused(WriteRefusal::PaymentRequired {
+            body: "QuotaExhausted".into(),
+        });
+        refused(WriteRefusal::Forbidden {
+            body: "Forbidden".into(),
+        });
+        refused(WriteRefusal::RateLimited {
+            body: "TenantRateLimited".into(),
+        });
+        for status in [502, 504] {
+            let unknown = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(
+                matches!(
+                    unknown,
+                    Append::Failed(Error::AppendUnknown {
+                        attempts: 1,
+                        last: Attempt::Status { status: s, .. }
+                    }) if s == status
+                ),
+                "{status}"
+            );
+        }
+        let rejected = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            rejected,
+            Append::Failed(Error::AppendRejected { status: 404, .. })
+        ));
+        let (status, _) = put_idempotent(&url, "i1", b"x", &|| false).unwrap();
+        assert_eq!(status, 413);
+        let put = put_idempotent(&url, "i1", b"x", &|| false).err().unwrap();
+        assert!(matches!(put, Error::Refused {
+            op: "put",
+            refusal: WriteRefusal::PaymentRequired { ref body },
+            ..
+        } if body == "QuotaExhausted"));
+        assert_eq!(server.join().unwrap().len(), 10);
+    }
+
+    // One attempt whose outcome is unknown (no answer, an unmarked 5xx) and the append may be in
+    // the stream: refusals before or after it prove nothing about it, vouched for or not, so a
+    // budget that runs out fails the append as unknown (or as unauthorized, after a refused token),
+    // and a marked final answer is a rejection.
+    #[test]
+    fn one_unknown_outcome_among_refusals_keeps_the_append_unknown() {
+        let pressure = |last: &str| {
+            answer(&format!(
+                "503 Service Unavailable\r\n{}\r\n{last}",
+                vouched("RaftLogPressure")
+            ))
+        };
+        let (url, server) = serve(vec![
+            // No answer, then refusals to the end.
+            String::new(),
+            pressure(LAST),
+            // Refusals, then an unmarked 503 to the end.
+            pressure("retry-after: 0"),
+            answer(&format!("503 Service Unavailable\r\n{LAST}")),
+            // An unmarked 503, then a refused token to the end.
+            answer("503 Service Unavailable\r\nretry-after: 0"),
+            answer(&format!("401 Unauthorized\r\n{LAST}")),
+            // An unmarked 503, then a marked final answer.
+            answer("503 Service Unavailable\r\nretry-after: 0"),
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                vouched("RequestBodyTooLarge")
+            )),
+        ]);
+        let unknown = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            unknown,
+            Append::Failed(Error::AppendUnknown {
+                attempts: 2,
+                last: Attempt::Status { status: 503, .. }
+            })
+        ));
+        let unknown = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            unknown,
+            Append::Failed(Error::AppendUnknown { attempts: 2, .. })
+        ));
+        let unauthorized = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            unauthorized,
+            Append::Failed(Error::Unauthorized { status: 401, .. })
+        ));
+        let rejected = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            rejected,
+            Append::Failed(Error::AppendRejected { status: 413, .. })
+        ));
+        assert_eq!(server.join().unwrap().len(), 8);
+    }
+
+    // A commit's attempt answered 204, the server's answer to a duplicate, while no earlier attempt
+    // of it can have reached the stream is a duplicate that no attempt of it explains: a commit
+    // refused before it at the same sequence may have been applied after all (`Db::append_commit`
+    // decides). A refused attempt of the same append does not explain it either. A 200 is an
+    // acknowledgement, a 204 after an attempt that may have reached the stream (no answer, or a
+    // 307, marked and vouched for or not: a redirect proves nothing) is that attempt's duplicate,
+    // and a claim's 204 is verified separately. A 307 to the end of the budget leaves the outcome
+    // unknown.
+    #[test]
+    fn a_duplicate_that_no_attempt_explains_is_told_apart() {
+        let pressure = |last: &str| {
+            answer(&format!(
+                "503 Service Unavailable\r\n{}\r\n{last}",
+                vouched("RaftLogPressure")
+            ))
+        };
+        let duplicate = || answer("204 No Content\r\nstream-next-offset: 12");
+        let redirect = |last: &str| {
+            answer(&format!(
+                "307 Temporary Redirect\r\nlocation: /b/s\r\n{}\r\n{last}",
+                vouched("RaftLogPressure")
+            ))
+        };
+        let (url, server) = serve(vec![
+            // Refused to the end, then a duplicate's answer to the next commit at its sequence.
+            pressure(LAST),
+            duplicate(),
+            // Refused to the end, then a fresh append's answer.
+            pressure(LAST),
+            answer("200 OK\r\nstream-next-offset: 12"),
+            // A refused attempt, then a duplicate's answer, within one append.
+            pressure("retry-after: 0"),
+            duplicate(),
+            // No answer, then a duplicate's answer: the lost attempt's.
+            String::new(),
+            duplicate(),
+            // A redirect, marked and vouched for, then a duplicate's answer: the redirected
+            // attempt's.
+            redirect("retry-after: 0"),
+            duplicate(),
+            // The same redirect to the end of the budget.
+            redirect(LAST),
+            // A claim's duplicate.
+            duplicate(),
+        ]);
+        let refused = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(
+            refused,
+            Append::Refused(WriteRefusal::NotApplied { status: 503, .. })
+        ));
+        let unexplained = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(
+            unexplained,
+            Append::UnexplainedDuplicate { next: Some(ref n), attempts: 1 } if n == "12"
+        ));
+        assert!(matches!(
+            append(&url, "i1", "p", b"x", 1, 5),
+            Append::Refused(_)
+        ));
+        let fresh = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(
+            matches!(fresh, Append::Acked { next: Some(ref n), attempts: 1, duplicate: false } if n == "12")
+        );
+        let within = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(within, Append::UnexplainedDuplicate {
+            attempts: 2,
+            ..
+        }));
+        let retried = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(
+            matches!(retried, Append::Acked { next: Some(ref n), attempts: 2, duplicate: true } if n == "12")
+        );
+        let redirected = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(
+            matches!(redirected, Append::Acked { next: Some(ref n), attempts: 2, duplicate: true } if n == "12")
+        );
+        let unknown = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(
+            unknown,
+            Append::Failed(Error::AppendUnknown {
+                attempts: 1,
+                last: Attempt::Status { status: 307, .. }
+            })
+        ));
+        let claim = append(&url, "i1", "p", b"x", 1, 0);
+        assert!(matches!(claim, Append::Acked { attempts: 1, .. }));
+        assert_eq!(server.join().unwrap().len(), 12);
+    }
+
+    // A marker counts only with a gateway's vouch (`applied_nothing`), and the vouch alone proves
+    // nothing: an answer with one of the two headers is read by its status alone. A 503 is then an
+    // unknown outcome, so a budget that runs out on it fails the append as unknown (a poison), and
+    // a 403 or a 413 fails it. A 401, 402 or 429 proves by its status that it applied nothing, with
+    // either header or none (a 429 marked alone is rate limiting). One attempt marked alone among
+    // vouched refusals leaves the append unknown.
+    #[test]
+    fn a_marker_proves_nothing_without_the_vouch() {
+        let unavailable = |headers: &str, last: &str| {
+            answer(&format!("503 Service Unavailable\r\n{headers}\r\n{last}"))
+        };
+        let (url, server) = serve(vec![
+            // The marker alone, and the vouch alone, to the end.
+            unavailable(&marker("RaftLogPressure"), LAST),
+            unavailable(VOUCH, LAST),
+            // A denial and a request too large, each with one of the two headers.
+            answer(&format!("403 Forbidden\r\n{}", marker("Forbidden"))),
+            answer(&format!("403 Forbidden\r\n{VOUCH}")),
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                marker("RequestBodyTooLarge")
+            )),
+            answer(&format!("413 Payload Too Large\r\n{VOUCH}")),
+            // A refused token, a 402 and a 429, marked alone: their status proves it.
+            answer(&format!(
+                "401 Unauthorized\r\n{}\r\n{LAST}",
+                marker("TokenExpired")
+            )),
+            answer_with_body(
+                &format!("402 Payment Required\r\n{}", marker("QuotaExhausted")),
+                "quota",
+            ),
+            answer_with_body(
+                &format!(
+                    "429 Too Many Requests\r\n{}\r\n{LAST}",
+                    marker("TenantRateLimited")
+                ),
+                "slow down",
+            ),
+            // Vouched refusals around one marked alone.
+            unavailable(&vouched("RaftLogPressure"), "retry-after: 0"),
+            unavailable(&marker("RaftLogPressure"), "retry-after: 0"),
+            unavailable(&vouched("RaftLogPressure"), LAST),
+        ]);
+        for _ in 0..2 {
+            let unknown = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(matches!(
+                unknown,
+                Append::Failed(Error::AppendUnknown {
+                    attempts: 1,
+                    last: Attempt::Status { status: 503, .. }
+                })
+            ));
+        }
+        for _ in 0..2 {
+            let denied = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(matches!(
+                denied,
+                Append::Failed(Error::Unauthorized { status: 403, .. })
+            ));
+        }
+        for _ in 0..2 {
+            let rejected = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(matches!(
+                rejected,
+                Append::Failed(Error::AppendRejected { status: 413, .. })
+            ));
+        }
+        let token = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            token,
+            Append::Refused(WriteRefusal::Unauthorized { .. })
+        ));
+        let payment = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&payment, Append::Refused(WriteRefusal::PaymentRequired { body }) if body == "quota")
+        );
+        let limited = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&limited, Append::Refused(WriteRefusal::RateLimited { body }) if body == "slow down")
+        );
+        let mixed = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            mixed,
+            Append::Failed(Error::AppendUnknown { attempts: 3, .. })
+        ));
+        assert_eq!(server.join().unwrap().len(), 12);
     }
 
     // Redirects are never followed: followed, a request would go out without the token (ureq
@@ -1238,7 +1938,9 @@ mod tests {
         let (status, _) = put_idempotent(&retention, "i1", b"", &|| false).unwrap();
         assert_eq!(status, 204);
         let acked = append(&url, "i1", "p", b"commit", 1, 1);
-        assert!(matches!(acked, Append::Acked { next: Some(ref n), attempts: 3 } if n == "9"));
+        assert!(
+            matches!(acked, Append::Acked { next: Some(ref n), attempts: 3, duplicate: false } if n == "9")
+        );
         let moved = append(&url, "i1", "p", b"commit", 1, 2);
         assert!(matches!(
             moved,
@@ -1434,7 +2136,7 @@ mod tests {
         ]);
         let settled = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
-            matches!(settled, Append::Acked { next: Some(ref n), attempts: 3 } if n == "9"),
+            matches!(settled, Append::Acked { next: Some(ref n), attempts: 3, duplicate: false } if n == "9"),
             "a 402 after a 307 was taken to have applied nothing"
         );
         let unknown = append(&url, "i1", "p", b"x", 1, 2);
@@ -1649,7 +2351,7 @@ mod tests {
         });
         let appended = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
-            matches!(appended, Append::Acked { next: Some(ref n), attempts: 2 } if n == "9"),
+            matches!(appended, Append::Acked { next: Some(ref n), attempts: 2, duplicate: false } if n == "9"),
             "one attempt on the oldest pooled connection, then one on a new connection"
         );
         assert_eq!(

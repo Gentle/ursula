@@ -74,18 +74,22 @@ pub(crate) fn claim_once(
         }
         Append::Fenced { current } => return Ok(Claimed::Fenced(current)),
         Append::Recreated => return Ok(Claimed::Recreated),
-        // A claim has sequence 0 and no `Stream-Seq`: the server answered something else.
-        Append::ProducerExpired | Append::SeqConflict { .. } => {
+        // Answers only a commit gets: a claim has sequence 0 and no `Stream-Seq`, and `append`
+        // tells an unexplained duplicate apart for commits alone (a claim's 2xx is verified
+        // below), so the server answered something else.
+        Append::ProducerExpired
+        | Append::SeqConflict { .. }
+        | Append::UnexplainedDuplicate { .. } => {
             return Err(Error::ClaimAnswer {
                 url: url.to_owned(),
             });
         }
-        // Refused in front of the stream: nothing was claimed.
-        Append::PaymentRequired { body } => {
-            return Err(Error::PaymentRequired {
+        // Refused before it reached the stream: nothing was claimed.
+        Append::Refused(refusal) => {
+            return Err(Error::Refused {
                 op: "claim",
                 url: url.to_owned(),
-                body,
+                refusal,
             });
         }
         Append::Failed(e) => return Err(e),
@@ -183,8 +187,9 @@ pub(crate) fn claim(
 /// owner's older epochs) must be ours (verified) and be the first frame after it. Otherwise
 /// another owner wrote or claimed, and this one is fenced ([`Error::is_fenced`]); so it is when the
 /// stream turns out to be another incarnation (every request here carries ours as a
-/// precondition). A layer in front of the stream that refuses with 402 fails it with
-/// [`Error::PaymentRequired`]: nothing was claimed, and the owner is as it was.
+/// precondition). A re-claim refused before it reached the stream (its read answered 402, or its
+/// claim was refused as `append` describes) fails with [`Error::Refused`]: nothing was claimed,
+/// and the owner is as it was.
 pub(crate) fn reclaim(db: &mut Db) -> Result<(), Error> {
     let (bytes, _) = read_from(&db.url, &db.incarnation, &db.offset)?;
     if !bytes.is_empty() {
@@ -209,10 +214,60 @@ pub(crate) fn reclaim(db: &mut Db) -> Result<(), Error> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::claim;
     use super::find_claim;
+    use crate::client::START;
+    use crate::client::mock::LAST;
+    use crate::client::mock::answer;
+    use crate::client::mock::marker;
+    use crate::client::mock::serve;
+    use crate::client::mock::vouched;
     use crate::error::ClaimScanError;
+    use crate::error::Error;
+    use crate::error::WriteRefusal;
     use crate::frame;
     use crate::frame::PAGE;
+
+    // A claim refused before it reached the stream claimed nothing: the attach fails with the
+    // refusal (`ursula_attach` reports it with a code of its own), and reads nothing back. A 403
+    // that does not prove it (unmarked, or marked without a gateway's vouch) fails it as
+    // unauthorized, and a 503 marked without the vouch is an unknown outcome, as any other failed
+    // claim.
+    #[test]
+    fn a_claim_refused_before_the_stream_claims_nothing() {
+        let (url, server) = serve(vec![
+            answer(&format!("403 Forbidden\r\n{}", vouched("Forbidden"))),
+            answer(&format!(
+                "503 Service Unavailable\r\n{}\r\n{LAST}",
+                vouched("RaftLogPressure")
+            )),
+            answer("403 Forbidden"),
+            answer(&format!("403 Forbidden\r\n{}", marker("Forbidden"))),
+            answer(&format!(
+                "503 Service Unavailable\r\n{}\r\n{LAST}",
+                marker("RaftLogPressure")
+            )),
+        ]);
+        let denied = claim(&url, "i1", "p", 3, START).unwrap_err();
+        assert!(matches!(denied, Error::Refused {
+            op: "claim",
+            refusal: WriteRefusal::Forbidden { .. },
+            ..
+        }));
+        let pressure = claim(&url, "i1", "p", 3, START).unwrap_err();
+        assert!(matches!(pressure, Error::Refused {
+            op: "claim",
+            refusal: WriteRefusal::NotApplied { status: 503, .. },
+            ..
+        }));
+        let unmarked = claim(&url, "i1", "p", 3, START).unwrap_err();
+        assert!(matches!(unmarked, Error::Unauthorized { status: 403, .. }));
+        let unvouched = claim(&url, "i1", "p", 3, START).unwrap_err();
+        assert!(matches!(unvouched, Error::Unauthorized { status: 403, .. }));
+        let unknown = claim(&url, "i1", "p", 3, START).unwrap_err();
+        assert!(matches!(unknown, Error::AppendUnknown { attempts: 1, .. }));
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
 
     // A claim is ours only if it is the frame ending at the answered offset (the bytes read from a
     // frame boundary before it end there), or, when the read ran past that offset (another owner

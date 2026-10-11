@@ -4,9 +4,10 @@
 //! (the data lies below the stream's retention: attach retries from a newer snapshot),
 //! [`Error::is_recreated`] (the stream is another incarnation: attach rebuilds),
 //! [`Error::is_fenced`] (another owner or writer holds the stream: `ursula_status` reports
-//! `fenced`) and [`Error::is_payment_required`] (a layer in front of the stream refused with 402:
-//! the operation fails alone, and `ursula_attach` reports it as SQLITE_AUTH). Every other variant
-//! fails the operation, or poisons the database until it is attached again.
+//! `fenced`) and [`Error::refusal`] (the request was refused before it reached the stream, which
+//! applied nothing of it, see [`WriteRefusal`]: the operation fails alone, and `ursula_attach`
+//! reports it as SQLITE_AUTH for a 402, SQLITE_IOERR_AUTH otherwise). Every other variant fails
+//! the operation, or poisons the database until it is attached again.
 
 use std::ffi::CStr;
 use std::ffi::c_int;
@@ -153,16 +154,15 @@ pub(crate) enum Error {
         url: String,
         status: u16,
     },
-    /// `body` is the layer's explanation, as it sent it (cut short: `client::body_text`).
+    /// Refused before it reached the stream, which applied nothing of it (see [`WriteRefusal`]).
     #[error(
-        "{op} {url}: 402 Payment Required{}: a layer in front of the stream refused it, and \
-         nothing of it reached the stream",
-        with_body(.body)
+        "{op} {url}: {refusal}: a layer in front of the stream refused it, and nothing of it \
+         reached the stream"
     )]
-    PaymentRequired {
+    Refused {
         op: &'static str,
         url: String,
-        body: String,
+        refusal: WriteRefusal,
     },
     #[error("{url} reports no Stream-Incarnation (an older server?); refusing to attach")]
     NoIncarnation { url: String },
@@ -249,6 +249,28 @@ pub(crate) enum Error {
     NotPublished { mx_frame: u32, frame: u32 },
     #[error("append after {offset} acknowledged with next offset {next}, not past it")]
     AckNotPast { offset: String, next: String },
+    /// The commit after one refused as never applied (`Db::refuse`), sent at the sequence the
+    /// refusal left free, was answered as a duplicate that none of its own attempts explains
+    /// (`client::Append::UnexplainedDuplicate`). The stream holds a commit at that sequence that
+    /// the local files lack, and the answer does not tell which: the refused commit, applied after
+    /// all (a layer in front of the stream broke the rule of design doc §2), or this commit, sent
+    /// again by a layer in front of the stream (a gateway that followed a leader redirect sent
+    /// after the leader proposed it). `receipt` is that commit's end in the stream.
+    #[error(
+        "a commit refused as never applied may have been applied after all: the next commit, at \
+         epoch {epoch} seq {seq} after {offset}, was answered as a duplicate (receipt {receipt}), \
+         so the stream holds either the refused commit (a layer in front of the stream refused a \
+         write that the stream applied) or this one (a layer in front of the stream sent it again, \
+         such as a gateway that followed a leader redirect), and the local file holds neither: \
+         attach the database again (the attach replays whichever the stream holds) and check \
+         which one it holds before running either transaction again"
+    )]
+    RefusedCommitApplied {
+        epoch: u64,
+        seq: u64,
+        offset: String,
+        receipt: String,
+    },
     #[error("producer expired again right after a re-claim")]
     ProducerExpiredAgain,
     #[error("local WAL write: {0}")]
@@ -324,6 +346,69 @@ pub(crate) enum Attempt {
     Transport(#[source] Box<ureq::Error>),
 }
 
+/// Why a write was refused before it reached the stream, so that the stream applied nothing of it
+/// (design doc §2): the write fails alone and never poisons a database (`Db::refuse`). A body is
+/// the refusing layer's explanation: its response body (cut short: `client::body_text`), or the
+/// token of a vouched marker when the body is empty (`client::Proof::refusal`).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum WriteRefusal {
+    /// 402 Payment Required: a layer in front of the stream (an authorizer, a quota or billing
+    /// service) refuses writes until something is paid or settled.
+    #[error("402 Payment Required{}", with_body(.body))]
+    PaymentRequired { body: String },
+    /// 401 until the retry budget ran out: an authorizer refused the token, read again before
+    /// every attempt.
+    #[error(
+        "401{}: the endpoint refused this client's credentials until the retry budget ran out \
+         (see URSULA_VFS_TOKEN_FILE and ursula_set_token)",
+        with_body(.body)
+    )]
+    Unauthorized { body: String },
+    /// 403 without `Producer-Epoch`, marked `x-ursula-not-applied` with a gateway's vouch: an
+    /// authorizer denied the write before passing it on (the server's fence names the epoch that
+    /// owns the stream, and any other 403 may have replaced the stream's own answer:
+    /// `client::append`).
+    #[error("403{}: an authorizer denied it", with_body(.body))]
+    Forbidden { body: String },
+    /// 429 until the retry budget ran out, marked or not.
+    #[error("429{}: rate limited until the retry budget ran out", with_body(.body))]
+    RateLimited { body: String },
+    /// A refusal marked `x-ursula-not-applied` (the server's ingress admission, a gateway or a
+    /// proxy refusing it before passing it on) and vouched for by a gateway
+    /// (`x-ursula-not-applied-checked`, see `client::applied_nothing`): a final one, or the last
+    /// one when the retry budget ran out. A 401, 402, 403 or 429 keeps its own kind. `reason` is
+    /// the marker's token (`RaftLogPressure`, say), empty when it has none.
+    #[error("{status} (not applied{})", with_token(.reason))]
+    NotApplied { status: u16, reason: String },
+}
+
+impl WriteRefusal {
+    /// What refused the write, as `ursula_status` reports it (`refused_kind`).
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            WriteRefusal::PaymentRequired { .. } => "payment_required",
+            WriteRefusal::Unauthorized { .. } => "unauthorized",
+            WriteRefusal::Forbidden { .. } => "forbidden",
+            WriteRefusal::RateLimited { .. } => "rate_limited",
+            WriteRefusal::NotApplied { .. } => "not_applied",
+        }
+    }
+
+    /// Why, as `ursula_status` reports it (`refused_reason`): the layer's explanation (its body, or
+    /// the marker's token when the body is empty), and the marker's token for `NotApplied`,
+    /// trimmed; `None` when it sent neither.
+    pub(crate) fn reason(&self) -> Option<&str> {
+        let reason = match self {
+            WriteRefusal::PaymentRequired { body }
+            | WriteRefusal::Unauthorized { body }
+            | WriteRefusal::Forbidden { body }
+            | WriteRefusal::RateLimited { body } => body,
+            WriteRefusal::NotApplied { reason, .. } => reason,
+        };
+        Some(reason.trim()).filter(|reason| !reason.is_empty())
+    }
+}
+
 impl Error {
     /// The data lies below the stream's retention, or a snapshot was superseded: retry from the
     /// stream's latest snapshot.
@@ -343,11 +428,14 @@ impl Error {
         matches!(self, Error::Fenced(_) | Error::Recreated { .. })
     }
 
-    /// A layer in front of the stream (an authorizer, a quota or billing service) refused the
-    /// request with 402 Payment Required, so nothing of it reached the stream: the operation fails
-    /// alone, and never poisons a database (see `Db::refuse`).
-    pub(crate) fn is_payment_required(&self) -> bool {
-        matches!(self, Error::PaymentRequired { .. })
+    /// Why the request was refused before it reached the stream, which applied nothing of it: the
+    /// operation fails alone, and never poisons a database (see `Db::refuse`). `None` for any
+    /// other error.
+    pub(crate) fn refusal(&self) -> Option<&WriteRefusal> {
+        match self {
+            Error::Refused { refusal, .. } => Some(refusal),
+            _ => None,
+        }
     }
 
     /// The local files may hold other pages than this process wrote (a write-back was lost, or
@@ -376,11 +464,22 @@ fn with_body(body: &str) -> String {
     }
 }
 
+/// `: token` for a marker's token, nothing for an empty one.
+fn with_token(token: &str) -> String {
+    let token = token.trim();
+    if token.is_empty() {
+        String::new()
+    } else {
+        format!(": {token}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Error;
     use super::Fence;
     use super::Gone;
+    use super::WriteRefusal;
 
     // Callers act on the class, never on the text: attach retries `Gone`, rebuilds on a recreated
     // stream, and `ursula_status` reports `fenced` for the fence classes only. The texts below are
@@ -430,20 +529,63 @@ mod tests {
             offset: "9".into(),
         };
         assert!(!lost.is_gone() && lost.to_string().contains("lost acknowledged data"));
-        // A 402 in front of the stream is its own class: never a fence, never gone, never damage.
-        let refused = Error::PaymentRequired {
-            op: "claim",
-            url: "http://h/b/s".into(),
+        // A refusal in front of the stream is its own class: never a fence, never gone, never
+        // damage. The 402's text is the one 0.7.1 introduced.
+        let payment = WriteRefusal::PaymentRequired {
             body: "{\"detail\":\"quota exhausted\"}".into(),
         };
-        assert!(refused.is_payment_required());
+        let refused = Error::Refused {
+            op: "claim",
+            url: "http://h/b/s".into(),
+            refusal: payment.clone(),
+        };
+        assert_eq!(refused.refusal(), Some(&payment));
         assert!(!refused.is_fenced() && !refused.is_gone() && !refused.is_local_damage());
         assert_eq!(
             refused.to_string(),
             "claim http://h/b/s: 402 Payment Required {\"detail\":\"quota exhausted\"}: a layer in front \
              of the stream refused it, and nothing of it reached the stream"
         );
-        assert!(!superseded.is_payment_required() && !local.is_payment_required());
+        assert_eq!(superseded.refusal(), None);
+        assert_eq!(local.refusal(), None);
+        let unauthorized = Error::Unauthorized {
+            op: "head",
+            url: "http://h/b/s".into(),
+            status: 401,
+        };
+        assert_eq!(unauthorized.refusal(), None);
+        let pressure = Error::Refused {
+            op: "claim",
+            url: "http://h/b/s".into(),
+            refusal: WriteRefusal::NotApplied {
+                status: 503,
+                reason: "RaftLogPressure".into(),
+            },
+        };
+        assert_eq!(
+            pressure.to_string(),
+            "claim http://h/b/s: 503 (not applied: RaftLogPressure): a layer in front of the \
+             stream refused it, and nothing of it reached the stream"
+        );
+        // The commit after a refused one, answered as a duplicate, poisons: neither a fence nor
+        // damage nor a refusal. The text names both commits the stream may hold.
+        let applied = Error::RefusedCommitApplied {
+            epoch: 2,
+            seq: 5,
+            offset: "9".into(),
+            receipt: "12".into(),
+        };
+        assert!(!applied.is_fenced() && !applied.is_local_damage() && applied.refusal().is_none());
+        assert_eq!(
+            applied.to_string(),
+            "a commit refused as never applied may have been applied after all: the next commit, \
+             at epoch 2 seq 5 after 9, was answered as a duplicate (receipt 12), so the stream \
+             holds either the refused commit (a layer in front of the stream refused a write that \
+             the stream applied) or this one (a layer in front of the stream sent it again, such as \
+             a gateway that followed a leader redirect), and the local file holds neither: attach \
+             the database again (the attach replays whichever the stream holds) and check which \
+             one it holds before running either transaction again"
+        );
         // A redirect the extension does not retry fails the request: never a fence, never gone.
         let redirected = Error::Redirected {
             op: "head",
@@ -452,11 +594,55 @@ mod tests {
             location: Some("https://h/b/s".into()),
         };
         assert!(!redirected.is_fenced() && !redirected.is_gone());
-        assert!(!redirected.is_payment_required() && !redirected.is_recreated());
+        assert!(redirected.refusal().is_none() && !redirected.is_recreated());
         assert_eq!(
             redirected.to_string(),
             "head http://h/b/s: 301 redirect to https://h/b/s: the extension never follows \
              redirects (point the stream URL at the server or gateway itself)"
         );
+    }
+
+    // `ursula_status` reports a refusal's kind (stable names) and its reason: the marker's token or
+    // the layer's explanation, `None` when it sent none.
+    #[test]
+    fn refusal_kinds_and_reasons() {
+        let body = |b: &str| b.to_owned();
+        let cases = [
+            (
+                WriteRefusal::PaymentRequired {
+                    body: body("quota"),
+                },
+                "payment_required",
+                Some("quota"),
+            ),
+            (
+                WriteRefusal::Unauthorized { body: body("") },
+                "unauthorized",
+                None,
+            ),
+            (
+                WriteRefusal::Forbidden {
+                    body: body(" denied \n"),
+                },
+                "forbidden",
+                Some("denied"),
+            ),
+            (
+                WriteRefusal::RateLimited { body: body("slow") },
+                "rate_limited",
+                Some("slow"),
+            ),
+            (
+                WriteRefusal::NotApplied {
+                    status: 503,
+                    reason: body("WalDiskPressure"),
+                },
+                "not_applied",
+                Some("WalDiskPressure"),
+            ),
+        ];
+        for (refusal, kind, reason) in cases {
+            assert_eq!((refusal.kind(), refusal.reason()), (kind, reason));
+        }
     }
 }

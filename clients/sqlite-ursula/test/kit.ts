@@ -7,7 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { expect, inject } from "vitest";
-import type { AttachStatus } from "../src/index.ts";
+import type { AttachStatus, MeterLike, MetricAttributes } from "../src/index.ts";
 
 let counter = 0;
 /** A fresh stream URL on the spawned node (bucket created by the global setup). */
@@ -36,6 +36,27 @@ export function openPlain(file: string): DatabaseSync {
 }
 
 export const integrity = (db: DatabaseSync): string => (db.prepare("PRAGMA integrity_check").get() as { integrity_check: string }).integrity_check;
+
+/** A meter for `instrument()` that keeps what it is given; `observe` runs a gauge's callback and returns what it observed. */
+export function recordingMeter() {
+	const records = new Map<string, number[]>();
+	const callbacks = new Map<string, (result: { observe(value: number, attributes?: MetricAttributes): void }) => void>();
+	const keep = (name: string, value: number) => records.set(name, [...(records.get(name) ?? []), value]);
+	const meter: MeterLike = {
+		createHistogram: (name) => ({ record: (value) => keep(name, value) }),
+		createCounter: (name) => ({ add: (value) => keep(name, value) }),
+		createObservableGauge: (name) => ({
+			addCallback: (callback) => callbacks.set(name, callback),
+			removeCallback: () => callbacks.delete(name),
+		}),
+	};
+	const observe = (name: string): number | undefined => {
+		let seen: number | undefined;
+		callbacks.get(name)?.({ observe: (value) => (seen = value) });
+		return seen;
+	};
+	return { meter, records, callbacks, observe };
+}
 
 /** Every table (FTS shadow tables included) and the schema, rows sorted. */
 export function dump(db: DatabaseSync): Record<string, string[]> {
@@ -72,6 +93,10 @@ export type ChildLine = {
 	payment_required?: boolean;
 	payment_reason?: string | null;
 	read_only?: boolean;
+	/** On `done`: whether the latest write was refused before it reached the stream, what refused it and why. */
+	writes_refused?: boolean;
+	refused_kind?: string | null;
+	refused_reason?: string | null;
 	/** On a `@status` step: `ursula_status`. */
 	status?: AttachStatus;
 	/** On `done`: snapshots published, the latest known snapshot and the retention this owner set. */
@@ -219,10 +244,17 @@ export class StallProxy {
 	}
 }
 
+/** How the gate answers the writes it refuses: `402` without extra headers unless set. */
+export type Refusal = { status?: number; headers?: Record<string, string> };
+
+/** What `gate.mjs` did so far (see {@link Gate.counts}). */
+export type GateCounts = { refused: number; forwarded: number; dropped: number; replaced: number; droppedStatuses: number[]; replacedStatuses: number[] };
+
 /**
- * An HTTP layer in front of the node that refuses writes with `402 Payment Required` on demand, the
- * way an authorizer or a quota or billing service may (`gate.mjs`). It runs in a process of its own,
- * so this process can attach and commit through it synchronously.
+ * An HTTP layer in front of the node that refuses writes on demand (`gate.mjs`), with `402 Payment
+ * Required` by default, the way an authorizer or a quota or billing service may, or with any status
+ * and headers. It runs in a process of its own, so this process can attach and commit through it
+ * synchronously.
  */
 export class Gate {
 	private readonly proc: ChildProcess;
@@ -248,22 +280,37 @@ export class Gate {
 	}
 
 	/**
-	 * Answers writes `402` with `body` from now on, without forwarding them: `limit` of them at most,
-	 * and only those with one of `methods` (POST and PUT by default). `null` forwards them again.
+	 * Answers writes `status` (`402` by default) with `headers` and `body` from now on, without
+	 * forwarding them: `limit` of them at most, and only those with one of `methods` (POST and PUT by
+	 * default). `null` forwards them again.
 	 */
-	async refuse(body: string | null, options: { limit?: number; methods?: string[] } = {}): Promise<void> {
+	async refuse(body: string | null, options: { limit?: number; methods?: string[] } & Refusal = {}): Promise<void> {
 		await this.control({ refuse: body, ...options });
 	}
 
-	/** Forwards the next POST but cuts its answer (its outcome stays unknown to the client), then refuses the next `limit` writes with `402` and `body`. */
-	async dropNextPostThenRefuse(body: string, limit: number): Promise<void> {
-		await this.control({ dropNextPost: { refuse: body, limit } });
+	/** Forwards the next POST but cuts its answer (its outcome stays unknown to the client), then refuses the next `limit` writes with `body` (and `refusal`'s status and headers, see `refuse`). */
+	async dropNextPostThenRefuse(body: string, limit: number, refusal: Refusal = {}): Promise<void> {
+		await this.control({ dropNextPost: { refuse: body, limit, ...refusal } });
 	}
 
-	/** Requests refused, forwarded and forwarded with their answer cut, so far. */
-	async counts(): Promise<{ refused: number; forwarded: number; dropped: number }> {
+	/**
+	 * Forwards the next POST and answers it with `body` (and `refusal`'s status and headers, see `refuse`)
+	 * in place of the node's answer, then refuses the next `limit` writes the same way. It breaks the rule
+	 * for refusals: the client is told that a write the stream applied was not applied.
+	 */
+	async forwardNextPostThenRefuse(body: string, limit: number, refusal: Refusal = {}): Promise<void> {
+		await this.control({ forwardNextPost: { refuse: body, limit, ...refusal } });
+	}
+
+	/** Forwards every request again, and drops an armed `dropNextPostThenRefuse` or `forwardNextPostThenRefuse`. */
+	async reset(): Promise<void> {
+		await this.control({ refuse: null, dropNextPost: null, forwardNextPost: null });
+	}
+
+	/** Requests refused, forwarded, forwarded with their answer cut, and forwarded with their answer replaced by a refusal, so far, and the node's status for each answer cut or replaced, in order. */
+	async counts(): Promise<GateCounts> {
 		const r = await fetch(`${this.url}/__gate`);
-		return (await r.json()) as { refused: number; forwarded: number; dropped: number };
+		return (await r.json()) as GateCounts;
 	}
 
 	private async control(body: object): Promise<void> {

@@ -249,7 +249,8 @@ commit alone, as a refused commit does (§2). Reads in
 recovery use `consistency=leader` (a follower may lag an acknowledged append). Catch-up reads,
 `HEAD` and snapshot `GET`s retry `429`, `503` (a leader that could not confirm its leadership in
 time) and a `307` (§2) like appends: no sooner than `Retry-After`, with backoff, within
-`URSULA_VFS_RETRY_MS`. The snapshot thread's retries also end at its stop flag. A redirect that
+`URSULA_VFS_RETRY_MS`. So is a read that got no answer (its connection reset or closed under it,
+or a timeout), sent again on a new connection (§7). A refused connection fails it at once. The snapshot thread's retries also end at its stop flag. A redirect that
 lasts the whole budget fails the read with its status, so attach never takes it for a missing
 stream (a `404`) or a superseded snapshot.
 

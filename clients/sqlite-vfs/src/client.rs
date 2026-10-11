@@ -152,10 +152,12 @@ fn prepared<B>(req: ureq::RequestBuilder<B>, resend: Resend) -> ureq::RequestBui
 }
 
 /// A request that got no answer for a reason another attempt on a new connection may not meet:
-/// the connection was reset, aborted or closed under it, or timed out (a pooled connection closed
-/// as the request went out, or dropped by a device without telling either end, a server
-/// restarting), or the answer came broken. Not a refused connection (nothing listens there), a
-/// failed TLS handshake (`InvalidData`), nor anything about the request or the setup.
+/// the connection was reset, aborted or closed under it (a server closing it mid-answer included,
+/// an early EOF), the request timed out (a pooled connection closed as the request went out, or
+/// dropped by a device without telling either end), or a signal interrupted it. Not a refused
+/// connection (nothing listens there, so a server still restarting fails the read), a failed TLS
+/// handshake (`InvalidData`), a protocol error (an answer that is not HTTP/1, such as from a gRPC
+/// port, is the same every time), nor anything about the request or the setup.
 fn no_answer(e: &ureq::Error) -> bool {
     match e {
         ureq::Error::Io(e) => matches!(
@@ -165,8 +167,9 @@ fn no_answer(e: &ureq::Error) -> bool {
                 | std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::UnexpectedEof
                 | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::Interrupted
         ),
-        ureq::Error::Timeout(_) | ureq::Error::Protocol(_) => true,
+        ureq::Error::Timeout(_) => true,
         _ => false,
     }
 }
@@ -902,6 +905,7 @@ mod tests {
     use std::net::TcpListener;
     use std::net::TcpStream;
     use std::sync::Arc;
+    use std::sync::Barrier;
     use std::sync::Mutex;
     use std::sync::PoisonError;
     use std::sync::atomic::AtomicUsize;
@@ -1519,7 +1523,7 @@ mod tests {
 
     // A connection idle for less than the agent's idle age carries the next request, and one idle
     // for longer is closed and replaced. 2 s here, well below ureq's 15 s, to keep the test short
-    // (`agents_keep_idle_connections_for_90_s` pins the agents' age).
+    // (`agents_keep_idle_connections_for_90_s_and_15_s` pins the agents' age).
     #[test]
     fn connections_are_reused_until_their_idle_age() {
         let (url, server) = serve_pooled(vec![(KEPT, None), (KEPT, None), (KEPT, None)]);
@@ -1534,15 +1538,18 @@ mod tests {
     }
 
     // ureq reads a pooled connection's socket before it reuses it: one the server closed while it
-    // sat idle is dropped, and the request goes out on a new connection instead of failing (a
-    // `HEAD` gets no retry after a transport error).
+    // sat idle is dropped, and the request goes out on a new connection instead of failing. Sent
+    // with a bare agent, without the retries here, so a request on the closed connection would
+    // fail.
     #[test]
     fn a_connection_closed_while_idle_is_not_reused() {
         let (url, server) =
             serve_pooled(vec![(KEPT, Some(Duration::from_millis(100))), (KEPT, None)]);
-        head(&url, &|| false).unwrap();
+        let agent = new_agent(Duration::from_secs(10), Duration::from_secs(90));
+        let head = || agent.head(url.as_str()).call().unwrap().status().as_u16();
+        assert_eq!(head(), 200);
         std::thread::sleep(Duration::from_millis(300));
-        head(&url, &|| false).unwrap();
+        assert_eq!(head(), 200);
         assert_eq!(server.join().unwrap(), [1, 2]);
     }
 
@@ -1568,31 +1575,29 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
-    // A device that drops idle connections without telling either end leaves every pooled
-    // connection to the host dead (here they take a request and close without an answer). After
-    // the first attempt, on the oldest one, gets no answer, the next one goes out on a new
-    // connection and the other stale one is dropped, instead of trying each pooled connection in
-    // turn: where nothing answers, each would cost the whole timeout, and three the whole budget.
-    #[test]
-    fn an_attempt_after_no_answer_goes_out_on_a_new_connection() {
+    /// A server whose connections answer every request (200 ms later, so that two requests sent at
+    /// once take two connections), until `dead` passes their number: from then on they take a
+    /// request and close without an answer, as connections a device dropped without telling either
+    /// end. Returns the URL, `dead`, and the connections accepted and requests received so far.
+    fn serve_until_dead() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/b/s", listener.local_addr().unwrap());
-        // Connections numbered below `dead` close at their next request without an answer.
         let dead = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
         {
-            let (dead, accepted) = (dead.clone(), accepted.clone());
+            let (dead, accepted, requests) = (dead.clone(), accepted.clone(), requests.clone());
             std::thread::spawn(move || {
                 for conn in listener.incoming() {
                     let mut conn = conn.unwrap();
                     let n = accepted.fetch_add(1, Ordering::SeqCst);
-                    let dead = dead.clone();
+                    let (dead, requests) = (dead.clone(), requests.clone());
                     std::thread::spawn(move || {
                         while read_request(&mut conn) {
+                            requests.fetch_add(1, Ordering::SeqCst);
                             if n < dead.load(Ordering::SeqCst) {
                                 return;
                             }
-                            // Both first requests are in flight at once: two connections.
                             std::thread::sleep(Duration::from_millis(200));
                             let ok = "HTTP/1.1 200 OK\r\nstream-incarnation: i1\r\n\
                                       stream-next-offset: 9\r\ncontent-length: 0\r\n\r\n";
@@ -1602,25 +1607,103 @@ mod tests {
                 }
             });
         }
-        let reads: Vec<_> = (0..2)
+        (url, dead, accepted, requests)
+    }
+
+    /// Two connections to a `serve_until_dead` server pooled by the agent `open` sends with (two
+    /// requests sent at once), idle past `RETRY_IDLE_AGE` and dead. Returns the URL, and the
+    /// connections accepted and requests received from then on (the count of connections goes on).
+    fn two_dead_pooled_connections(open: fn(&str)) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (url, dead, accepted, requests) = serve_until_dead();
+        let start = Arc::new(Barrier::new(2));
+        let sends: Vec<_> = (0..2)
             .map(|_| {
-                let url = url.clone();
-                std::thread::spawn(move || head(&url, &|| false).unwrap())
+                let (url, start) = (url.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    open(&url);
+                })
             })
             .collect();
-        for read in reads {
-            read.join().unwrap();
+        for send in sends {
+            send.join().unwrap();
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
-        // Both pooled connections idle past the age an attempt after no answer accepts, and dead.
         std::thread::sleep(Duration::from_millis(1_200));
         dead.store(2, Ordering::SeqCst);
+        requests.store(0, Ordering::SeqCst);
+        (url, accepted, requests)
+    }
+
+    // A device that drops idle connections without telling either end leaves every pooled
+    // connection to the host dead (here they take a request and close without an answer). After
+    // the first attempt, on the oldest one, gets no answer, the next one goes out on a new
+    // connection and the other stale one is dropped, instead of trying each pooled connection in
+    // turn: where nothing answers, each would cost the whole timeout, and three the whole budget.
+    // So the next append goes out on the new connection at once: ureq drops a pooled connection too
+    // old for a request (3.4.2 does, although its docs say it keeps it), which this pins.
+    #[test]
+    fn an_append_after_no_answer_goes_out_on_a_new_connection() {
+        let (url, accepted, requests) = two_dead_pooled_connections(|url| {
+            head(url, &|| false).unwrap();
+        });
         let appended = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
             matches!(appended, Append::Acked { next: Some(ref n), attempts: 2 } if n == "9"),
             "one attempt on the oldest pooled connection, then one on a new connection"
         );
-        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            (
+                accepted.load(Ordering::SeqCst),
+                requests.load(Ordering::SeqCst)
+            ),
+            (3, 2)
+        );
+        let next = append(&url, "i1", "p", b"x", 1, 2);
+        assert!(matches!(next, Append::Acked { attempts: 1, .. }));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "the stale connection is gone"
+        );
+    }
+
+    // The same for a read: attach's first `HEAD` and its catch-up reads would otherwise try each
+    // dead pooled connection in turn.
+    #[test]
+    fn a_read_after_no_answer_goes_out_on_a_new_connection() {
+        let (url, accepted, requests) = two_dead_pooled_connections(|url| {
+            head(url, &|| false).unwrap();
+        });
+        assert_eq!(
+            head(&url, &|| false).unwrap().incarnation.as_deref(),
+            Some("i1")
+        );
+        assert_eq!(
+            (
+                accepted.load(Ordering::SeqCst),
+                requests.load(Ordering::SeqCst)
+            ),
+            (3, 2)
+        );
+    }
+
+    // The same for a snapshot `PUT` or a retention move, on the snapshot agent's own pool.
+    #[test]
+    fn a_put_after_no_answer_goes_out_on_a_new_connection() {
+        let put = |url: &str| {
+            let retention = format!("{url}/retention/7");
+            put_idempotent(&retention, "i1", b"", &|| false).unwrap();
+        };
+        let (url, accepted, requests) = two_dead_pooled_connections(put);
+        put(&url);
+        assert_eq!(
+            (
+                accepted.load(Ordering::SeqCst),
+                requests.load(Ordering::SeqCst)
+            ),
+            (3, 2)
+        );
     }
 
     /// Reads a request (its head, and a body of its `content-length`): false when the client

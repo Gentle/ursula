@@ -6,6 +6,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -732,13 +733,22 @@ impl LeadershipShed {
         for group_id in &due {
             self.stranded_reported.insert(*group_id, now);
         }
+        let peers = |nodes: &HashSet<u64>| -> BTreeSet<u64> {
+            nodes
+                .iter()
+                .copied()
+                .filter(|node| *node != self.node_id)
+                .collect()
+        };
         tracing::warn!(
             reason = %self.reason,
             node_id = self.node_id,
             groups = ?due,
-            ?targets,
-            "leadership-shed: no peer can take over these leaderships now, because none may \
-             campaign or the handoff check refused each; they stay pending"
+            may_take_first_handoff = ?peers(&targets.first),
+            may_take_retry = ?peers(&targets.retry),
+            "leadership-shed: no peer can take over these leaderships now, because each peer \
+             answered that it may not campaign, did not answer, or failed the handoff check; \
+             they stay pending"
         );
     }
 }

@@ -4,9 +4,10 @@
 //!
 //! Raft leadership redirects (marked by `x-ursula-raft-leader-id`) are followed
 //! internally by the gateway after buffering the request body, so a client
-//! never gets one: up to three in a row, within 5 s of the request's first
-//! hop. A redirect to an address that is not one of the upstreams sends the
-//! request to an upstream it has not reached yet instead. When no upstream
+//! never gets one: up to three hops after the first, none starting later than
+//! 5 s after the first redirect. A redirect to an address that is not one of
+//! the upstreams, or to an upstream the request already went to, sends the
+//! request to an upstream it has not tried yet instead. When no upstream
 //! answers without redirecting within those limits, the client gets a
 //! retryable `503`. This keeps internal node addresses from clients, and SSE
 //! live reads from looping when the first upstream is a follower. Other
@@ -142,8 +143,10 @@ struct GatewayMetricsSnapshot {
     /// Raft leader redirects followed, each hop counted.
     leader_redirects: u64,
     leader_redirect_ns: u64,
-    /// Hops to an upstream the request had not reached, after a redirect
-    /// whose `Location` is not one of the upstreams.
+    /// Search hops: hops to an upstream the request had not tried, which no
+    /// redirect named. They follow a redirect whose `Location` names no
+    /// upstream or one the request already went to, and a search hop that
+    /// could not connect.
     leader_searches: u64,
     /// Requests answered `503` because no upstream answered without
     /// redirecting within the redirect limits.
@@ -526,10 +529,10 @@ impl Gateway {
     /// of its answers (see [`Chain`]), so that a client never gets one.
     ///
     /// - A redirect sends the request to the upstream its `Location` names,
-    ///   unless the request reached that upstream already in this chain.
+    ///   unless the request already went to that upstream in this chain.
     /// - Otherwise, and when the `Location` names no upstream (`--upstream`
     ///   names the nodes otherwise than their peer URLs), the request goes to
-    ///   an upstream it has not reached yet, the next after the one that
+    ///   an upstream it has not tried yet, the next after the one that
     ///   redirected in the configured order. Such a search hop that cannot
     ///   connect sent nothing, so the search goes on to the next one.
     /// - At most [`MAX_LEADER_REDIRECTS`] hops follow redirects, and none
@@ -570,7 +573,7 @@ impl Gateway {
                 Err(error) => {
                     self.upstream_failed(pin_key.as_deref(), &target, &error);
                     // A search hop that could not connect sent nothing: look
-                    // on among the upstreams the request has not reached.
+                    // on among the upstreams the request has not tried.
                     if chain.searching
                         && matches!(error, GatewayError::LeaderUnreachable { .. })
                         && let Some(next) = chain
@@ -627,8 +630,8 @@ impl Gateway {
 
     /// Where a request goes after a redirect from the hop under way, and
     /// whether that is a search hop. `named` is the upstream the redirect's
-    /// `Location` names. It goes there unless the request reached it already,
-    /// else to an upstream it has not reached ([`Gateway::untried_upstream`]),
+    /// `Location` names. It goes there unless the request already went to it,
+    /// else to an upstream it has not tried ([`Gateway::untried_upstream`]),
     /// else back to `named`. `None` when there is nowhere to go.
     fn next_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, bool)> {
         match named {
@@ -701,7 +704,7 @@ impl Gateway {
     }
 
     /// The next upstream after the hop under way, in the configured order and
-    /// around, that the request has not reached yet and that selection does
+    /// around, that the request has not tried yet and that selection does
     /// not skip (see `ejection`). One whose ejection window has expired becomes
     /// this request's probe. Where the gateway looks for the leader after a
     /// redirect it cannot follow. Starting after the redirecting upstream
@@ -1045,10 +1048,10 @@ enum Hop {
     /// before it.
     First,
     /// An upstream after a Raft redirect: the leader the redirect named, or
-    /// an upstream the request has not reached yet. `applied_nothing`: every
-    /// earlier hop was answered with a redirect marked
-    /// `x-ursula-not-applied`, so no node proposed the request before this
-    /// hop. Otherwise one may have, before it redirected.
+    /// an upstream the request has not tried yet. `applied_nothing`: every
+    /// redirect before this hop was marked `x-ursula-not-applied`, so no node
+    /// proposed the request before it (an earlier hop that could not connect
+    /// sent nothing). Otherwise one may have, before it redirected.
     Followed { applied_nothing: bool },
 }
 
@@ -1550,9 +1553,9 @@ pub enum GatewayError {
         source: reqwest::Error,
     },
     /// No connection to the upstream of a hop after a Raft redirect. The
-    /// request was never sent there. `applied_nothing`: every earlier hop was
-    /// answered with a marked redirect, so no node proposed it. Otherwise a
-    /// node that redirected may have.
+    /// request was never sent there. `applied_nothing`: every redirect before
+    /// it was marked, so no node proposed the request (a hop that could not
+    /// connect sent nothing). Otherwise a node that redirected may have.
     #[error("upstream {upstream} is unreachable after a redirect")]
     LeaderUnreachable {
         upstream: String,
@@ -1560,12 +1563,13 @@ pub enum GatewayError {
         source: reqwest::Error,
         applied_nothing: bool,
     },
-    /// Every upstream the request reached redirected it, and the gateway
-    /// stopped following: after [`MAX_LEADER_REDIRECTS`] hops, after
+    /// Every upstream that answered the request redirected it, and the
+    /// gateway stopped following: after [`MAX_LEADER_REDIRECTS`] hops, after
     /// [`LEADER_REDIRECT_DEADLINE`], or with nowhere left to go. `followed`
-    /// counts the redirects it followed. `applied_nothing`: every redirect
-    /// was marked, so no node proposed the request.
-    #[error("no leader found after following {followed} redirects")]
+    /// counts the hops after the first, search hops included.
+    /// `applied_nothing`: every redirect was marked, so no node proposed the
+    /// request.
+    #[error("no leader found after {followed} further hops")]
     LeaderNotFound {
         followed: usize,
         applied_nothing: bool,

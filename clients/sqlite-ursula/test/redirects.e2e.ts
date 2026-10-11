@@ -2,7 +2,7 @@
 // (3 nodes only). This gateway reaches the nodes as `localhost`, while the peer URLs that leader
 // redirects name say `127.0.0.1`, so no redirect names one of its upstreams. A gateway before 0.7.3
 // passed each such redirect on with a path-only Location. From 0.7.3 it looks for the leader among
-// the upstreams it has not reached yet, and answers 503 when it finds none within its limits, so no
+// the upstreams it has not tried yet, and answers 503 when it finds none within its limits, so no
 // redirect reaches the client (#460). Meanwhile a loop hands every group's leadership to the next
 // node, again and again with a short pause, through the nodes' admin API: from before an owner's
 // attach, through its commits and snapshot read-backs, a second host's attach from the snapshot, and

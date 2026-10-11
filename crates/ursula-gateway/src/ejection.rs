@@ -7,7 +7,8 @@
 //! 10 s, doubled for each failure after a window up to 60 s.
 //!
 //! When the window expires, one request probes the upstream: the first one
-//! that selects it, through a cached route or at random. Until that probe
+//! that selects it, through a cached route or at random, or as a search hop
+//! after a leader redirect (`Ejections::claim`). Until that probe
 //! answers or fails, every other request keeps skipping the upstream. A probe
 //! that does neither within the probe deadline (a slow long-poll, say) no
 //! longer holds the others back, and the next request that selects the

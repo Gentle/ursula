@@ -54,7 +54,8 @@ identifies the Raft leader.
   a live node does the same. A node that vanished fails within
   `--upstream-tcp-user-timeout` instead.
 - **Probe.** When a window expires, the next request that selects the
-  upstream, along a cached route or at random, probes it. The other requests
+  upstream, along a cached route, at random, or as a search hop after a
+  leader redirect, probes it. The other requests
   keep skipping the upstream until the probe answers or fails, or for at most
   `--connect-timeout` plus `--upstream-tcp-user-timeout`, after which the
   next request that selects it probes it again. Any response from the
@@ -105,10 +106,10 @@ leader redirects with `x-ursula-raft-leader-id` itself, so a client never gets
 one:
 
 - It sends the request to the upstream that the redirect's `Location` names,
-  unless the request reached that upstream already.
+  unless the request already went to that upstream.
 - Otherwise, and when the `Location` names no upstream because `--upstream`
   names the nodes otherwise than their peer URLs, it searches: it sends the
-  request to the next upstream it has not reached yet, starting after the one
+  request to the next upstream it has not tried yet, starting after the one
   that redirected, in the configured order and around. It skips ejected
   upstreams, and one whose ejection window has expired becomes the request's
   probe. A search hop that cannot connect sent nothing, so the search goes on
@@ -185,8 +186,9 @@ can redirect a write after it proposed it. A node marks only the redirects it
 sends before it proposes a write, so a leader's admission refusal reached
 through such redirects keeps its marker. The gateway's `503` for an upstream
 it could not connect to after redirects, and its `503` when it stops
-following redirects, are marked on the same condition: every node that
-answered refused before proposing, and the last hop sent nothing. The other
+following redirects, are marked only when every redirect was marked. A hop
+that could not connect sent nothing, so it does not count against the
+marker. The other
 answers the gateway gives when an upstream fails carry no marker: the `502`,
 and the `504` for an upstream that sent no response headers in time.
 
@@ -272,7 +274,7 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
     Point it at the node itself, by the node's peer URL where you can. A
     leader redirect names the leader by its peer URL, and the gateway follows
     one that names another address only by trying the upstreams it has not
-    reached yet. A proxy, service-mesh sidecar or another gateway in between
+    tried yet. A proxy, service-mesh sidecar or another gateway in between
     must not resend requests, or the gateway vouches for an
     x-ursula-not-applied marker from a later delivery. Nor may it answer
     401, 402 or 429, for example from a local rate limit: a client counts

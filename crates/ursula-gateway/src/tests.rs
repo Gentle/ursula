@@ -1710,7 +1710,7 @@ async fn a_chain_of_redirects_keeps_the_marker_only_when_every_redirect_carried_
 
 /// A redirect whose `Location` is not one of the upstreams (`--upstream`
 /// names the nodes otherwise than their peer URLs) sends the request to the
-/// next upstream it has not reached, in the configured order, skipping
+/// next upstream it has not tried, in the configured order, skipping
 /// ejected ones. Those hops count for the marker like any other. When none is
 /// left, the client gets a `503`, marked only when every redirect was.
 #[tokio::test]
@@ -1973,7 +1973,7 @@ async fn a_leader_hop_that_times_out_is_unmarked_and_teaches_no_route() {
 }
 
 /// A search hop that cannot connect sent nothing, so the search goes on to
-/// the next upstream the request has not reached, and the one it could not
+/// the next upstream the request has not tried, and the one it could not
 /// connect to is ejected. With none left, the client gets the `503` of that
 /// connect failure, marked only when every redirect was. A search hop whose
 /// upstream read the whole request and closed the connection is a `502`
@@ -2024,6 +2024,167 @@ async fn a_search_hop_that_cannot_connect_searches_on_and_one_that_was_sent_stay
     assert!(request.ends_with("\r\n\r\nabc"), "{request}");
 }
 
+/// Ports nothing listens on, `count` of them and all different: connects to
+/// each are refused.
+async fn refusing_upstreams(count: usize) -> Vec<String> {
+    let mut listeners = Vec::new();
+    for _ in 0..count {
+        listeners.push(
+            tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind"),
+        );
+    }
+    listeners
+        .iter()
+        .map(|listener| format!("http://{}", listener.local_addr().expect("local addr")))
+        .collect()
+}
+
+/// A search hop whose upstream read the whole request and closed the
+/// connection ends the request with a `502` without a marker, even with an
+/// upstream left that the request has not tried: that node may have
+/// proposed the write, and a later node's marked answer would claim that
+/// nothing applied. The upstream after it never gets the request.
+#[tokio::test]
+async fn a_search_hop_that_was_sent_ends_the_request_with_upstreams_left() {
+    let (node, request) = hanging_up_upstream().await;
+    let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
+    a.answers(raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])));
+    leader.answers(refusal(&["RaftLogPressure"]));
+    let gateway = gateway_with(
+        test_config(vec![a.url(), node.url.clone(), leader.url()]),
+        &a,
+    );
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(not_applied(&response), None);
+    assert_eq!(vouch(&response), Some("1"));
+    assert_eq!(leader.hits(), 0);
+    assert_eq!(gateway.metrics_snapshot().leader_searches, 1);
+    assert_eq!(cached_route(&gateway), None);
+    let request = request.await.expect("the upstream read a request");
+    let request = String::from_utf8(request).expect("an ASCII request");
+    assert!(request.ends_with("\r\n\r\nabc"), "{request}");
+}
+
+/// The same for a search hop that sends no response headers in time, on a
+/// paused clock: a `504` without a marker, and the upstream after it never
+/// gets the request. Its timeout ends well before the redirect deadline, so
+/// the deadline does not stop the search instead.
+#[tokio::test(start_paused = true)]
+async fn a_search_hop_that_times_out_ends_the_request_with_upstreams_left() {
+    let _frozen = FrozenClock::hold();
+    let timeout = Duration::from_secs(2);
+    assert!(timeout < LEADER_REDIRECT_DEADLINE);
+    let (silent, mut arrivals) = silent_upstream().await;
+    let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
+    a.answers(raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])));
+    leader.answers(refusal(&["RaftLogPressure"]));
+    let mut config = test_config(vec![a.url(), silent.url.clone(), leader.url()]);
+    config.response_header_timeout = timeout;
+    let gateway = Arc::new(gateway_with(config, &a));
+
+    let mut request = send(&gateway, post_path("/bucket/stream"));
+    until_reached(
+        async {
+            arrivals.recv().await.expect("the upstream is up");
+        },
+        &mut request,
+    )
+    .await;
+    tokio::time::advance(timeout).await;
+    let response = request.await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(not_applied(&response), None);
+    assert_eq!(vouch(&response), Some("1"));
+    assert_eq!(leader.hits(), 0);
+    assert_eq!(gateway.metrics_snapshot().leader_searches, 1);
+    assert_eq!(cached_route(&gateway), None);
+}
+
+/// Search hops that cannot connect count toward the three hops a request
+/// follows: after three of them, the client gets the `503` of the last
+/// connect failure, marked since every redirect was, and the upstream after
+/// them never gets the request.
+#[tokio::test]
+async fn a_search_that_cannot_connect_stops_after_three_hops() {
+    let gone = refusing_upstreams(3).await;
+    let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
+    a.answers(raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])));
+    let mut upstreams = vec![a.url()];
+    upstreams.extend(gone.iter().cloned());
+    upstreams.push(leader.url());
+    let gateway = gateway_with(test_config(upstreams), &a);
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(not_applied(&response), Some("UpstreamUnreachable"));
+    assert_eq!(vouch(&response), Some("1"));
+    assert_eq!(leader.hits(), 0);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(
+        (
+            metrics.leader_redirects,
+            metrics.leader_searches,
+            metrics.upstream_ejections
+        ),
+        (3, 3, 3)
+    );
+}
+
+/// A search hop that could not connect sent nothing, so it leaves the chain
+/// as the redirects left it: after marked redirects, the marked answer of the
+/// upstream the search goes on to keeps its marker.
+#[tokio::test]
+async fn a_search_hop_skipped_for_a_connect_failure_keeps_the_marker() {
+    let gone = refusing_upstream().await;
+    let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
+    a.answers(raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])));
+    leader.answers(refusal(&["RaftLogPressure"]));
+    let gateway = gateway_with(test_config(vec![a.url(), gone, leader.url()]), &a);
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(markers(&response), ["RaftLogPressure"]);
+    assert_eq!(vouch(&response), Some("1"));
+    assert_eq!(leader.hits(), 1);
+    assert_eq!(gateway.metrics_snapshot().leader_searches, 2);
+}
+
+/// An upstream a redirect named that cannot be connected to ends the request,
+/// with the upstream after it left: only a search hop searches on. The client
+/// gets the `503` of the connect failure, marked since every redirect was.
+#[tokio::test]
+async fn a_named_upstream_that_cannot_connect_ends_the_request() {
+    let gone = refusing_upstream().await;
+    let (a, b, c) = (
+        Scripted::spawn().await,
+        Scripted::spawn().await,
+        Scripted::spawn().await,
+    );
+    a.answers(b.redirect_here(&["NotLeader"]));
+    b.answers(raft_redirect(
+        &format!("{gone}/bucket/stream"),
+        marked(&["NotLeader"]),
+    ));
+    let gateway = gateway_with(test_config(vec![a.url(), b.url(), gone, c.url()]), &a);
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(not_applied(&response), Some("UpstreamUnreachable"));
+    assert_eq!(vouch(&response), Some("1"));
+    assert_eq!(c.hits(), 0);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!((metrics.leader_redirects, metrics.leader_searches), (2, 0));
+}
+
 /// A search starts at the upstream after the one that redirected, in the
 /// configured order and around, so that the first search hop of every miss
 /// does not go to the same upstream.
@@ -2044,8 +2205,8 @@ async fn a_search_starts_after_the_upstream_that_redirected() {
     assert_eq!((x.hits(), a.hits(), leader.hits()), (0, 1, 1));
 }
 
-/// A redirect that names an upstream the request reached already sends it
-/// to one it has not reached instead, so that two nodes with stale views do
+/// A redirect that names an upstream the request already went to sends it
+/// to one it has not tried instead, so that two nodes with stale views do
 /// not use the hops up between them.
 #[tokio::test]
 async fn a_redirect_back_to_an_upstream_already_reached_searches_instead() {

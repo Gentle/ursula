@@ -455,9 +455,24 @@ impl ShedDrain {
         }
     }
 
+    /// Records how submitting `handoff` at `now` went. An accepted handoff
+    /// waits `settle` for its leadership to move. A refused one stays queued,
+    /// so the next tick plans it again.
+    pub(crate) fn record<E>(
+        &mut self,
+        handoff: ShedHandoff,
+        outcome: &Result<(), E>,
+        now: Instant,
+        settle: Duration,
+    ) {
+        if outcome.is_ok() {
+            self.submitted(handoff, now.checked_add(settle).unwrap_or(now));
+        }
+    }
+
     /// Records a submitted handoff. Until `settle_by` the group waits for its
     /// leadership to move.
-    pub(crate) fn submitted(&mut self, handoff: ShedHandoff, settle_by: Instant) {
+    fn submitted(&mut self, handoff: ShedHandoff, settle_by: Instant) {
         if let Some(pending) = self.pending.get_mut(&handoff.group_id) {
             *pending = Pending::Submitted {
                 target: handoff.target,
@@ -599,17 +614,14 @@ impl LeadershipShed {
         };
         for handoff in tick.plan.handoffs {
             let group = RaftGroupId(handoff.group_id);
-            match self.registry.transfer_leader(group, handoff.target).await {
+            let outcome = self.registry.transfer_leader(group, handoff.target).await;
+            let settle = self
+                .registry
+                .get(group)
+                .map_or(Duration::ZERO, |raft| raft.handoff_settle_time());
+            self.drain.record(handoff, &outcome, Instant::now(), settle);
+            match outcome {
                 Ok(()) => {
-                    let settle = self
-                        .registry
-                        .get(group)
-                        .map_or(Duration::ZERO, |raft| raft.handoff_settle_time());
-                    let submitted_at = Instant::now();
-                    self.drain.submitted(
-                        handoff,
-                        submitted_at.checked_add(settle).unwrap_or(submitted_at),
-                    );
                     tracing::warn!(
                         reason = %self.reason,
                         node_id = self.node_id,
@@ -769,10 +781,10 @@ mod tests {
         )
     }
 
-    /// Submits every planned handoff at `now`.
+    /// Records every planned handoff as accepted at `now`.
     fn submit_all(drain: &mut ShedDrain, plan: &ShedPlan, now: Instant) {
         for handoff in &plan.handoffs {
-            drain.submitted(*handoff, now.checked_add(SETTLE).expect("deadline"));
+            drain.record(*handoff, &Ok::<(), ()>(()), now, SETTLE);
         }
     }
 
@@ -1127,18 +1139,27 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_submission_stays_queued() {
+    fn a_refused_submission_stays_queued_for_the_next_tick() {
         let snaps = vec![snap(0, Some(ME)), snap(1, Some(ME))];
         let mut drain = ShedDrain::of_groups_led_by(&snaps, ME);
         let start = Instant::now();
 
         let first = tick(&mut drain, &snaps, start, &[]);
         assert_eq!(first.plan.handoffs, vec![handoff(0, 2), handoff(1, 3)]);
-        // Only group 1's transfer was accepted.
-        drain.submitted(handoff(1, 3), at(start, 8));
+        // The registry refuses group 0's transfer and accepts group 1's.
+        drain.record(handoff(0, 2), &Err("refused"), start, SETTLE);
+        drain.record(handoff(1, 3), &Ok::<(), &str>(()), start, SETTLE);
 
         let retry = tick(&mut drain, &snaps, at(start, 1), &[]);
         assert_eq!(retry.plan.handoffs, vec![handoff(0, 2)]);
+        assert!(retry.stalled.is_empty());
+        drain.record(handoff(0, 2), &Ok::<(), &str>(()), at(start, 1), SETTLE);
+
+        // The accepted one waits out its settle time, then stalls.
+        let waiting = tick(&mut drain, &snaps, at(start, 7), &[]);
+        assert_eq!(waiting, DrainTick::default());
+        let stalled = tick(&mut drain, &snaps, at(start, 8), &[]);
+        assert_eq!(stalled.stalled, vec![handoff(1, 3)]);
     }
 
     #[test]

@@ -1465,6 +1465,30 @@ async fn single_node_openraft_group_applies_client_writes() {
     raft.shutdown().await.expect("shutdown raft group");
 }
 
+/// A leader that still leads a group this long after it submitted a
+/// transfer knows the transfer did not move the leadership: the transfer
+/// deadline of two maximum election timeouts, then one minimum election
+/// timeout for a refused step-down to be retried.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_handoff_settles_within_the_transfer_deadline_and_one_minimum_election_timeout() {
+    let config = raft_config("ursula-handoff-settle-time", 300, 700);
+    let (_wal_root, log_store) = fresh_journal_store();
+    let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
+        1,
+        config,
+        SingleNodeRaftNetworkFactory,
+        log_store,
+        RaftGroupStateMachine::new(placement()),
+    )
+    .await
+    .expect("create single-node raft group");
+    let owner = crate::owner::OwnerRaftHandle::new(raft.clone());
+    // 2 x 700 ms + 300 ms.
+    assert_eq!(owner.handoff_settle_time(), Duration::from_millis(1_700));
+    raft.shutdown().await.expect("shutdown raft group");
+}
+
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn three_node_openraft_group_replicates_group_writes() {

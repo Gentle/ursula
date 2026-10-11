@@ -6632,11 +6632,16 @@ mod leadership_shed {
     use ursula_raft::LeadershipShedReason;
     use ursula_raft::RaftGroupHandleRegistry;
     use ursula_raft::snapshot_cadence::SnapshotCadence;
+    use ursula_runtime::AppendRequest;
+    use ursula_runtime::ColdStore;
+    use ursula_runtime::ColdStoreHandle;
+    use ursula_runtime::CreateStreamRequest;
     use ursula_runtime::SnapshotKey;
     use ursula_runtime::SnapshotLocation;
     use ursula_runtime::SnapshotStore;
     use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
+    use ursula_shard::BucketStreamId;
     use ursula_shard::RaftGroupId;
 
     use super::StaticGrpcTestNode;
@@ -6659,6 +6664,12 @@ mod leadership_shed {
     impl Cluster {
         /// Three nodes with [`GROUPS`] groups, every leadership on node 1.
         async fn led_by_node_1() -> Self {
+            Self::led_by_node_1_with(None).await
+        }
+
+        /// [`Self::led_by_node_1`], every node with `cold_store` as its cold
+        /// store.
+        async fn led_by_node_1_with(cold_store: Option<ColdStoreHandle>) -> Self {
             let mut listeners = Vec::new();
             let mut peers = Vec::new();
             for node_id in 1..=3_u64 {
@@ -6679,7 +6690,10 @@ mod leadership_shed {
                         peers.clone(),
                         node_id == 1,
                         usize::try_from(GROUPS).unwrap(),
-                        StaticGrpcTestNodeStorage::default(),
+                        StaticGrpcTestNodeStorage {
+                            cold_store: cold_store.clone(),
+                            ..StaticGrpcTestNodeStorage::default()
+                        },
                     )
                     .await,
                 );
@@ -6695,27 +6709,76 @@ mod leadership_shed {
             for group in 0..GROUPS {
                 cluster.move_leadership_to_node_1(group).await;
             }
-            cluster.wait_until_every_node_may_campaign().await;
+            // Every node's recovery gates open, so each may campaign and take
+            // over leaderships.
+            cluster.wait_until_may_campaign([1, 2, 3]).await;
             cluster
         }
 
-        /// Waits until every node's recovery gates are open, so each may
-        /// campaign and take over leaderships.
-        async fn wait_until_every_node_may_campaign(&self) {
+        /// Waits until node 1 sees exactly `nodes` as the nodes that may
+        /// campaign, and returns them. One answer can come late on a loaded
+        /// host, so a single query is not enough.
+        async fn wait_until_may_campaign(
+            &self,
+            nodes: impl IntoIterator<Item = u64>,
+        ) -> HashSet<u64> {
+            let expected: HashSet<u64> = nodes.into_iter().collect();
             let deadline = deadline(Duration::from_secs(60));
             let participation = self.participation();
             loop {
                 let eligible = participation
                     .campaign_eligible_nodes(&self.node_1().registry)
                     .await;
-                if eligible == HashSet::from([1, 2, 3]) {
-                    return;
+                if eligible == expected {
+                    return eligible;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "only nodes {eligible:?} may campaign"
+                    "only nodes {eligible:?} may campaign, not {expected:?}"
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Each group's term, as node 1 sees it.
+        fn terms(&self) -> BTreeMap<u32, u64> {
+            self.node_1()
+                .registry
+                .metrics_snapshot()
+                .into_iter()
+                .map(|snap| (snap.raft_group_id, snap.current_term))
+                .collect()
+        }
+
+        /// Checks that node 1 hands off nothing for 8 s while no peer may
+        /// campaign. A handoff to a peer that may not campaign is refused
+        /// without a word, and Raft abandons it after its 6 s transfer
+        /// deadline: node 1 then leads the group in a newer term.
+        async fn assert_node_1_hands_nothing_off(&self) {
+            let terms = self.terms();
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            assert_eq!(self.led_by(1), usize::try_from(GROUPS).unwrap());
+            assert_eq!(
+                self.terms(),
+                terms,
+                "a handoff went to a peer that may not campaign"
+            );
+        }
+
+        /// Waits until node 1 is shedding for `reason`.
+        async fn wait_until_node_1_sheds(&self, reason: LeadershipShedReason) {
+            let deadline = deadline(Duration::from_secs(30));
+            while !self
+                .node_1()
+                .registry
+                .leadership_shed_state()
+                .contains(reason.into())
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "node 1 does not shed for {reason}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
 
@@ -6898,6 +6961,13 @@ mod leadership_shed {
             registry: node_1.registry.clone(),
             probes: Mutex::new(Vec::new()),
         });
+        // Both peers drain, so neither may campaign.
+        for node_id in [2, 3] {
+            cluster
+                .node(node_id)
+                .registry
+                .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+        }
         let participation = cluster.participation();
         crate::bootstrap::spawn_snapshot_driver(
             &node_1.runtime,
@@ -6913,6 +6983,15 @@ mod leadership_shed {
             None,
             16,
         );
+        cluster
+            .wait_until_node_1_sheds(LeadershipShedReason::SnapshotDriverS3)
+            .await;
+        cluster.assert_node_1_hands_nothing_off().await;
+        // Once node 3 may campaign, every leadership goes to it.
+        cluster
+            .node(3)
+            .registry
+            .clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
         cluster
             .wait_until_node_1_leads_nothing(Duration::from_secs(60))
             .await;
@@ -6933,9 +7012,7 @@ mod leadership_shed {
                 "more than {PER_TICK} leaderships left per tick: {probes:?}"
             );
         }
-        let (to_2, to_3) = (cluster.led_by(2), cluster.led_by(3));
-        assert_eq!(to_2.saturating_add(to_3), all);
-        assert!(to_2 >= 4 && to_3 >= 4, "node 2 leads {to_2}, node 3 {to_3}");
+        assert_eq!(cluster.led_by(3), all, "only node 3 may campaign");
         cluster.shutdown().await;
     }
 
@@ -6943,7 +7020,6 @@ mod leadership_shed {
     async fn each_step_hands_off_at_most_four_leaderships_to_both_peers() {
         let cluster = Cluster::led_by_node_1().await;
         let node_1 = cluster.node_1();
-        let participation = cluster.participation();
         let mut shed = LeadershipShed::new(
             &node_1.registry,
             LeadershipShedReason::SnapshotDriverS3,
@@ -6956,14 +7032,8 @@ mod leadership_shed {
         let deadline = deadline(Duration::from_secs(60));
         while shed.is_draining() {
             assert!(Instant::now() < deadline, "the drain does not finish");
-            let may_campaign = participation
-                .campaign_eligible_nodes(&node_1.registry)
-                .await;
-            assert_eq!(
-                may_campaign,
-                HashSet::from([2, 3]),
-                "node 1 sheds, and both peers may campaign"
-            );
+            // Node 1 sheds, and both peers may campaign.
+            let may_campaign = cluster.wait_until_may_campaign([2, 3]).await;
             let step = shed.step(&may_campaign, &[]).await;
             assert!(step.submitted.len() <= PER_TICK, "{step:?}");
             for handoff in &step.submitted {
@@ -7035,10 +7105,42 @@ mod leadership_shed {
             .into_iter()
             .map(|snap| (snap.raft_group_id, snap.current_term))
             .collect();
+        let submitting = Instant::now();
         let first = shed.step(&HashSet::from([2, 3]), &[]).await;
         assert_eq!(first.submitted.len(), PER_TICK, "{first:?}");
-        // Raft abandons each transfer and node 1, which its draining peers
-        // still vote for, leads the group again in a newer term.
+        let settle = node_1
+            .registry
+            .get(RaftGroupId(first.submitted[0].group_id))
+            .expect("registered group")
+            .handoff_settle_time();
+
+        // Raft abandons each transfer at its deadline, and node 1, which its
+        // draining peers still vote for, leads the group again. The drain
+        // calls a handoff stalled only once its settle time has passed,
+        // so it does not send a second transfer while Raft may still be
+        // completing the first.
+        let mut stalled: Vec<ShedHandoff> = Vec::new();
+        let stall_deadline = deadline(settle.saturating_add(Duration::from_secs(30)));
+        let mut steps = tokio::time::interval(Duration::from_millis(250));
+        while stalled.len() < first.submitted.len() {
+            assert!(
+                Instant::now() < stall_deadline,
+                "the handoffs never stall: {stalled:?}"
+            );
+            steps.tick().await;
+            let step = shed.step(&HashSet::new(), &[]).await;
+            let stepped = Instant::now();
+            assert!(step.submitted.is_empty(), "{step:?}");
+            if !step.stalled.is_empty() {
+                let since = stepped.saturating_duration_since(submitting);
+                assert!(
+                    since >= settle,
+                    "{:?} stalled {since:?} after submission, before the {settle:?} settle time",
+                    step.stalled
+                );
+            }
+            stalled.extend(step.stalled);
+        }
         for handoff in &first.submitted {
             let raft = node_1
                 .registry
@@ -7060,7 +7162,6 @@ mod leadership_shed {
             .node(2)
             .registry
             .clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
-        let mut stalled: Vec<ShedHandoff> = Vec::new();
         let mut resubmitted: Vec<ShedHandoff> = Vec::new();
         let first_groups: Vec<u32> = first
             .submitted
@@ -7068,14 +7169,13 @@ mod leadership_shed {
             .map(|handoff| handoff.group_id)
             .collect();
         let deadline = deadline(Duration::from_secs(60));
-        let mut ticks = tokio::time::interval(Duration::from_millis(250));
         while shed.is_draining() {
             assert!(
                 Instant::now() < deadline,
                 "the drain does not finish: leaders {:?}",
                 cluster.leaders()
             );
-            ticks.tick().await;
+            steps.tick().await;
             let may_campaign = participation
                 .campaign_eligible_nodes(&node_1.registry)
                 .await;
@@ -7149,15 +7249,9 @@ mod leadership_shed {
                 ..ursula_config::ClusterProbeConfig::default()
             },
         );
-        let deadline = deadline(Duration::from_secs(30));
-        while !node_1
-            .registry
-            .leadership_shed_state()
-            .contains(LeadershipShedReason::ClusterEgress.into())
-        {
-            assert!(Instant::now() < deadline, "the egress gate does not shed");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        cluster
+            .wait_until_node_1_sheds(LeadershipShedReason::ClusterEgress)
+            .await;
         // Every leadership leaves before the next tick, to peers that did
         // not answer whether they may campaign. A gate that handed off a few
         // per tick would keep some on node 1 for another 5 s.
@@ -7166,6 +7260,93 @@ mod leadership_shed {
             .await;
         let (to_2, to_3) = (cluster.led_by(2), cluster.led_by(3));
         assert!(to_2 >= 4 && to_3 >= 4, "node 2 leads {to_2}, node 3 {to_3}");
+        cluster.shutdown().await;
+    }
+
+    /// A stream that `group` holds.
+    fn stream_in_group(node: &StaticGrpcTestNode, group: u32) -> BucketStreamId {
+        (0..10_000)
+            .map(|index| BucketStreamId::new("benchcmp", format!("shed-{index}")))
+            .find(|stream| node.runtime.locate(stream).raft_group_id == RaftGroupId(group))
+            .expect("a stream in the group")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_cold_health_gate_drains_the_hottest_group_first() {
+        const HOT_GROUP: u32 = 7;
+        let cold_store: ColdStoreHandle = Arc::new(ColdStore::memory().expect("memory cold store"));
+        let cluster = Cluster::led_by_node_1_with(Some(cold_store)).await;
+        let node_1 = cluster.node_1();
+        // No flush worker runs, so the bytes stay hot: group 7 holds more
+        // unflushed bytes than any other group, and more than the high
+        // watermark.
+        let stream = stream_in_group(node_1, HOT_GROUP);
+        node_1
+            .runtime
+            .create_stream(CreateStreamRequest::new(
+                stream.clone(),
+                "application/octet-stream",
+            ))
+            .await
+            .expect("create the stream");
+        node_1
+            .runtime
+            .append(AppendRequest::from_bytes(stream, vec![7; 8 * 1024]))
+            .await
+            .expect("append");
+        // Both peers drain, so neither may campaign.
+        for node_id in [2, 3] {
+            cluster
+                .node(node_id)
+                .registry
+                .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+        }
+        // One tick over the high watermark sheds, and the gate ticks every
+        // 4 s.
+        crate::bootstrap::spawn_cold_health_gate(
+            &node_1.runtime,
+            &node_1.registry,
+            &cluster.participation(),
+            &ursula_config::ColdHealthConfig {
+                interval: ursula_config::HumanDuration::sec(4),
+                unhealthy_ticks: 1,
+                hot_size_high: ursula_config::HumanSize::kib(4),
+                hot_size_low: ursula_config::HumanSize::kib(2),
+                ..ursula_config::ColdHealthConfig::default()
+            },
+        );
+        cluster
+            .wait_until_node_1_sheds(LeadershipShedReason::ColdHealth)
+            .await;
+        cluster.assert_node_1_hands_nothing_off().await;
+        // Once node 3 may campaign, the next step hands it four leaderships,
+        // the hottest group among them.
+        cluster
+            .node(3)
+            .registry
+            .clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+        let deadline = deadline(Duration::from_secs(10));
+        while cluster.led_by(3) < PER_TICK {
+            assert!(
+                Instant::now() < deadline,
+                "the first step does not land on node 3: leaders {:?}",
+                cluster.leaders()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let leaders = cluster.leaders();
+        assert_eq!(leaders[&HOT_GROUP], Some(3), "{leaders:?}");
+        assert_eq!(cluster.led_by(3), PER_TICK, "{leaders:?}");
+        assert_eq!(
+            cluster.led_by(1),
+            usize::try_from(GROUPS)
+                .unwrap()
+                .checked_sub(PER_TICK)
+                .unwrap(),
+            "{leaders:?}"
+        );
+        // A cold-health shed keeps the node in elections.
+        assert!(node_1.registry.participation_status().should_campaign);
         cluster.shutdown().await;
     }
 }

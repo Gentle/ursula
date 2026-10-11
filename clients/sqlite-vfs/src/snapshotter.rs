@@ -8,6 +8,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::client::RESENT_UP_TO;
+use crate::client::answers;
+use crate::client::before_connection;
 use crate::client::body_text;
 use crate::client::get_snapshot;
 use crate::client::head;
@@ -145,9 +148,10 @@ const RETRY_MAX: Duration = Duration::from_secs(300);
 /// What a failed snapshot attempt failed on, for the wait before the next one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FailureKind {
-    /// The body is over a size limit in front of the stream: answered 413, or it got no answer
-    /// while larger than any body this owner published. A gateway stops reading a body at its
-    /// limit and closes the connection: the client usually sees a failed write, not the 413.
+    /// The body is over a size limit in front of the stream: answered 413, or a large body failed
+    /// while the stream answers (see [`FailureKind::may_be_size`]). A gateway stops reading a body
+    /// at its limit and closes the connection: the client usually sees a failed write, not the
+    /// 413.
     Size,
     /// No answer, or a 5xx: the server or a layer in front of it is unavailable.
     Outage,
@@ -156,17 +160,42 @@ pub(crate) enum FailureKind {
 }
 
 impl FailureKind {
-    /// What `e` failed on, for an attempt whose body was `body` bytes (`None`: it failed before
-    /// one was built), when the largest body this owner published was `largest_published` bytes.
-    fn of(e: &Error, body: Option<usize>, largest_published: usize) -> FailureKind {
-        match e {
-            Error::SnapshotTooLarge { .. } => FailureKind::Size,
-            Error::PutUnknown {
-                last: Attempt::Transport(_),
-                ..
-            } if body.is_some_and(|bytes| bytes > largest_published) => FailureKind::Size,
-            Error::PutUnknown { .. } | Error::Http { .. } => FailureKind::Outage,
-            Error::Status { status, .. } if *status >= 500 => FailureKind::Outage,
+    /// Whether a failure may be about the body's size, which a probe of the stream then decides
+    /// (`snapshot_loop`). The body, `body` bytes, is over `RESENT_UP_TO` (a smaller one was sent
+    /// again until the retry budget ran out) and larger than any this owner published or
+    /// installed (`largest_published`). And the failure is one a size limit in front of the stream
+    /// causes: no answer after a connection carried the request (a layer that stops reading at
+    /// its limit closes the connection), a 5xx, or a 408. A connection that never opened (a
+    /// refused connection, a host that did not resolve, a failed TLS handshake, a connect timeout)
+    /// says nothing about the body.
+    fn may_be_size(e: &Error, body: Option<usize>, largest_published: usize) -> bool {
+        let large = body.is_some_and(|bytes| bytes > RESENT_UP_TO && bytes > largest_published);
+        large
+            && match e {
+                Error::PutUnknown {
+                    last: Attempt::Transport(e),
+                    ..
+                } => !before_connection(e),
+                Error::PutUnknown {
+                    last: Attempt::Status { status, .. },
+                    ..
+                }
+                | Error::Status { status, .. } => *status >= 500 || *status == 408,
+                _ => false,
+            }
+    }
+
+    /// What `e` failed on. `answered`: for a failure that may be about the size
+    /// ([`FailureKind::may_be_size`]), whether the stream answered a `HEAD` right after it with a
+    /// status below 500 (`client::answers`). Then the layers in front of it pass requests and the
+    /// server is up, and the body is what failed. Otherwise it is an outage.
+    fn of(e: &Error, answered: Option<bool>) -> FailureKind {
+        match (e, answered) {
+            (Error::SnapshotTooLarge { .. }, _) | (_, Some(true)) => FailureKind::Size,
+            (_, Some(false)) | (Error::PutUnknown { .. } | Error::Http { .. }, _) => {
+                FailureKind::Outage
+            }
+            (Error::Status { status, .. }, _) if *status >= 500 => FailureKind::Outage,
             _ => FailureKind::Other,
         }
     }
@@ -226,30 +255,51 @@ impl SnapshotFailing {
     }
 
     /// A commit was acknowledged at `now`: after an outage the stream takes writes again, so the
-    /// next attempt need not wait. Once a run: whether it brought the attempt forward.
+    /// next attempt need not wait out the rest. It moves to a random point within
+    /// `BROUGHT_FORWARD_SPREAD` from now (or before the wait would end), so that the owners an
+    /// outage failed together do not all try again at once. Once a run: whether it brought the
+    /// attempt forward.
     pub(crate) fn commit_acknowledged(&mut self, now: Instant) -> bool {
         if self.kind != FailureKind::Outage || self.brought_forward || now >= self.until {
             return false;
         }
-        self.until = now;
+        let spread = self
+            .until
+            .saturating_duration_since(now)
+            .min(BROUGHT_FORWARD_SPREAD);
+        self.until = now
+            .checked_add(spread.mul_f64(random_fraction()))
+            .unwrap_or(now);
         self.brought_forward = true;
         true
     }
 }
 
+/// How far after the commit that brings it forward an attempt may start (`commit_acknowledged`).
+const BROUGHT_FORWARD_SPREAD: Duration = Duration::from_secs(30);
+
+/// A random number from 0 to 1, from the standard library's randomly keyed hasher: no dependency
+/// for one.
+fn random_fraction() -> f64 {
+    RandomState::new().build_hasher().finish() as f64 / u64::MAX as f64
+}
+
 /// `wait` give or take a fifth.
 fn jittered(wait: Duration) -> Duration {
-    // A random number from the standard library's randomly keyed hasher: no dependency for one.
-    let random = RandomState::new().build_hasher().finish();
-    let fraction = random as f64 / u64::MAX as f64;
-    wait.mul_f64(0.8 + 0.4 * fraction)
+    wait.mul_f64(0.8 + 0.4 * random_fraction())
 }
 
 /// The snapshot health `ursula_status` reports, and the wait before the next attempt, after an
 /// attempt that ended at `now` having taken `taken`: a snapshot at its offset (one published, or
 /// one already there) ends a run of failures, an error extends it (`SnapshotFailing`), and any
 /// other outcome leaves it as it was (nothing was published, nor did anything fail).
-fn record_attempt(d: &mut Db, attempt: &Result<Outcome, Error>, taken: Taken, now: Instant) {
+fn record_attempt(
+    d: &mut Db,
+    attempt: &Result<Outcome, Error>,
+    taken: Taken,
+    answered: Option<bool>,
+    now: Instant,
+) {
     match attempt {
         Ok(Outcome::Published | Outcome::Covered) => d.snapshot_failing = None,
         Ok(
@@ -260,7 +310,7 @@ fn record_attempt(d: &mut Db, attempt: &Result<Outcome, Error>, taken: Taken, no
             | Outcome::Refused,
         ) => {}
         Err(e) => {
-            let kind = FailureKind::of(e, taken.body, d.snapshot_published_bytes);
+            let kind = FailureKind::of(e, answered);
             let first = snapshot_retry().clamp(Duration::from_millis(1), kind.retry_max());
             let (count, wait, brought_forward) = match &d.snapshot_failing {
                 Some(last) => (
@@ -303,10 +353,26 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
         }
         let mut taken = Taken::default();
         let attempt = snapshot_once(db, snapper, &mut taken);
+        // After a failure that may be about the body's size, whether the stream answers a request
+        // without a body (`client::answers`): asked outside the lock.
+        let answered = match &attempt {
+            Err(e) => {
+                let (largest, url) = {
+                    let d = lock(db);
+                    (d.snapshot_published_bytes, d.url.clone())
+                };
+                FailureKind::may_be_size(e, taken.body, largest).then(|| answers(&url))
+            }
+            Ok(_) => None,
+        };
         let (path, url, failing, due) = {
             let mut d = lock(db);
-            record_attempt(&mut d, &attempt, taken, Instant::now());
-            let failing = d.snapshot_failing.as_ref().map(|f| (f.count, f.wait));
+            let now = Instant::now();
+            record_attempt(&mut d, &attempt, taken, answered, now);
+            let failing = d
+                .snapshot_failing
+                .as_ref()
+                .map(|f| (f.count, f.until.saturating_duration_since(now)));
             (d.path.clone(), d.url.clone(), failing, d.snapshot_due())
         };
         match attempt {
@@ -623,6 +689,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
+    use super::BROUGHT_FORWARD_SPREAD;
     use super::FailureKind;
     use super::Outcome;
     use super::RETRY_MAX;
@@ -669,8 +736,8 @@ mod tests {
     fn only_a_snapshot_at_the_offset_ends_a_run_of_failures() {
         let mut d = Db::for_tests();
         let now = Instant::now();
-        record_attempt(&mut d, &failed(), Taken::default(), now);
-        record_attempt(&mut d, &failed(), Taken::default(), now);
+        record_attempt(&mut d, &failed(), Taken::default(), None, now);
+        record_attempt(&mut d, &failed(), Taken::default(), None, now);
         let until = d.snapshot_failing.as_ref().map(|f| (f.count, f.until));
         assert_eq!(until.map(|(count, _)| count), Some(2));
         for outcome in [
@@ -680,45 +747,121 @@ mod tests {
             Outcome::Busy,
             Outcome::Refused,
         ] {
-            record_attempt(&mut d, &Ok(outcome), Taken::default(), now);
+            record_attempt(&mut d, &Ok(outcome), Taken::default(), None, now);
             let failing = d.snapshot_failing.as_ref().map(|f| (f.count, f.until));
             assert_eq!(failing, until, "{outcome:?}");
         }
-        record_attempt(&mut d, &Ok(Outcome::Covered), Taken::default(), now);
+        record_attempt(&mut d, &Ok(Outcome::Covered), Taken::default(), None, now);
         assert!(d.snapshot_failing.is_none());
-        record_attempt(&mut d, &failed(), Taken::default(), now);
-        record_attempt(&mut d, &Ok(Outcome::Published), Taken::default(), now);
+        record_attempt(&mut d, &failed(), Taken::default(), None, now);
+        record_attempt(&mut d, &Ok(Outcome::Published), Taken::default(), None, now);
         assert!(d.snapshot_failing.is_none());
     }
 
-    // A 413 is about the body's size, and so is no answer for a body larger than any this owner
-    // published (a gateway closes the connection on a body over its limit). No answer for a body no
-    // larger, or a 5xx, is an outage. Anything else is neither.
+    /// A body's publish that never got a connection: `e` before anything was sent.
+    fn unconnected(e: ureq::Error) -> Error {
+        Error::PutUnknown {
+            url: "http://h/b/s/snapshot/7".into(),
+            last: Attempt::Transport(Box::new(e)),
+        }
+    }
+
+    // A failure may be about the body's size only for a body over 1 MiB and larger than any this
+    // owner published or installed, when it got no answer after a connection carried it, a 5xx or
+    // a 408. A connection that never opened (refused, a host that did not resolve) says nothing
+    // about the body, and neither does a small body, which was sent again until the budget ran out.
     #[test]
-    fn failures_are_told_apart_by_what_they_failed_on() {
-        let kind = |e: &Error, body: Option<usize>| FailureKind::of(e, body, 1000);
-        assert_eq!(kind(&too_large().unwrap_err(), Some(10)), FailureKind::Size);
-        assert_eq!(kind(&unanswered(), Some(1001)), FailureKind::Size);
-        assert_eq!(kind(&unanswered(), Some(1000)), FailureKind::Outage);
-        assert_eq!(kind(&unanswered(), None), FailureKind::Outage);
-        let answered = Error::PutUnknown {
+    fn a_failure_may_be_about_the_size_only_for_a_large_body_that_went_out() {
+        let large = Some(2 << 20);
+        let may_be_size = |e: &Error, body: Option<usize>, largest: usize| {
+            FailureKind::may_be_size(e, body, largest)
+        };
+        let status = |status| Error::Status {
+            op: "put",
+            url: "u".into(),
+            status,
+            body: String::new(),
+        };
+        let unknown_status = |status| Error::PutUnknown {
             url: "u".into(),
             last: Attempt::Status {
-                status: 503,
+                status,
                 body: String::new(),
             },
         };
-        assert_eq!(kind(&answered, Some(1 << 30)), FailureKind::Outage);
+        assert!(may_be_size(&unanswered(), large, 1000));
+        assert!(may_be_size(&unknown_status(503), large, 1000));
+        assert!(may_be_size(&status(408), large, 1000));
+        assert!(!may_be_size(&status(404), large, 1000));
+        assert!(
+            !may_be_size(&unanswered(), large, 2 << 20),
+            "as large as one published"
+        );
+        assert!(
+            !may_be_size(&unanswered(), Some(1 << 20), 0),
+            "not over 1 MiB"
+        );
+        assert!(
+            !may_be_size(&unanswered(), Some(1000), 0),
+            "small, with no baseline"
+        );
+        assert!(!may_be_size(&unanswered(), None, 0), "no body");
+        for (name, e) in [
+            (
+                "refused",
+                ureq::Error::Io(ErrorKind::ConnectionRefused.into()),
+            ),
+            ("unresolved", ureq::Error::HostNotFound),
+            ("failed", ureq::Error::ConnectionFailed),
+            (
+                "connect timeout",
+                ureq::Error::Timeout(ureq::Timeout::Connect),
+            ),
+        ] {
+            assert!(!may_be_size(&unconnected(e), large, 0), "{name}");
+        }
+        assert!(!may_be_size(&too_large().unwrap_err(), large, 0));
+    }
+
+    // A 413 is about the body's size, and so is a failure that may be (above) when the stream
+    // answers a probe right after it below 500. When it does not, that failure is an outage. Without
+    // a probe, no answer or a 5xx is an outage, and so is a request that failed at the transport.
+    // Anything else is neither.
+    #[test]
+    fn failures_are_told_apart_by_what_they_failed_on() {
+        assert_eq!(
+            FailureKind::of(&too_large().unwrap_err(), None),
+            FailureKind::Size
+        );
+        assert_eq!(
+            FailureKind::of(&unanswered(), Some(true)),
+            FailureKind::Size
+        );
+        assert_eq!(
+            FailureKind::of(&unanswered(), Some(false)),
+            FailureKind::Outage
+        );
+        assert_eq!(FailureKind::of(&unanswered(), None), FailureKind::Outage);
+        let http = Error::Http {
+            op: "put",
+            url: "u".into(),
+            source: Box::new(ureq::Error::ConnectionFailed),
+        };
+        assert_eq!(FailureKind::of(&http, None), FailureKind::Outage);
         let status = |status| Error::Status {
             op: "get snapshot",
             url: "u".into(),
             status,
             body: String::new(),
         };
-        assert_eq!(kind(&status(500), None), FailureKind::Outage);
-        assert_eq!(kind(&status(404), None), FailureKind::Other);
+        assert_eq!(FailureKind::of(&status(500), None), FailureKind::Outage);
         assert_eq!(
-            kind(&failed().unwrap_err(), Some(1 << 30)),
+            FailureKind::of(&status(408), Some(false)),
+            FailureKind::Outage
+        );
+        assert_eq!(FailureKind::of(&status(404), None), FailureKind::Other);
+        assert_eq!(
+            FailureKind::of(&failed().unwrap_err(), None),
             FailureKind::Other
         );
     }
@@ -734,7 +877,7 @@ mod tests {
         let now = Instant::now();
         let mut waits = Vec::new();
         for _ in 0..18 {
-            record_attempt(&mut d, &failed(), took(400, 10), now);
+            record_attempt(&mut d, &failed(), took(400, 10), None, now);
             let failing = d.snapshot_failing.as_ref().unwrap();
             let after = failing.until.duration_since(now);
             assert!(
@@ -753,14 +896,27 @@ mod tests {
         assert_eq!((failing.count, failing.pages), (18, 400));
         assert_eq!(failing.error, "the snapshot at 7 does not read back");
         for _ in 0..4 {
-            record_attempt(&mut d, &too_large(), took(400, 40 << 20), now);
+            record_attempt(&mut d, &too_large(), took(400, 40 << 20), None, now);
         }
         assert_eq!(
             d.snapshot_failing.as_ref().map(|f| f.wait),
             Some(SIZE_RETRY_MAX)
         );
-        record_attempt(&mut d, &Ok(Outcome::Published), Taken::default(), now);
-        record_attempt(&mut d, &failed(), Taken::default(), now);
+        // An outage after failures about the size waits five minutes at most again.
+        record_attempt(&mut d, &Err(unanswered()), took(400, 10), None, now);
+        assert_eq!(d.snapshot_failing.as_ref().map(|f| f.wait), Some(RETRY_MAX));
+        // Outages alone stop at five minutes too.
+        let mut outages = Db::for_tests();
+        for _ in 0..18 {
+            record_attempt(&mut outages, &Err(unanswered()), took(400, 10), None, now);
+        }
+        let failing = outages.snapshot_failing.as_ref().unwrap();
+        assert_eq!(
+            (failing.kind, failing.wait),
+            (FailureKind::Outage, RETRY_MAX)
+        );
+        record_attempt(&mut d, &Ok(Outcome::Published), Taken::default(), None, now);
+        record_attempt(&mut d, &failed(), Taken::default(), None, now);
         let failing = d.snapshot_failing.as_ref().unwrap();
         assert_eq!(
             (failing.count, failing.wait, failing.pages),
@@ -775,7 +931,7 @@ mod tests {
     fn a_failure_holds_the_next_attempt_back_until_its_wait_ends_or_the_database_shrinks() {
         let mut d = Db::for_tests();
         let now = Instant::now();
-        record_attempt(&mut d, &too_large(), took(400, 40 << 20), now);
+        record_attempt(&mut d, &too_large(), took(400, 40 << 20), None, now);
         let failing = d.snapshot_failing.as_ref().unwrap();
         for pages in [400, 401, 4000, 300] {
             assert!(failing.holds_back(pages, now), "{pages}");
@@ -783,7 +939,7 @@ mod tests {
         assert!(!failing.holds_back(299, now));
         assert!(!failing.holds_back(0, now));
         assert!(!failing.holds_back(400, failing.until));
-        record_attempt(&mut d, &too_large(), took(0, 10), now);
+        record_attempt(&mut d, &too_large(), took(0, 10), None, now);
         assert!(d.snapshot_failing.as_ref().unwrap().holds_back(0, now));
     }
 
@@ -795,31 +951,54 @@ mod tests {
         let mut d = Db::for_tests();
         let now = Instant::now();
         let outage = Err(unanswered());
-        record_attempt(&mut d, &outage, Taken::default(), now);
+        record_attempt(&mut d, &outage, Taken::default(), None, now);
         let failing = d.snapshot_failing.as_mut().unwrap();
+        let until = failing.until;
         assert!(failing.commit_acknowledged(now));
-        assert!(!failing.holds_back(0, now));
+        assert!(failing.until >= now && failing.until <= until);
+        assert!(!failing.holds_back(0, failing.until));
         assert!(!failing.commit_acknowledged(now));
         let later = now + Duration::from_secs(1);
-        record_attempt(&mut d, &outage, Taken::default(), later);
+        record_attempt(&mut d, &outage, Taken::default(), None, later);
         let failing = d.snapshot_failing.as_mut().unwrap();
         assert!(!failing.commit_acknowledged(later), "once a run");
         assert!(failing.holds_back(0, later));
         let mut d = Db::for_tests();
-        record_attempt(&mut d, &too_large(), took(400, 40 << 20), now);
+        record_attempt(&mut d, &too_large(), took(400, 40 << 20), None, now);
         assert!(
             !d.snapshot_failing
                 .as_mut()
                 .unwrap()
                 .commit_acknowledged(now)
         );
-        record_attempt(&mut d, &failed(), Taken::default(), now);
+        record_attempt(&mut d, &failed(), Taken::default(), None, now);
         assert!(
             !d.snapshot_failing
                 .as_mut()
                 .unwrap()
                 .commit_acknowledged(now)
         );
+    }
+
+    // A commit brings an attempt that waits long forward to a random point within 30 s, so that
+    // owners an outage failed together do not all try again at the same moment.
+    #[test]
+    fn a_brought_forward_attempt_is_spread_over_30_s() {
+        let now = Instant::now();
+        let mut starts = Vec::new();
+        for _ in 0..100 {
+            let mut d = Db::for_tests();
+            for _ in 0..12 {
+                record_attempt(&mut d, &Err(unanswered()), Taken::default(), None, now);
+            }
+            let failing = d.snapshot_failing.as_mut().unwrap();
+            assert!(failing.until.duration_since(now) > BROUGHT_FORWARD_SPREAD);
+            assert!(failing.commit_acknowledged(now));
+            starts.push(failing.until.duration_since(now));
+        }
+        assert!(starts.iter().all(|start| *start <= BROUGHT_FORWARD_SPREAD));
+        assert!(starts.iter().any(|start| *start < Duration::from_secs(10)));
+        assert!(starts.iter().any(|start| *start > Duration::from_secs(20)));
     }
 
     // The wait is spread over a fifth on each side, so owners that failed together do not try again

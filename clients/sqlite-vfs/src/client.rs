@@ -177,6 +177,43 @@ fn no_answer(e: &ureq::Error) -> bool {
     }
 }
 
+/// A transport failure before any connection carried the request: the host did not resolve, the
+/// connection was refused or failed, the TLS handshake failed, or resolving or connecting (TLS
+/// included) timed out. Nothing of the request was sent.
+pub(crate) fn before_connection(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::Tls(_)
+        | ureq::Error::Rustls(_)
+        | ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => true,
+        ureq::Error::Io(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::InvalidData
+        ),
+        _ => false,
+    }
+}
+
+/// Whether the stream at `url` answers a `HEAD` with a status below 500, in one attempt on a new
+/// connection: the layers in front of the stream pass a request without a body, and the server
+/// behind them is up (a gateway whose servers are down answers 502 or 503). The snapshot thread
+/// asks after a large body failed, to tell a body too large for a layer in front of the stream
+/// from an outage (`snapshotter::FailureKind`).
+pub(crate) fn answers(url: &str) -> bool {
+    let resend = Resend {
+        fresh: true,
+        ..Resend::default()
+    };
+    prepared(agent().head(url), resend)
+        .call()
+        .is_ok_and(|r| r.status().as_u16() < 500)
+}
+
 /// A token went out in clear (`authorized`), and the log said so.
 static IN_CLEAR_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -1005,7 +1042,7 @@ pub(crate) fn get_snapshot(
 const UNKNOWN_SENDS: u32 = 2;
 
 /// The largest body `put_idempotent` sends again until the retry budget runs out, as before 0.7.3.
-const RESENT_UP_TO: usize = 1 << 20;
+pub(crate) const RESENT_UP_TO: usize = 1 << 20;
 
 /// `PUT` to stream incarnation `incarnation` (a 412 when it is not) with retries while the outcome
 /// is unknown (transport errors, 5xx, a 307: `redirect_retried`), no sooner than Retry-After

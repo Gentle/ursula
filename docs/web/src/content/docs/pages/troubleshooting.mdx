@@ -339,18 +339,18 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 
 [Refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing) lists every value. A commit fails with 7178 only when every attempt of it was refused this way. One attempt that got no answer, or a `5xx` without both headers, poisons the file instead, because that attempt may have been applied.
 
-### The file is poisoned because a refused commit was applied
+### The file is poisoned at the commit after a refused one
 
-`status(file)` reports `poisoned: true` with a `reason` that starts with `a commit refused as never applied was applied after all`. A layer in front of the stream answered a commit with a refusal that says nothing was applied (a `401`, `402` or `429`, or a refusal marked `x-ursula-not-applied` with the gateway's vouch) after the stream had applied it. That commit failed with 7178. The next commit went out with the same producer sequence and the stream answered it as the refused commit's duplicate, so the extension poisoned the file instead of acknowledging a commit that never reached the stream.
+`status(file)` reports `poisoned: true` with a `reason` that starts with `a commit refused as never applied may have been applied after all`. A commit failed with 7178, refused with an answer that says nothing was applied (a `401`, `402` or `429`, or a refusal marked `x-ursula-not-applied` with the gateway's vouch). The next commit went out with the same producer sequence, and the stream answered it as a duplicate. So the stream holds a commit at that sequence that the file lacks: either the refused commit, applied after all, or the next commit, sent again by a layer in front of the stream. The answer does not tell which, so the extension poisoned the file instead of acknowledging a commit that may never have reached the stream.
 
-Attach the file again. The attach replays the refused commit, so the database then holds it although its commit failed. Then find the layer that broke the rule in [Writes refused before they reach the stream](/docs/examples/sqlite-vfs#writes-refused-before-they-reach-the-stream):
+Attach the file again. The attach replays whichever commit the stream holds. Check which of the two transactions the database then holds before you run either again. When it holds the refused one, although its commit failed, a layer broke the rule in [Writes refused before they reach the stream](/docs/examples/sqlite-vfs#writes-refused-before-they-reach-the-stream). Find it:
 
 - A proxy or service mesh that retries writes. Istio retries a `503` twice by default, POSTs included. Set `retries: attempts: 0` on the routes that carry stream writes, to the gateway and from the gateway to the servers.
 - A proxy that follows redirects for writes.
 - A layer between `ursula gateway` and the servers that answers `401`, `402` or `429`.
 - A layer that refuses a write after it passed the write on, such as metering that answers `402` after the stream answered.
 
-The same poison can follow a commit that a gateway sent again to a new leader, after the old leader proposed it and redirected the gateway, when a refused commit came just before it. The attach then finds that commit in the stream, and nothing is lost.
+When the database holds the next transaction instead, a gateway sent that commit again to a new leader, after the old leader proposed it and redirected the gateway. No layer broke the rule, and nothing is lost.
 
 ## Still stuck?
 

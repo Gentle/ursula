@@ -148,24 +148,25 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   local file lacks, and the next commit goes out with the producer sequence the refused one used.
   The check in the next item catches most of what slips through.
 - **A false refusal is caught at the next commit.** The server answers a fresh producer append 200
-  and a duplicate 204 with the receipt of the append it duplicates. The next commit after a
-  refused one goes out with the same epoch and sequence, so when the refused commit was applied
-  after all, the server answers it as that commit's duplicate. A 204 to an attempt of a commit
-  while no earlier attempt of it can have reached the stream is a duplicate that none of its
-  attempts explains, and at the sequence a refused commit left free the VFS takes it for that
-  commit. It poisons the database (`reason`: a commit refused as never applied was applied after
-  all) instead of acknowledging a commit whose pages would never reach the stream. The attach that
-  follows replays the refused transaction, so the database then holds it although its commit
-  failed with `SQLITE_IOERR_AUTH`. With this check a false refusal poisons at the next commit
-  instead of diverging, so the vouch makes false refusals rarer but is no longer the only barrier
-  against divergence. Two gaps remain. A 204 after an attempt of the next commit that got no
-  answer, or an answer that proves nothing, is taken for that attempt's own duplicate, as every
-  retry's is, so a false refusal followed by such an attempt still diverges with no error. And an
-  unexplained 204 can be the commit's own: a gateway follows a leader redirect that a server can
-  send after it proposed the write, and the new leader answers the gateway's second exchange as
-  the duplicate of the first. At a sequence no refused commit used, that is the only explanation,
-  so the commit is acknowledged. At the sequence a refused commit left free, that case poisons too,
-  which costs an attach but loses nothing.
+  and a duplicate 204 with the receipt of the append it duplicates. The next commit after a refused
+  one goes out with the same epoch and sequence, so when the refused commit was applied after all,
+  the server answers it as that commit's duplicate. A 204 to an attempt of a commit while no earlier
+  attempt of it can have reached the stream is a duplicate that none of its attempts explains, and
+  at the sequence a refused commit left free the VFS takes it for that commit. It poisons the
+  database (`reason`: a commit refused as never applied may have been applied after all) instead of
+  acknowledging a commit whose pages may never reach the stream. The answer does not tell which of
+  the two commits the stream holds (the second gap below), so the reason names both, and the attach
+  that follows replays whichever it is. When it is the refused transaction, the database then holds
+  it although its commit failed with `SQLITE_IOERR_AUTH`. With this check a false refusal poisons at
+  the next commit instead of diverging, so the vouch makes false refusals rarer but is no longer the
+  only barrier against divergence. Two gaps remain. A 204 after an attempt of the next commit that
+  got no answer, or an answer that proves nothing, is taken for that attempt's own duplicate, as
+  every retry's is, so a false refusal followed by such an attempt still diverges with no error. And
+  an unexplained 204 can be the commit's own: a gateway follows a leader redirect that a server can
+  send after it proposed the write, and the new leader answers the gateway's second exchange as the
+  duplicate of the first. At a sequence no refused commit used, that is the only explanation, so the
+  commit is acknowledged. At the sequence a refused commit left free, that case poisons too, which
+  costs an attach but loses nothing.
 - A 403 without `Producer-Epoch` counts only when it carries both headers. A filtering proxy, such
   as a web application firewall that inspects responses, can answer 403 in place of the stream's
   own answer after the stream applied the write. So any other 403 fails the write and poisons, as
@@ -635,15 +636,15 @@ What attach does in each case:
   succeeds, with no attach (§2). A 403 without both headers poisons. A process that restarts
   meanwhile cannot attach as the owner, because its claim is refused. It attaches read-only to read
   (§3).
-- A proxy or service mesh in front of Ursula that retries writes, or follows redirects for them,
-  can relay a refusal to a retry after an earlier exchange applied the write (§2). A mesh retries
-  by default: Istio retries a 503 twice, POSTs included, unless a route sets `retries: attempts:
-  0`. The next commit is then answered as the refused commit's duplicate, and it poisons with a
-  reason that says so (§2): attach again, and the database holds the refused transaction. If an
-  attempt of that next commit got no answer, or an answer that proves nothing, before the
-  duplicate's answer, the next commit is acknowledged instead and its pages never reach the stream.
-  Turn such retries off for writes, on the routes to the gateway and on those from the gateway to
-  the servers.
+- A proxy or service mesh in front of Ursula that retries writes, or follows redirects for them, can
+  relay a refusal to a retry after an earlier exchange applied the write (§2). A mesh retries by
+  default: Istio retries a 503 twice, POSTs included, unless a route sets `retries: attempts: 0`.
+  The next commit is then answered as the refused commit's duplicate, and it poisons with a reason
+  that names both commits the stream may hold (§2): attach again, and the database holds the refused
+  transaction. If an attempt of that next commit got no answer, or an answer that proves nothing,
+  before the duplicate's answer, the next commit is acknowledged instead and its pages never reach
+  the stream. Turn such retries off for writes, on the routes to the gateway and on those from the
+  gateway to the servers.
 - A layer between the gateway and the servers that answers 401, 402 or 429 is trusted by status
   even after the gateway followed a redirect that carried no marker, since only the marker passes
   the gateway's redirect rule. Ursula's components never answer so there, and such a third-party

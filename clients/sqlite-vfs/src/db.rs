@@ -91,8 +91,8 @@ pub(crate) struct Db {
     pub(crate) refused: Option<WriteRefusal>,
     /// The epoch and producer sequence of the latest commit refused before it reached the stream
     /// (`refuse`), until a commit is acknowledged. The next commit goes out with them, so a
-    /// duplicate's answer to it that none of its own attempts explains is the refused commit's
-    /// receipt: it was applied after all (`append_commit`).
+    /// duplicate's answer to it that none of its own attempts explains may be the refused
+    /// commit's receipt: it may have been applied after all (`append_commit`).
     pub(crate) refused_at: Option<(u64, u64)>,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
     /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame

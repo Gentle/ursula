@@ -174,8 +174,8 @@ it("a refusal for a commit the stream applied is caught at the next commit, whic
 	expect(step(child, 4)?.status).toMatchObject({ poisoned: false, writes_refused: true, refused_kind: "not_applied", refused_reason: "RaftLogPressure" });
 	expect(step(child, 6)).toMatchObject({ ok: false, errcode: POISONED });
 	expect(done).toMatchObject({ poisoned: true, fenced: false, writes_refused: false, refused_kind: null });
-	expect(done.reason).toMatch(/^a commit refused as never applied was applied after all: the next commit, at epoch \d+ seq \d+ after \S+, was answered as its duplicate \(receipt \S+\)/);
-	expect(child.stderr()).toMatch(/event=poisoned file=\S+ stream=\S+ fenced=false reason="a commit refused as never applied was applied after all/);
+	expect(done.reason).toMatch(/^a commit refused as never applied may have been applied after all: the next commit, at epoch \d+ seq \d+ after \S+, was answered as a duplicate \(receipt \S+\), so the stream holds either the refused commit \(.+\) or this one \(.+\), and the local file holds neither: attach the database again/);
+	expect(child.stderr()).toMatch(/event=poisoned file=\S+ stream=\S+ fenced=false reason="a commit refused as never applied may have been applied after all/);
 	// The stream holds the refused transaction, and not the next one.
 	const copy = freshFile();
 	attach(copy, ursulaUrl() + path);

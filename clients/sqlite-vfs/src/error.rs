@@ -251,14 +251,19 @@ pub(crate) enum Error {
     AckNotPast { offset: String, next: String },
     /// The commit after one refused as never applied (`Db::refuse`), sent at the sequence the
     /// refusal left free, was answered as a duplicate that none of its own attempts explains
-    /// (`client::Append::UnexplainedDuplicate`): the refused commit was applied after all, so the
-    /// stream holds it and the local files do not. `receipt` is its end in the stream.
+    /// (`client::Append::UnexplainedDuplicate`). The stream holds a commit at that sequence that
+    /// the local files lack, and the answer does not tell which: the refused commit, applied after
+    /// all (a layer in front of the stream broke the rule of design doc §2), or this commit, sent
+    /// again by a layer in front of the stream (a gateway that followed a leader redirect sent
+    /// after the leader proposed it). `receipt` is that commit's end in the stream.
     #[error(
-        "a commit refused as never applied was applied after all: the next commit, at epoch \
-         {epoch} seq {seq} after {offset}, was answered as its duplicate (receipt {receipt}), so a \
-         layer in front of the stream refused a write that the stream applied; the stream holds the \
-         refused commit and the local file does not: attach the database again (the attach \
-         replays it)"
+        "a commit refused as never applied may have been applied after all: the next commit, at \
+         epoch {epoch} seq {seq} after {offset}, was answered as a duplicate (receipt {receipt}), \
+         so the stream holds either the refused commit (a layer in front of the stream refused a \
+         write that the stream applied) or this one (a layer in front of the stream sent it again, \
+         such as a gateway that followed a leader redirect), and the local file holds neither: \
+         attach the database again (the attach replays whichever the stream holds) and check \
+         which one it holds before running either transaction again"
     )]
     RefusedCommitApplied {
         epoch: u64,
@@ -562,7 +567,8 @@ mod tests {
             "claim http://h/b/s: 503 (not applied: RaftLogPressure): a layer in front of the \
              stream refused it, and nothing of it reached the stream"
         );
-        // A refused commit applied after all poisons: neither a fence nor damage nor a refusal.
+        // The commit after a refused one, answered as a duplicate, poisons: neither a fence nor
+        // damage nor a refusal. The text names both commits the stream may hold.
         let applied = Error::RefusedCommitApplied {
             epoch: 2,
             seq: 5,
@@ -572,10 +578,13 @@ mod tests {
         assert!(!applied.is_fenced() && !applied.is_local_damage() && applied.refusal().is_none());
         assert_eq!(
             applied.to_string(),
-            "a commit refused as never applied was applied after all: the next commit, at epoch 2 \
-             seq 5 after 9, was answered as its duplicate (receipt 12), so a layer in front of the \
-             stream refused a write that the stream applied; the stream holds the refused commit \
-             and the local file does not: attach the database again (the attach replays it)"
+            "a commit refused as never applied may have been applied after all: the next commit, \
+             at epoch 2 seq 5 after 9, was answered as a duplicate (receipt 12), so the stream \
+             holds either the refused commit (a layer in front of the stream refused a write that \
+             the stream applied) or this one (a layer in front of the stream sent it again, such as \
+             a gateway that followed a leader redirect), and the local file holds neither: attach \
+             the database again (the attach replays whichever the stream holds) and check which \
+             one it holds before running either transaction again"
         );
         // A redirect the extension does not retry fails the request: never a fence, never gone.
         let redirected = Error::Redirected {

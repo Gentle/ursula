@@ -262,7 +262,8 @@ impl Db {
     /// returned. Otherwise the database is poisoned, or the commit refused alone when nothing of it
     /// reached the stream (`refuse`), and the code the write fails with is returned. A duplicate's
     /// answer that none of the commit's attempts explains, at the sequence a refused commit left
-    /// free (`refused_at`), poisons: the refused commit was applied after all.
+    /// free (`refused_at`), poisons: the stream holds the refused commit, applied after all, or this
+    /// one, sent again by a layer in front of the stream, and the local files hold neither.
     fn append_commit(&mut self, body: &[u8]) -> Result<u32, c_int> {
         let mut outcome = append(
             &self.url,

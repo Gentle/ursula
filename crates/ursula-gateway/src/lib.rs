@@ -9,6 +9,15 @@
 //! leaking internal node addresses to clients and prevents SSE live reads from
 //! looping when the initial random upstream lands on a follower.
 //!
+//! Every request the gateway refuses before forwarding it (access control,
+//! tenant admission, an oversized body), and a request whose first upstream
+//! it could not connect to, is answered with `x-ursula-not-applied`: no node
+//! received it. A node's `x-ursula-not-applied` passes through, unless the
+//! gateway followed a leader redirect that did not carry it. Every response
+//! carries `x-ursula-not-applied-checked: 1`, the gateway's vouch that it
+//! applied that rule. A client trusts the marker only together with the vouch
+//! (see [`ursula_proto::headers`]).
+//!
 //! Module map:
 //!
 //! - [`auth`]: opt-in, provider-neutral authentication and authorization hooks.
@@ -47,6 +56,8 @@ use percent_encoding::percent_decode_str;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
+use ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER;
+use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
 
@@ -68,6 +79,7 @@ use crate::auth::AccessControl;
 use crate::auth::Action;
 use crate::auth::AuthenticationError;
 use crate::auth::AuthorizationDecision;
+use crate::auth::AuthorizationError;
 use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
@@ -233,7 +245,19 @@ impl Gateway {
         self
     }
 
+    /// Answers one client request. Every response leaves through here, so
+    /// each one carries the gateway's vouch, [`NOT_APPLIED_CHECKED_HEADER`],
+    /// added after the redirect rule decided whether a node's
+    /// [`NOT_APPLIED_HEADER`] stays.
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
+        let mut response = self.handle_with_cors(req).await;
+        response
+            .headers_mut()
+            .insert(NOT_APPLIED_CHECKED_HEADER, HeaderValue::from_static("1"));
+        response
+    }
+
+    async fn handle_with_cors(&self, req: Request<Body>) -> AxumResponse {
         let Some(policy) = self.cors.clone() else {
             return self.handle_inner(req).await;
         };
@@ -261,7 +285,7 @@ impl Gateway {
 
         let context = match self.gate(&parts).await {
             Ok(context) => context,
-            Err(response) => return response,
+            Err(refusal) => return refusal.into_response(),
         };
         if self.access_control.is_some() {
             // The credential terminates at the gateway. Internal Ursula nodes
@@ -273,7 +297,7 @@ impl Gateway {
         if let Some(context) = &context {
             match self.admit(context) {
                 Ok(guard) => live_guard = guard,
-                Err(response) => return response,
+                Err(refusal) => return refusal.into_response(),
             }
         }
 
@@ -281,14 +305,15 @@ impl Gateway {
         {
             Ok(b) => b,
             Err(err) => {
-                if err
+                let refusal = if err
                     .source()
                     .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
                 {
-                    return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                    Refusal::BodyTooLarge
                 } else {
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
+                    Refusal::BodyUnreadable
+                };
+                return refusal.into_response();
             }
         };
         if let Some(max) = context
@@ -296,14 +321,14 @@ impl Gateway {
             .and_then(|ctx| ctx.limits.max_request_body_bytes)
             && body_bytes.len() as u64 > max
         {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            return Refusal::BodyTooLarge.into_response();
         }
 
         let upstream = match self.pick_upstream(&parts.uri) {
             Some(u) => u,
             None => {
                 error!("no upstreams configured");
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                return Refusal::NoUpstream.into_response();
             }
         };
 
@@ -351,24 +376,24 @@ impl Gateway {
     async fn gate(
         &self,
         parts: &axum::http::request::Parts,
-    ) -> Result<Option<RequestContext>, AxumResponse> {
+    ) -> Result<Option<RequestContext>, Refusal> {
         let Some(access_control) = self.access_control.as_ref() else {
             return Ok(None);
         };
         let Some(request) = classify_request(&parts.method, &parts.uri, &parts.headers) else {
             // An access-controlled gateway is a public resource server, not a
             // transparent escape hatch to internal or newly added routes.
-            return Err(StatusCode::NOT_FOUND.into_response());
+            return Err(Refusal::NotFound);
         };
 
         let principal = match bearer_token(&parts.headers) {
             Ok(Some(token)) => match access_control.principal_resolver().resolve(token).await {
                 Ok(principal) => Some(principal),
-                Err(error) => return Err(authentication_error_response(error)),
+                Err(error) => return Err(authentication_refusal(error)),
             },
             Ok(None) => None,
             Err(()) => {
-                return Err(authentication_error_response(
+                return Err(authentication_refusal(
                     AuthenticationError::InvalidCredential,
                 ));
             }
@@ -386,13 +411,11 @@ impl Gateway {
             .await;
         match decision {
             Ok(AuthorizationDecision::Allow) => {}
-            Ok(AuthorizationDecision::Deny) => return Err(StatusCode::FORBIDDEN.into_response()),
-            Ok(AuthorizationDecision::ConcealAsNotFound) => {
-                return Err(StatusCode::NOT_FOUND.into_response());
-            }
+            Ok(AuthorizationDecision::Deny) => return Err(Refusal::Forbidden),
+            Ok(AuthorizationDecision::ConcealAsNotFound) => return Err(Refusal::NotFound),
             Err(error) => {
                 error!(error = %error, "gateway authorization failed");
-                return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+                return Err(Refusal::Authorization(error));
             }
         }
 
@@ -412,25 +435,18 @@ impl Gateway {
     /// Enforces the tenant's admission limits. `Retry-After` accompanies every
     /// retryable rejection; Ursula's own `503` backpressure semantics are
     /// untouched.
-    #[expect(
-        clippy::result_large_err,
-        reason = "the error is the terminal HTTP response, produced at most once per request"
-    )]
-    fn admit(&self, context: &RequestContext) -> Result<Option<LiveReadGuard>, AxumResponse> {
+    fn admit(&self, context: &RequestContext) -> Result<Option<LiveReadGuard>, Refusal> {
         if self.quota_provider.is_none() {
             return Ok(None);
         }
-        if let Err(rejection) = self
-            .admission
+        self.admission
             .admit_request(&context.bucket_id, context.limits)
-        {
-            return Err(admission_rejection_response(rejection));
-        }
+            .map_err(Refusal::Admission)?;
         if context.class == UsageClass::LiveRead {
             return self
                 .admission
                 .admit_live_read(&context.bucket_id, context.limits)
-                .map_err(admission_rejection_response);
+                .map_err(Refusal::Admission);
         }
         Ok(None)
     }
@@ -494,7 +510,7 @@ impl Gateway {
 
         let redirect_started_at = Instant::now();
         let upstream_resp = self
-            .send_request(upstream, &target_url, parts, body.clone())
+            .send_request(Hop::First, upstream, &target_url, parts, body.clone())
             .await
             .inspect_err(|error| self.upstream_failed(pin_key.as_deref(), upstream, error))?;
         self.upstream_answered(upstream);
@@ -515,6 +531,10 @@ impl Gateway {
                 if let Some(key) = pin_key.clone() {
                     self.remember_leader(key, leader_upstream.to_owned());
                 }
+                // A node can redirect after it proposed the write, so the
+                // leader's answer speaks for the whole request only when the
+                // redirect also applied nothing.
+                let redirect_applied_nothing = response_headers.contains_key(NOT_APPLIED_HEADER);
                 // Drop the follower response; it has no meaningful body.
                 drop(upstream_resp);
 
@@ -524,7 +544,13 @@ impl Gateway {
                     path_and_query
                 );
                 let leader_resp = self
-                    .send_request(leader_upstream, &leader_target, parts, body)
+                    .send_request(
+                        Hop::RedirectedLeader,
+                        leader_upstream,
+                        &leader_target,
+                        parts,
+                        body,
+                    )
                     .await
                     .inspect_err(|error| {
                         self.upstream_failed(pin_key.as_deref(), leader_upstream, error);
@@ -534,7 +560,11 @@ impl Gateway {
                     u64::try_from(redirect_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
-                return Self::build_response(leader_resp, tail);
+                let mut response = Self::build_response(leader_resp, tail)?;
+                if !redirect_applied_nothing {
+                    response.headers_mut().remove(NOT_APPLIED_HEADER);
+                }
+                return Ok(response);
             }
         }
 
@@ -557,6 +587,7 @@ impl Gateway {
     /// Covers only response headers so SSE bodies stay open.
     async fn send_request(
         &self,
+        hop: Hop,
         upstream: &str,
         url: &str,
         parts: &axum::http::request::Parts,
@@ -579,16 +610,22 @@ impl Gateway {
             timeout,
         })?
         .map_err(|source| {
-            if source.is_connect() {
-                GatewayError::UpstreamUnreachable {
-                    upstream: upstream.to_owned(),
-                    source,
+            let upstream = upstream.to_owned();
+            // `is_connect` holds only for a failure before the request was
+            // handed to a connection: in the connector (DNS, TCP or TLS
+            // setup, or the connect timeout) or in the pool checkout. So this
+            // attempt wrote nothing of the request. Any later failure, such
+            // as an upstream that read the request and closed the connection
+            // without answering, stays unmarked. Inside one `send`, hyper
+            // retries only a request that a pooled connection gave back
+            // unwritten, and reqwest only one that an HTTP/2 peer refused
+            // unprocessed (`REFUSED_STREAM`, or a graceful `GOAWAY`).
+            match (source.is_connect(), hop) {
+                (true, Hop::First) => GatewayError::UpstreamUnreachable { upstream, source },
+                (true, Hop::RedirectedLeader) => {
+                    GatewayError::LeaderUnreachable { upstream, source }
                 }
-            } else {
-                GatewayError::Upstream {
-                    upstream: upstream.to_owned(),
-                    source,
-                }
+                (false, _) => GatewayError::Upstream { upstream, source },
             }
         })
     }
@@ -848,6 +885,17 @@ fn upstream_pin_key(uri: &Uri, shard_map: Option<&StaticShardMap>) -> Option<Str
     Some(format!("/{stream_id}"))
 }
 
+/// Which exchange of a forwarded request a request to an upstream is.
+#[derive(Clone, Copy, Debug)]
+enum Hop {
+    /// The upstream picked for the request. No node received the request
+    /// before it.
+    First,
+    /// The leader that a node's Raft redirect named. The node that redirected
+    /// may have proposed the request before it redirected.
+    RedirectedLeader,
+}
+
 /// Per-request context available once access control has classified and
 /// authorized the request.
 struct RequestContext {
@@ -880,25 +928,99 @@ fn principal_ref(principal: &VerifiedPrincipal) -> PrincipalRef {
     }
 }
 
-fn admission_rejection_response(rejection: AdmissionRejection) -> AxumResponse {
-    match rejection {
-        AdmissionRejection::RateLimited { retry_after_secs } => {
-            let mut response = (
-                StatusCode::TOO_MANY_REQUESTS,
-                "tenant request rate limit exceeded",
-            )
-                .into_response();
-            if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                response.headers_mut().insert(RETRY_AFTER, value);
-            }
-            response
-        }
-        AdmissionRejection::LiveReadsExhausted => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "tenant live-read connection limit exceeded",
-        )
-            .into_response(),
+/// A request the gateway answered itself, before forwarding it to any
+/// upstream. Nothing of it reached a stream, so every refusal carries
+/// [`NOT_APPLIED_HEADER`] with a token naming it.
+#[derive(Debug)]
+enum Refusal {
+    /// Access control does not serve the route, or the authorizer concealed
+    /// the resource. Both answer the same `404`.
+    NotFound,
+    /// The bearer credential failed verification (`401`), or the verifier is
+    /// unavailable (`503`).
+    Authentication(AuthenticationError),
+    /// The authorizer denied the request (`403`).
+    Forbidden,
+    /// The authorizer could not decide (`503`).
+    Authorization(AuthorizationError),
+    /// A tenant admission limit (`429`).
+    Admission(AdmissionRejection),
+    /// The body is larger than the gateway's or the tenant's limit (`413`).
+    BodyTooLarge,
+    /// The body could not be read (`400`).
+    BodyUnreadable,
+    /// No upstream is configured (`503`).
+    NoUpstream,
+}
+
+impl IntoResponse for Refusal {
+    fn into_response(self) -> AxumResponse {
+        let (mut response, reason) = match self {
+            Self::NotFound => (StatusCode::NOT_FOUND.into_response(), "NotFound"),
+            Self::Authentication(AuthenticationError::Unavailable) => (
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                "AuthenticationUnavailable",
+            ),
+            Self::Authentication(
+                AuthenticationError::InvalidCredential
+                | AuthenticationError::Expired
+                | AuthenticationError::WrongAudience,
+            ) => (
+                (StatusCode::UNAUTHORIZED, [(
+                    WWW_AUTHENTICATE,
+                    HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+                )])
+                    .into_response(),
+                "InvalidCredential",
+            ),
+            Self::Forbidden => (StatusCode::FORBIDDEN.into_response(), "Forbidden"),
+            Self::Authorization(AuthorizationError::Unavailable) => (
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                "AuthorizationUnavailable",
+            ),
+            Self::Admission(AdmissionRejection::RateLimited { retry_after_secs }) => (
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(RETRY_AFTER, HeaderValue::from(retry_after_secs))],
+                    "tenant request rate limit exceeded",
+                )
+                    .into_response(),
+                "TenantRateLimited",
+            ),
+            Self::Admission(AdmissionRejection::LiveReadsExhausted) => (
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "tenant live-read connection limit exceeded",
+                )
+                    .into_response(),
+                "TenantLiveReadsExhausted",
+            ),
+            Self::BodyTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+                "RequestBodyTooLarge",
+            ),
+            Self::BodyUnreadable => (
+                StatusCode::BAD_REQUEST.into_response(),
+                "RequestBodyUnreadable",
+            ),
+            Self::NoUpstream => (
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                "NoUpstream",
+            ),
+        };
+        mark_not_applied(&mut response, reason);
+        response
     }
+}
+
+/// Marks `response` as answering a request that no node received, with
+/// `token` naming why. The only place the gateway sets [`NOT_APPLIED_HEADER`]
+/// itself. A node's marker reaches the client only through the redirect rule
+/// in [`Gateway::forward`].
+fn mark_not_applied(response: &mut AxumResponse, token: &'static str) {
+    response
+        .headers_mut()
+        .insert(NOT_APPLIED_HEADER, HeaderValue::from_static(token));
 }
 
 /// Rides the response body: counts egress bytes and, on drop, records the
@@ -1111,23 +1233,21 @@ fn bearer_token(headers: &HeaderMap) -> Result<Option<&str>, ()> {
     Ok(Some(token))
 }
 
-fn authentication_error_response(error: AuthenticationError) -> AxumResponse {
+fn authentication_refusal(error: AuthenticationError) -> Refusal {
     if error == AuthenticationError::Unavailable {
         error!(error = %error, "gateway authentication failed");
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-
-    let mut response = StatusCode::UNAUTHORIZED.into_response();
-    response.headers_mut().insert(
-        WWW_AUTHENTICATE,
-        HeaderValue::from_static(r#"Bearer error="invalid_token""#),
-    );
-    response
+    Refusal::Authentication(error)
 }
 
 // Copy end-to-end headers while removing hop-by-hop proxy headers. Hop-by-hop
 // headers describe only the current TCP/HTTP connection, so the gateway must
 // let its HTTP client/server stack recreate them for the next connection.
+//
+// The vouch for `x-ursula-not-applied` is dropped too, in both directions. It
+// is this gateway's own statement, added to every response in
+// `Gateway::handle`, so one from an upstream never reaches the redirect rule
+// or the client.
 //
 // Request forwarding also drops Host so the client can set it from the upstream
 // URL. Use append, not insert, so repeated headers such as Set-Cookie survive.
@@ -1136,7 +1256,10 @@ fn copy_forwarded_headers(src: &HeaderMap, drop_host: bool) -> HeaderMap {
     let connection_tokens = connection_header_tokens(src);
     for (key, value) in src {
         let key_str = key.as_str();
-        if (drop_host && key_str == "host") || is_hop_by_hop_header(key_str, &connection_tokens) {
+        if (drop_host && key_str == "host")
+            || key_str == NOT_APPLIED_CHECKED_HEADER
+            || is_hop_by_hop_header(key_str, &connection_tokens)
+        {
             continue;
         }
         dst.append(key.clone(), value.clone());
@@ -1185,9 +1308,19 @@ fn is_hop_by_hop_header(key: &str, connection_tokens: &[String]) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
-    /// No connection to the upstream: the request was never sent.
+    /// No connection to the upstream picked for the request: the request was
+    /// never sent, so no node received it.
     #[error("upstream {upstream} is unreachable")]
     UpstreamUnreachable {
+        upstream: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    /// No connection to the leader that a node's Raft redirect named. The
+    /// request was never sent there, but the node that redirected may have
+    /// proposed it.
+    #[error("redirect leader {upstream} is unreachable")]
+    LeaderUnreachable {
         upstream: String,
         #[source]
         source: reqwest::Error,
@@ -1216,24 +1349,27 @@ impl GatewayError {
     /// built, which never left the gateway.
     fn ejects_upstream(&self) -> bool {
         match self {
-            Self::UpstreamUnreachable { .. } => true,
+            Self::UpstreamUnreachable { .. } | Self::LeaderUnreachable { .. } => true,
             Self::Upstream { source, .. } => !source.is_builder(),
             Self::UpstreamTimeout { .. } | Self::ResponseBuild(_) => false,
         }
     }
 
-    /// The client's answer. Only an unreachable upstream is safe to retry
-    /// whatever the method (503 with `Retry-After`, as Ursula answers while
-    /// a group has no reachable leader): the request was never sent. The
-    /// bodies name no internal address.
+    /// The client's answer. An unreachable upstream is answered `503` with
+    /// `Retry-After`, as Ursula answers while a group has no reachable
+    /// leader: the request was never sent there. The first upstream's answer
+    /// is marked, because no node received the request. An unreachable
+    /// leader's is not, because the node that redirected may have proposed
+    /// it. The other failures may follow a request the upstream received.
+    /// The bodies name no internal address.
     fn into_response(self) -> AxumResponse {
         match self {
-            Self::UpstreamUnreachable { .. } => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(RETRY_AFTER, HeaderValue::from_static("1"))],
-                "upstream unreachable; retry",
-            )
-                .into_response(),
+            Self::UpstreamUnreachable { .. } => {
+                let mut response = unreachable_response();
+                mark_not_applied(&mut response, "UpstreamUnreachable");
+                response
+            }
+            Self::LeaderUnreachable { .. } => unreachable_response(),
             Self::UpstreamTimeout { .. } => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream sent no response in time",
@@ -1245,6 +1381,15 @@ impl GatewayError {
             Self::ResponseBuild(_) => StatusCode::BAD_GATEWAY.into_response(),
         }
     }
+}
+
+fn unreachable_response() -> AxumResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(RETRY_AFTER, HeaderValue::from_static("1"))],
+        "upstream unreachable; retry",
+    )
+        .into_response()
 }
 
 #[cfg(test)]

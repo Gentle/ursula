@@ -355,7 +355,8 @@ gateway:
   corsAllowedOrigins: []
 
   # Manual upstream URLs. When empty, the chart auto-generates upstreams from
-  # Ursula server pod DNS through the headless Service.
+  # Ursula server pod DNS through the headless Service. Each must reach one
+  # node, with nothing in between that resends requests.
   upstreams: []
 
   # Extra annotations applied to gateway pods.

@@ -220,6 +220,20 @@ becomes unready and attempts to yield its leaders. Free space or expand the
 volume. Admission resumes only at `raft.wal.resume_available_size`, preventing
 probe flapping.
 
+`RaftLogPressure` means the node's unsnapshotted Raft log is over twice
+`raft.snapshot_log_budget`. The node refuses writes with a body until
+snapshots bring the log below 1.5 times the budget.
+`IngressBodyBytesLimitReached` means the write bodies in flight on the node
+leave too little of `server.http_inflight_body_size` for this one.
+
+`WalDiskPressure`, `RaftLogPressure` and `IngressBodyBytesLimitReached` are
+write admission refusals. Their responses also carry the code in
+`x-ursula-not-applied`: the node refused the request before it proposed
+anything of it. A client can count the attempt as never applied only when
+the response also carries `x-ursula-not-applied-checked`, which a gateway
+at 0.7.3 or newer adds. See
+[refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing).
+
 Other errors indicate cold-write backpressure for that group. Either the hot
 ring exceeds `storage.cold.max_hot_size_per_group` (cold flush isn't keeping
 up), or the cold backend is slow or erroring out.

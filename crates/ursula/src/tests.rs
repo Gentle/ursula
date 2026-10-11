@@ -17,6 +17,8 @@ use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use serde_json::json;
 use tower::ServiceExt;
+use ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER;
+use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftLogProgressSnapshot;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
@@ -5244,6 +5246,15 @@ async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
     assert_eq!(header_str(&response, HEADER_STREAM_INCARNATION), current);
 }
 
+/// Ingress admission as the server builds it, with an in-flight body budget
+/// of `bytes`.
+fn admission_with_body_budget(bytes: u64) -> IngressAdmission {
+    IngressAdmission::new(&ursula_config::ServerConfig {
+        http_inflight_body_size: ursula_config::HumanSize::bytes(bytes),
+        ..ursula_config::ServerConfig::default()
+    })
+}
+
 // Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
@@ -5253,11 +5264,7 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
             post(|_body: Bytes| async { StatusCode::NO_CONTENT }),
         )
         .layer(middleware::from_fn_with_state(
-            IngressAdmission {
-                body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
-                wal_disk: WalDiskMonitor::default(),
-                raft_log: None,
-            },
+            admission_with_body_budget(4),
             ingress_admission_middleware,
         ));
 
@@ -5271,6 +5278,11 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(header_str(&response, axum::http::header::RETRY_AFTER), "1");
+    // Refused before the handler ran: nothing was applied.
+    assert_eq!(
+        header_str(&response, NOT_APPLIED_HEADER),
+        "IngressBodyBytesLimitReached"
+    );
     let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
         .await
         .expect("body");
@@ -5303,11 +5315,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
             }),
         )
         .layer(middleware::from_fn_with_state(
-            IngressAdmission {
-                body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
-                wal_disk: WalDiskMonitor::default(),
-                raft_log: None,
-            },
+            admission_with_body_budget(4),
             ingress_admission_middleware,
         ));
 
@@ -5717,11 +5725,19 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
     )
     .await;
     assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(header_str(&write, NOT_APPLIED_HEADER), "WalDiskPressure");
+    // Only a gateway vouches for the marker.
+    assert!(!write.headers().contains_key(NOT_APPLIED_CHECKED_HEADER));
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)
             .expect("utf8 response")
             .contains("WalDiskPressure")
+    );
+    // The marked refusal created nothing. Reads pass admission under pressure.
+    assert_eq!(
+        http_head(&app, "/benchcmp/disk-pressure").await.status(),
+        StatusCode::NOT_FOUND
     );
 
     assert_eq!(
@@ -5732,6 +5748,16 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
         http_get(&app, READINESS_PATH).await.status(),
         StatusCode::OK
     );
+    // Admitted, the same write creates the stream.
+    let write = http_put(
+        &app,
+        "/benchcmp/disk-pressure",
+        &[(CONTENT_LENGTH.as_str(), "1")],
+        Body::from("x"),
+    )
+    .await;
+    assert_eq!(write.status(), StatusCode::CREATED);
+    assert!(!write.headers().contains_key(NOT_APPLIED_HEADER));
 }
 
 /// Format epoch 2 (E8): once a Raft protocol mismatch is recorded, readiness
@@ -5802,16 +5828,26 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
             .headers()
             .contains_key(axum::http::header::RETRY_AFTER)
     );
+    assert_eq!(header_str(&write, NOT_APPLIED_HEADER), "RaftLogPressure");
+    // Only a gateway vouches for the marker.
+    assert!(!write.headers().contains_key(NOT_APPLIED_CHECKED_HEADER));
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)
             .expect("utf8 response")
             .contains("RaftLogPressure")
     );
+    // The marked refusal created nothing.
+    assert_eq!(
+        http_head(&app, "/benchcmp/log-pressure").await.status(),
+        StatusCode::NOT_FOUND
+    );
     let bodiless = http_put(&app, "/benchcmp", &[], Body::empty()).await;
     assert_ne!(bodiless.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!bodiless.headers().contains_key(NOT_APPLIED_HEADER));
 
     assert_eq!(coordinator.observe_log_bytes(50, 200, 100), Some(false));
+    // Admitted, the same write creates the stream.
     let write = http_put(
         &app,
         "/benchcmp/log-pressure",
@@ -5819,7 +5855,8 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
         Body::from("x"),
     )
     .await;
-    assert_ne!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(write.status(), StatusCode::CREATED);
+    assert!(!write.headers().contains_key(NOT_APPLIED_HEADER));
 }
 
 /// Shared fixture for the governance unit-test modules below: one

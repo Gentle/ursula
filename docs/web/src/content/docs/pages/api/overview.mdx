@@ -86,7 +86,7 @@ The server sets the marker on every refusal of its write admission, which runs b
 
 The `503` refusals also carry `Retry-After: 1` and name the token as the JSON `error`.
 
-The gateway sets the marker on every request it refuses before forwarding it, and on a request it could not send because the connection to its first upstream failed. It passes a node's marker through, except after a leader redirect, as described below. Its tokens are listed in the [gateway README](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-gateway/README.md#refusals-that-applied-nothing). A proxy in front of the gateway can make its own refusals count too: answer them with `401`, `402` or `429`, or set both headers, but only on requests it did not pass on.
+The gateway sets the marker on every request it refuses before forwarding it, and on a request it could not send because the connection to its first upstream failed. It passes a node's marker through, except after a leader redirect, as described below. Its tokens are listed in the [gateway README](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-gateway/README.md#refusals-that-applied-nothing). A proxy in front of the gateway can make its own refusals count too: answer them with `401`, `402` or `429`, but only on requests it did not pass on.
 
 The marker speaks for one attempt only. A marked answer to a retry says nothing about the earlier attempts.
 

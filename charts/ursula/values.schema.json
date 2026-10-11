@@ -866,7 +866,7 @@
         },
         "upstreams": {
           "type": "array",
-          "description": "Manual upstream URLs. When empty, upstreams are auto-generated from Ursula headless Service pod DNS. Each must reach one node, with nothing in between that resends requests.",
+          "description": "Manual upstream URLs. When empty, upstreams are auto-generated from Ursula headless Service pod DNS. Each must reach one node, with nothing in between that resends requests or answers 401, 402 or 429.",
           "items": {
             "type": "string"
           }

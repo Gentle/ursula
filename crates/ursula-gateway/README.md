@@ -158,9 +158,15 @@ or the gateway vouches for a marker from a later delivery. For example, a
 node can propose a write and then answer `503` without a marker. If a
 sidecar resends the request on that `503`, as Istio's default retry policy
 did before 1.24, and a node refuses the copy at admission with a marked
-`503`, the gateway sees only that refusal and vouches for it. A gateway
-older than 0.7.3 used as an upstream causes the same problem, because it
-passes a leader's marker on after any redirect it follows.
+`503`, the gateway sees only that refusal and vouches for it. For the same
+reason, a 0.7.3 gateway must not sit in front of an older gateway, which
+follows redirects itself and passes a leader's marker on after any of them.
+
+Nothing between the gateway and the nodes may answer `401`, `402` or `429`
+either, as a sidecar's local rate limit does. A client counts those
+statuses as never applied without the headers, and after a redirect without
+a marker the gateway returns the leader's status unchanged, although the
+node that redirected may have proposed the write.
 
 ## SSE Behavior
 
@@ -210,7 +216,9 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
     Base URL for an Ursula HTTP or HTTPS node. Repeat once per node. Required.
     Point it at the node itself. A proxy, service-mesh sidecar or another
     gateway in between must not resend requests, or the gateway vouches for
-    an x-ursula-not-applied marker from a later delivery.
+    an x-ursula-not-applied marker from a later delivery. Nor may it answer
+    401, 402 or 429, for example from a local rate limit: a client counts
+    those statuses as never applied.
 
 --response-header-timeout <SECONDS>
     Timeout for sending the upstream request and receiving response headers.

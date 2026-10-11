@@ -51,7 +51,11 @@ pub const NOT_APPLIED_HEADER: &str = "x-ursula-not-applied";
 /// between the gateway and the nodes must not resend requests, or the gateway
 /// vouches for a marker from a later delivery: a node can propose a write and
 /// answer an unmarked `503`, and a resent copy can then be refused at
-/// admission with a marked one.
+/// admission with a marked one. For the same reason, a 0.7.3 gateway must not
+/// sit in front of an older gateway (see below). Nothing in between may answer
+/// `401`, `402` or `429` either, as a sidecar's local rate limit does: those
+/// statuses count without the headers, and after a redirect without a marker
+/// the gateway returns the leader's status unchanged.
 ///
 /// Gateways before 0.7.3 pass a leader's marker on after any redirect they
 /// follow, including one that a node sent after it proposed the write. They

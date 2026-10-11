@@ -255,6 +255,11 @@ impl Db {
             self.poison(e);
             return;
         }
+        // After a snapshot outage, the stream takes writes again: the next attempt need not wait
+        // (once a run, see `SnapshotFailing::commit_acknowledged`).
+        if let Some(failing) = self.snapshot_failing.as_mut() {
+            failing.commit_acknowledged(Instant::now());
+        }
         if self.snapshot_due() {
             self.snapper.request();
         }

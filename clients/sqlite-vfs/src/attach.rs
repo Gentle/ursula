@@ -681,6 +681,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         snapshot_published_at: None,
         snapshot_failing: None,
         snapshot_bytes: None,
+        snapshot_published_bytes: 0,
         attached_from: from,
         installed,
     }));

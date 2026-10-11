@@ -149,6 +149,9 @@ pub(crate) struct Db {
     pub(crate) snapshot_failing: Option<SnapshotFailing>,
     /// The compressed size of the latest snapshot body built, published or not.
     pub(crate) snapshot_bytes: Option<usize>,
+    /// The largest snapshot body this owner published, in bytes: a larger one that gets no answer
+    /// is taken to be over a size limit (`snapshotter::FailureKind::Size`).
+    pub(crate) snapshot_published_bytes: usize,
 }
 
 /// Why an attached database is poisoned: the first reason, and what any reason so far showed.
@@ -493,6 +496,7 @@ impl Db {
             snapshot_published_at: None,
             snapshot_failing: None,
             snapshot_bytes: None,
+            snapshot_published_bytes: 0,
         }
     }
 }

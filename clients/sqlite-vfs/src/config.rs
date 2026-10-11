@@ -131,8 +131,8 @@ fn frame_limit_from(value: &str) -> Setting<usize> {
 }
 
 /// Test hook `URSULA_VFS_SNAPSHOT_RETRY_MS`: the wait after a first failed snapshot attempt (100 ms
-/// by default), which doubles with each further failure (`snapshotter::SnapshotFailing`). Tests set
-/// it high to see the next attempt held back.
+/// by default, at least 1 ms), which doubles with each further failure
+/// (`snapshotter::SnapshotFailing`). Tests set it high to see the next attempt held back.
 pub(crate) fn snapshot_retry() -> Duration {
     static V: OnceLock<Duration> = OnceLock::new();
     *V.get_or_init(|| {

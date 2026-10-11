@@ -24,6 +24,9 @@ it("status reports an owner's health, and instrument() reports it as metrics", (
 	expect(observe("sqlite_ursula.log.bytes")).toBe(s.log_bytes);
 	expect(observe("sqlite_ursula.poisoned")).toBe(0);
 	expect(observe("sqlite_ursula.snapshot.age")).toBeUndefined();
+	// No snapshot body built yet: no value.
+	expect(s.snapshot_bytes).toBeNull();
+	expect(observe("sqlite_ursula.snapshot.bytes")).toBeUndefined();
 	stop();
 	expect(records.get("sqlite_ursula.commit.duration")).toHaveLength(6);
 	expect(records.get("sqlite_ursula.append.duration")).toHaveLength(6);

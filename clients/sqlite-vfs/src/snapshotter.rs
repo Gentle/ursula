@@ -1,5 +1,8 @@
 //! The per-database snapshot thread: snapshots, their read-back, and retention.
 
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+use std::hash::Hasher;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -14,6 +17,7 @@ use crate::client::recreated;
 use crate::config::snapshot_retry;
 use crate::db::Db;
 use crate::db::lock;
+use crate::error::Attempt;
 use crate::error::Error;
 use crate::host::Checkpoint;
 use crate::host::Private;
@@ -131,44 +135,121 @@ enum Outcome {
     Refused,
 }
 
-/// The longest wait between two failed snapshot attempts (`SnapshotFailing`).
-const RETRY_MAX: Duration = Duration::from_secs(3600);
+/// The longest wait between failed snapshot attempts (`SnapshotFailing`): an hour while the body
+/// is too large for a layer in front of the stream, which fails the same way until the database
+/// shrinks, and five minutes after any other failure, so that a snapshot follows soon after its
+/// cause goes away.
+const SIZE_RETRY_MAX: Duration = Duration::from_secs(3600);
+const RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// What a failed snapshot attempt failed on, for the wait before the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailureKind {
+    /// The body is over a size limit in front of the stream: answered 413, or it got no answer
+    /// while larger than any body this owner published. A gateway stops reading a body at its
+    /// limit and closes the connection: the client usually sees a failed write, not the 413.
+    Size,
+    /// No answer, or a 5xx: the server or a layer in front of it is unavailable.
+    Outage,
+    /// Anything else: a snapshot that did not read back as published, a local error.
+    Other,
+}
+
+impl FailureKind {
+    /// What `e` failed on, for an attempt whose body was `body` bytes (`None`: it failed before
+    /// one was built), when the largest body this owner published was `largest_published` bytes.
+    fn of(e: &Error, body: Option<usize>, largest_published: usize) -> FailureKind {
+        match e {
+            Error::SnapshotTooLarge { .. } => FailureKind::Size,
+            Error::PutUnknown {
+                last: Attempt::Transport(_),
+                ..
+            } if body.is_some_and(|bytes| bytes > largest_published) => FailureKind::Size,
+            Error::PutUnknown { .. } | Error::Http { .. } => FailureKind::Outage,
+            Error::Status { status, .. } if *status >= 500 => FailureKind::Outage,
+            _ => FailureKind::Other,
+        }
+    }
+
+    fn retry_max(self) -> Duration {
+        match self {
+            FailureKind::Size => SIZE_RETRY_MAX,
+            FailureKind::Outage | FailureKind::Other => RETRY_MAX,
+        }
+    }
+}
+
+/// What a snapshot attempt took, as far as it got (`snapshot_once`): the image's size in pages,
+/// and the body's size in bytes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Taken {
+    pub(crate) pages: Option<u32>,
+    pub(crate) body: Option<usize>,
+}
 
 /// Snapshot attempts that failed in a row, since the last one that published a snapshot at its
-/// offset or found one there (`Db::snapshot_failing`).
+/// offset or found one there (`Db::snapshot_failing`). It lives in memory: a new attach starts
+/// without one.
 ///
 /// Each failure doubles the wait before the next attempt, from `snapshot_retry()` (100 ms) up to
-/// `RETRY_MAX` (1 h). An attempt reads, compresses and sends the whole database, and a body over a
-/// size limit of the server or of a layer in front of it (answered 413, or reset or timed out by
-/// a proxy) fails the same way each time until the database shrinks. So a database that shrank by
-/// more than a quarter since the last failure (a `VACUUM`) tries again without waiting.
+/// [`FailureKind::retry_max`] (an hour for a body too large, five minutes otherwise), give or take a
+/// fifth (`jittered`), so the owners a cluster-wide outage failed together do not try again
+/// together. An attempt reads, compresses and sends the whole database, and a body over a size
+/// limit fails the same way each time until the database shrinks. So an attempt does not wait once
+/// the database is below three quarters of the image that last failed (after a `VACUUM`, say).
+/// After an outage, the first commit acknowledged brings the next attempt forward, once a run, so
+/// that a snapshot that keeps failing while commits succeed still backs off.
 pub(crate) struct SnapshotFailing {
     /// How many failed in a row.
     pub(crate) count: u32,
     /// Why the last one failed.
     pub(crate) error: String,
-    /// The database's size, in pages, at the last failure.
+    /// What it failed on.
+    pub(crate) kind: FailureKind,
+    /// The size, in pages, of the image the last failure took (of the database, when it failed
+    /// before taking one).
     pub(crate) pages: u32,
-    /// The wait after the last failure.
+    /// The wait after the last failure, before `jittered`.
     pub(crate) wait: Duration,
     /// The next attempt starts no sooner, unless the database shrank (`holds_back`).
     pub(crate) until: Instant,
+    /// A commit brought the next attempt forward in this run already (`commit_acknowledged`).
+    pub(crate) brought_forward: bool,
 }
 
 impl SnapshotFailing {
     /// Whether an attempt at `now` waits, with the database at `pages`: until `until`, unless it is
-    /// below three quarters of its size at the last failure.
+    /// below three quarters of the image that last failed.
     pub(crate) fn holds_back(&self, pages: u32, now: Instant) -> bool {
         let shrank = u64::from(pages).saturating_mul(4) < u64::from(self.pages).saturating_mul(3);
         now < self.until && !shrank
     }
+
+    /// A commit was acknowledged at `now`: after an outage the stream takes writes again, so the
+    /// next attempt need not wait. Once a run: whether it brought the attempt forward.
+    pub(crate) fn commit_acknowledged(&mut self, now: Instant) -> bool {
+        if self.kind != FailureKind::Outage || self.brought_forward || now >= self.until {
+            return false;
+        }
+        self.until = now;
+        self.brought_forward = true;
+        true
+    }
+}
+
+/// `wait` give or take a fifth.
+fn jittered(wait: Duration) -> Duration {
+    // A random number from the standard library's randomly keyed hasher: no dependency for one.
+    let random = RandomState::new().build_hasher().finish();
+    let fraction = random as f64 / u64::MAX as f64;
+    wait.mul_f64(0.8 + 0.4 * fraction)
 }
 
 /// The snapshot health `ursula_status` reports, and the wait before the next attempt, after an
-/// attempt that ended at `now`: a snapshot at its offset (one published, or one already there)
-/// ends a run of failures, an error extends it (`SnapshotFailing`), and any other outcome leaves
-/// it as it was (nothing was published, nor did anything fail).
-fn record_attempt(d: &mut Db, attempt: &Result<Outcome, Error>, now: Instant) {
+/// attempt that ended at `now` having taken `taken`: a snapshot at its offset (one published, or
+/// one already there) ends a run of failures, an error extends it (`SnapshotFailing`), and any
+/// other outcome leaves it as it was (nothing was published, nor did anything fail).
+fn record_attempt(d: &mut Db, attempt: &Result<Outcome, Error>, taken: Taken, now: Instant) {
     match attempt {
         Ok(Outcome::Published | Outcome::Covered) => d.snapshot_failing = None,
         Ok(
@@ -179,19 +260,24 @@ fn record_attempt(d: &mut Db, attempt: &Result<Outcome, Error>, now: Instant) {
             | Outcome::Refused,
         ) => {}
         Err(e) => {
-            let (count, wait) = match &d.snapshot_failing {
+            let kind = FailureKind::of(e, taken.body, d.snapshot_published_bytes);
+            let first = snapshot_retry().clamp(Duration::from_millis(1), kind.retry_max());
+            let (count, wait, brought_forward) = match &d.snapshot_failing {
                 Some(last) => (
                     last.count.saturating_add(1),
-                    last.wait.saturating_mul(2).min(RETRY_MAX),
+                    last.wait.saturating_mul(2).clamp(first, kind.retry_max()),
+                    last.brought_forward,
                 ),
-                None => (1, snapshot_retry().min(RETRY_MAX)),
+                None => (1, first, false),
             };
             d.snapshot_failing = Some(SnapshotFailing {
                 count,
                 error: e.to_string(),
-                pages: d.pages,
+                kind,
+                pages: taken.pages.unwrap_or(d.pages),
                 wait,
-                until: now.checked_add(wait).unwrap_or(now),
+                until: now.checked_add(jittered(wait)).unwrap_or(now),
+                brought_forward,
             });
         }
     }
@@ -215,10 +301,11 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
                 return;
             }
         }
-        let attempt = snapshot_once(db, snapper);
+        let mut taken = Taken::default();
+        let attempt = snapshot_once(db, snapper, &mut taken);
         let (path, url, failing, due) = {
             let mut d = lock(db);
-            record_attempt(&mut d, &attempt, Instant::now());
+            record_attempt(&mut d, &attempt, taken, Instant::now());
             let failing = d.snapshot_failing.as_ref().map(|f| (f.count, f.wait));
             (d.path.clone(), d.url.clone(), failing, d.snapshot_due())
         };
@@ -270,7 +357,7 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
 /// frames into the db file (a reader at mark 0 blocks backfill, one at a later mark caps it) and no
 /// closing connection can checkpoint (that needs an EXCLUSIVE lock), so the pages copied are those
 /// of `offset`. Commits wait only for the checkpoint and the start of the read transaction.
-fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
+fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper, taken: &mut Taken) -> Result<Outcome, Error> {
     let stopped = || snapper.stopped();
     let started = Instant::now();
     let path = lock(db).path.clone();
@@ -315,6 +402,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
             d.log,
         )
     };
+    taken.pages = Some(pages);
     let window = Window(db);
     // A checkpoint started by another connection after the window opened makes this one busy
     // (it gets no busy handler): retry briefly, it only covers frames up to `offset` too.
@@ -361,6 +449,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
         source,
     })?;
     lock(db).snapshot_bytes = Some(body.len());
+    taken.body = Some(body.len());
     // This state is a prefix of the incarnation it was attached to, not of a stream recreated at
     // the same path since: the publish and the retention move carry the incarnation, so the
     // server refuses them there (412), and this owner's commits stop now rather than at its next
@@ -464,6 +553,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
         }
         d.log = d.log.saturating_sub(log);
         d.snapshot_published_at = Some(Instant::now());
+        d.snapshot_published_bytes = d.snapshot_published_bytes.max(body.len());
         d.stats.snapshot(SnapshotStat {
             offset: offset.clone(),
             bytes: body.len(),
@@ -474,26 +564,21 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
         (previous, d.retained.clone())
     };
     // Retention trails one snapshot behind: a host that read the previous snapshot (or whose file
-    // is past it) still finds the frames after it, and the newer snapshot has read back.
+    // is past it) still finds the frames after it, and the newer snapshot has read back. The
+    // snapshot is published whatever the move does: a move that fails is logged
+    // (`retention_failed`) and tried again after the next snapshot, and does not extend a run of
+    // failed snapshots.
     if previous > retained && previous < offset {
-        let moved = match put_idempotent(
-            &format!("{url}/retention/{previous}"),
-            &incarnation,
-            &[],
-            &stopped,
-        ) {
-            Ok(answer) => answer,
-            Err(e) => return refused(e, "retention move"),
-        };
-        match moved {
-            (412, _) => {
+        let target = format!("{url}/retention/{previous}");
+        match put_idempotent(&target, &incarnation, &[], &stopped) {
+            Ok((412, _)) => {
                 fence(
                     format!("retention not moved to {previous}"),
                     recreated(&url, &incarnation),
                 );
                 return Ok(Outcome::Fenced);
             }
-            (200..=299, r) => {
+            Ok((200..=299, r)) => {
                 let effective = header_offset(&r, "stream-retained-offset").unwrap_or(previous);
                 let mut d = lock(db);
                 if effective > d.retained {
@@ -501,34 +586,80 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
                 }
             }
             // Already past it (another owner, or this file before a re-attach).
-            (409 | 410, _) => {}
-            (status, mut r) => {
-                return Err(Error::Status {
-                    op: "move retention",
-                    url: format!("{url}/retention/{previous}"),
-                    status,
-                    body: r.body_mut().read_to_string().unwrap_or_default(),
-                });
+            Ok((409 | 410, _)) => {}
+            Ok((status, mut r)) => retention_failed(db, &Error::Status {
+                op: "move retention",
+                url: target,
+                status,
+                body: body_text(&mut r),
+            }),
+            // A 402: nothing moved, and no snapshot is taken until a commit is acknowledged.
+            Err(Error::Refused { refusal, .. }) => {
+                lock(db).writes_refused(refusal, "retention move");
             }
+            Err(e) => retention_failed(db, &e),
         }
     }
     Ok(Outcome::Published)
 }
 
+/// A retention move after a published snapshot failed with `e`: logged, and tried again after the
+/// next snapshot (retention never passes it meanwhile, so nothing is lost, the log stays longer).
+fn retention_failed(db: &Mutex<Db>, e: &Error) {
+    let (path, url) = {
+        let d = lock(db);
+        (d.path.clone(), d.url.clone())
+    };
+    log::emit(Level::Warn, "retention_failed", &[
+        ("file", &path),
+        ("stream", &url),
+        ("reason", e),
+    ]);
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
     use std::time::Duration;
     use std::time::Instant;
 
+    use super::FailureKind;
     use super::Outcome;
     use super::RETRY_MAX;
+    use super::SIZE_RETRY_MAX;
     use super::Snapper;
+    use super::Taken;
+    use super::jittered;
     use super::record_attempt;
     use crate::db::Db;
+    use crate::error::Attempt;
     use crate::error::Error;
 
     fn failed() -> Result<Outcome, Error> {
         Err(Error::SnapshotNotReadBack { offset: "7".into() })
+    }
+
+    fn too_large() -> Result<Outcome, Error> {
+        Err(Error::SnapshotTooLarge {
+            url: "http://h/b/s/snapshot/7".into(),
+            bytes: 40 << 20,
+            body: String::new(),
+        })
+    }
+
+    fn unanswered() -> Error {
+        Error::PutUnknown {
+            url: "http://h/b/s/snapshot/7".into(),
+            last: Attempt::Transport(Box::new(ureq::Error::Io(ErrorKind::BrokenPipe.into()))),
+        }
+    }
+
+    /// The image of `pages` and a body of `body` bytes.
+    fn took(pages: u32, body: usize) -> Taken {
+        Taken {
+            pages: Some(pages),
+            body: Some(body),
+        }
     }
 
     // Only a snapshot at the offset (published, or one already there) ends a run of failures: an
@@ -538,8 +669,8 @@ mod tests {
     fn only_a_snapshot_at_the_offset_ends_a_run_of_failures() {
         let mut d = Db::for_tests();
         let now = Instant::now();
-        record_attempt(&mut d, &failed(), now);
-        record_attempt(&mut d, &failed(), now);
+        record_attempt(&mut d, &failed(), Taken::default(), now);
+        record_attempt(&mut d, &failed(), Taken::default(), now);
         let until = d.snapshot_failing.as_ref().map(|f| (f.count, f.until));
         assert_eq!(until.map(|(count, _)| count), Some(2));
         for outcome in [
@@ -549,57 +680,102 @@ mod tests {
             Outcome::Busy,
             Outcome::Refused,
         ] {
-            record_attempt(&mut d, &Ok(outcome), now);
+            record_attempt(&mut d, &Ok(outcome), Taken::default(), now);
             let failing = d.snapshot_failing.as_ref().map(|f| (f.count, f.until));
             assert_eq!(failing, until, "{outcome:?}");
         }
-        record_attempt(&mut d, &Ok(Outcome::Covered), now);
+        record_attempt(&mut d, &Ok(Outcome::Covered), Taken::default(), now);
         assert!(d.snapshot_failing.is_none());
-        record_attempt(&mut d, &failed(), now);
-        record_attempt(&mut d, &Ok(Outcome::Published), now);
+        record_attempt(&mut d, &failed(), Taken::default(), now);
+        record_attempt(&mut d, &Ok(Outcome::Published), Taken::default(), now);
         assert!(d.snapshot_failing.is_none());
     }
 
-    // Each failure doubles the wait before the next attempt, from 100 ms up to an hour, and a run
-    // that ends starts the next one from 100 ms again. The run keeps the last error and the
-    // database's size at the last failure.
+    // A 413 is about the body's size, and so is no answer for a body larger than any this owner
+    // published (a gateway closes the connection on a body over its limit). No answer for a body no
+    // larger, or a 5xx, is an outage. Anything else is neither.
     #[test]
-    fn failures_double_the_wait_up_to_an_hour() {
+    fn failures_are_told_apart_by_what_they_failed_on() {
+        let kind = |e: &Error, body: Option<usize>| FailureKind::of(e, body, 1000);
+        assert_eq!(kind(&too_large().unwrap_err(), Some(10)), FailureKind::Size);
+        assert_eq!(kind(&unanswered(), Some(1001)), FailureKind::Size);
+        assert_eq!(kind(&unanswered(), Some(1000)), FailureKind::Outage);
+        assert_eq!(kind(&unanswered(), None), FailureKind::Outage);
+        let answered = Error::PutUnknown {
+            url: "u".into(),
+            last: Attempt::Status {
+                status: 503,
+                body: String::new(),
+            },
+        };
+        assert_eq!(kind(&answered, Some(1 << 30)), FailureKind::Outage);
+        let status = |status| Error::Status {
+            op: "get snapshot",
+            url: "u".into(),
+            status,
+            body: String::new(),
+        };
+        assert_eq!(kind(&status(500), None), FailureKind::Outage);
+        assert_eq!(kind(&status(404), None), FailureKind::Other);
+        assert_eq!(
+            kind(&failed().unwrap_err(), Some(1 << 30)),
+            FailureKind::Other
+        );
+    }
+
+    // Each failure doubles the wait before the next attempt, from 100 ms up to an hour for a body
+    // too large and five minutes otherwise, give or take a fifth, and a run that ends starts the
+    // next one from 100 ms again. The run keeps the last error and the size of the image that last
+    // failed, not of the database by the time it was recorded (an upload can take minutes).
+    #[test]
+    fn failures_double_the_wait_up_to_their_kinds_limit() {
         let mut d = Db::for_tests();
-        d.pages = 400;
+        d.pages = 999;
         let now = Instant::now();
         let mut waits = Vec::new();
         for _ in 0..18 {
-            record_attempt(&mut d, &failed(), now);
+            record_attempt(&mut d, &failed(), took(400, 10), now);
             let failing = d.snapshot_failing.as_ref().unwrap();
-            assert_eq!(failing.until, now + failing.wait);
+            let after = failing.until.duration_since(now);
+            assert!(
+                after >= failing.wait.mul_f64(0.8) && after <= failing.wait.mul_f64(1.2),
+                "{after:?} for {:?}",
+                failing.wait
+            );
             waits.push(failing.wait);
         }
         assert_eq!(waits[0], Duration::from_millis(100));
         assert_eq!(waits[1], Duration::from_millis(200));
-        assert_eq!(waits[15], Duration::from_millis(100 << 15));
-        assert_eq!(waits[16], RETRY_MAX);
+        assert_eq!(waits[11], Duration::from_millis(100 << 11));
+        assert_eq!(waits[12], RETRY_MAX);
         assert_eq!(waits[17], RETRY_MAX);
         let failing = d.snapshot_failing.as_ref().unwrap();
         assert_eq!((failing.count, failing.pages), (18, 400));
         assert_eq!(failing.error, "the snapshot at 7 does not read back");
-        record_attempt(&mut d, &Ok(Outcome::Published), now);
-        record_attempt(&mut d, &failed(), now);
+        for _ in 0..4 {
+            record_attempt(&mut d, &too_large(), took(400, 40 << 20), now);
+        }
         assert_eq!(
-            d.snapshot_failing.as_ref().map(|f| (f.count, f.wait)),
-            Some((1, Duration::from_millis(100)))
+            d.snapshot_failing.as_ref().map(|f| f.wait),
+            Some(SIZE_RETRY_MAX)
+        );
+        record_attempt(&mut d, &Ok(Outcome::Published), Taken::default(), now);
+        record_attempt(&mut d, &failed(), Taken::default(), now);
+        let failing = d.snapshot_failing.as_ref().unwrap();
+        assert_eq!(
+            (failing.count, failing.wait, failing.pages),
+            (1, Duration::from_millis(100), 999)
         );
     }
 
     // The next attempt waits for the end of the wait, unless the database shrank below three
-    // quarters of its size at the last failure (a VACUUM): a body over a size limit would fail the
+    // quarters of the image that last failed (a VACUUM): a body over a size limit would fail the
     // same way before. A database that grew, or shrank less, waits, and so does one that was empty.
     #[test]
     fn a_failure_holds_the_next_attempt_back_until_its_wait_ends_or_the_database_shrinks() {
         let mut d = Db::for_tests();
-        d.pages = 400;
         let now = Instant::now();
-        record_attempt(&mut d, &failed(), now);
+        record_attempt(&mut d, &too_large(), took(400, 40 << 20), now);
         let failing = d.snapshot_failing.as_ref().unwrap();
         for pages in [400, 401, 4000, 300] {
             assert!(failing.holds_back(pages, now), "{pages}");
@@ -607,9 +783,58 @@ mod tests {
         assert!(!failing.holds_back(299, now));
         assert!(!failing.holds_back(0, now));
         assert!(!failing.holds_back(400, failing.until));
-        d.pages = 0;
-        record_attempt(&mut d, &failed(), now);
+        record_attempt(&mut d, &too_large(), took(0, 10), now);
         assert!(d.snapshot_failing.as_ref().unwrap().holds_back(0, now));
+    }
+
+    // After an outage, the first commit acknowledged brings the next attempt forward: the stream
+    // takes writes again. Once a run, so that a snapshot that keeps failing while commits succeed
+    // still backs off, and not after a failure about the body's size or anything else.
+    #[test]
+    fn a_commit_after_an_outage_brings_the_next_attempt_forward_once() {
+        let mut d = Db::for_tests();
+        let now = Instant::now();
+        let outage = Err(unanswered());
+        record_attempt(&mut d, &outage, Taken::default(), now);
+        let failing = d.snapshot_failing.as_mut().unwrap();
+        assert!(failing.commit_acknowledged(now));
+        assert!(!failing.holds_back(0, now));
+        assert!(!failing.commit_acknowledged(now));
+        let later = now + Duration::from_secs(1);
+        record_attempt(&mut d, &outage, Taken::default(), later);
+        let failing = d.snapshot_failing.as_mut().unwrap();
+        assert!(!failing.commit_acknowledged(later), "once a run");
+        assert!(failing.holds_back(0, later));
+        let mut d = Db::for_tests();
+        record_attempt(&mut d, &too_large(), took(400, 40 << 20), now);
+        assert!(
+            !d.snapshot_failing
+                .as_mut()
+                .unwrap()
+                .commit_acknowledged(now)
+        );
+        record_attempt(&mut d, &failed(), Taken::default(), now);
+        assert!(
+            !d.snapshot_failing
+                .as_mut()
+                .unwrap()
+                .commit_acknowledged(now)
+        );
+    }
+
+    // The wait is spread over a fifth on each side, so owners that failed together do not try again
+    // together.
+    #[test]
+    fn waits_are_spread_by_a_fifth() {
+        let wait = Duration::from_secs(10);
+        let spread: Vec<Duration> = (0..200).map(|_| jittered(wait)).collect();
+        assert!(
+            spread
+                .iter()
+                .all(|d| *d >= wait.mul_f64(0.8) && *d <= wait.mul_f64(1.2))
+        );
+        assert!(spread.iter().any(|d| *d < wait.mul_f64(0.95)));
+        assert!(spread.iter().any(|d| *d > wait.mul_f64(1.05)));
     }
 
     // The wait between failed attempts ends at a request (to check whether the database shrank),

@@ -576,6 +576,17 @@ mod tests {
         };
         assert!(recreated.is_recreated() && recreated.is_fenced() && !recreated.is_gone());
         assert!(recreated.to_string().contains("deleted and recreated"));
+        let too_large = Error::SnapshotTooLarge {
+            url: "http://h/b/s/snapshot/7".into(),
+            bytes: 41_943_040,
+            body: "snapshot body is too large".into(),
+        };
+        assert_eq!(
+            too_large.to_string(),
+            "publish snapshot http://h/b/s/snapshot/7: 413 snapshot body is too large: a body of \
+             41943040 bytes is over the request size limit of the server or of a layer in front of \
+             it (ursulagw: --max-request-body-bytes)"
+        );
         let superseded = Error::Fenced(Fence::Superseded {
             epoch: 2,
             current: Some(3),

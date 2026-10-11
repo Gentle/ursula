@@ -996,22 +996,28 @@ pub(crate) fn get_snapshot(
     }
 }
 
-/// How many times `put_idempotent` sends a body (a snapshot's) while its outcome stays unknown:
-/// once, and once again. A snapshot can be hundreds of MiB, and one that a proxy resets for its
-/// size or times out fails the same way every time, so the snapshot thread backs off before its
-/// next attempt instead (`snapshotter::SnapshotFailing`).
-const BODY_SENDS: u32 = 2;
+/// How many times `put_idempotent` sends a body larger than [`RESENT_UP_TO`] (a snapshot's) whose
+/// outcome stays unknown (no answer, a 5xx or a 307): once, and once again. Such a body can be hundreds
+/// of MiB, and one that a layer in front of the stream cuts off for its size (a gateway stops
+/// reading at its limit and closes the connection, which the client sees as a failed write), or
+/// that a proxy times out, fails the same way every time. So the snapshot thread backs off before
+/// its next attempt instead (`snapshotter::SnapshotFailing`).
+const UNKNOWN_SENDS: u32 = 2;
+
+/// The largest body `put_idempotent` sends again until the retry budget runs out, as before 0.7.3.
+const RESENT_UP_TO: usize = 1 << 20;
 
 /// `PUT` to stream incarnation `incarnation` (a 412 when it is not) with retries while the outcome
-/// is unknown (transport errors, 5xx, a 307: `redirect_retried`), no sooner than
-/// Retry-After (seconds): both publishing a snapshot and advancing retention are idempotent, so a
-/// 402 fails the request alone ([`Error::Refused`]), whatever an earlier attempt did, and so does
-/// any other redirect ([`Error::Redirected`]). No other answer refuses it, whatever headers it
-/// carries: no answer here decides a producer sequence, so none needs `applied_nothing`, and a
-/// marked 413 for a snapshot body over a gateway's limit stays a snapshot failure, which the
-/// snapshot thread counts. A body is sent `BODY_SENDS` times at most, an empty one (a retention
-/// move) until the retry budget runs out. Returns the status and response. Gives up once `stopped`
-/// (a re-attach is waiting for the snapshot thread).
+/// is unknown (transport errors, 5xx, a 307: `redirect_retried`), no sooner than Retry-After
+/// (seconds): both publishing a snapshot and advancing retention are idempotent, so a 402 fails
+/// the request alone ([`Error::Refused`]), whatever an earlier attempt did, and so does any other
+/// redirect ([`Error::Redirected`]). No other answer refuses it, whatever headers it carries: no
+/// answer here decides a producer sequence, so none needs `applied_nothing`, and a marked 413 for
+/// a snapshot body over a gateway's limit stays a snapshot failure, which the snapshot thread
+/// counts. A body larger than [`RESENT_UP_TO`] is sent [`UNKNOWN_SENDS`] times at most while its
+/// outcome stays unknown (a refused token, sent again with the token read again, does not count),
+/// a smaller one (a small snapshot, a retention move) until the retry budget runs out. Returns the
+/// status and response. Gives up once `stopped` (a re-attach is waiting for the snapshot thread).
 pub(crate) fn put_idempotent(
     url: &str,
     incarnation: &str,
@@ -1022,9 +1028,9 @@ pub(crate) fn put_idempotent(
     let mut backoff = Duration::from_millis(50);
     // How the next attempt goes out, after a refused token or no answer.
     let mut resend = Resend::default();
-    let mut sends: u32 = 0;
+    // Sends whose outcome is unknown, for a body larger than `RESENT_UP_TO`.
+    let mut unknown_sends: u32 = 0;
     loop {
-        sends = sends.saturating_add(1);
         let mut retry_after = None;
         let unknown = match prepared(bulk_agent().put(url), std::mem::take(&mut resend))
             .header("content-type", CONTENT_TYPE)
@@ -1064,7 +1070,10 @@ pub(crate) fn put_idempotent(
                 Attempt::Transport(Box::new(e))
             }
         };
-        if (!body.is_empty() && sends >= BODY_SENDS)
+        if !resend.refresh {
+            unknown_sends = unknown_sends.saturating_add(1);
+        }
+        if (body.len() > RESENT_UP_TO && unknown_sends >= UNKNOWN_SENDS)
             || stopped()
             || !pause(retry_after, &mut backoff, deadline)
         {
@@ -1738,46 +1747,35 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
-    // A body whose outcome stays unknown is sent twice at most: a large snapshot that a proxy
-    // resets or times out fails the same way again, and the snapshot thread backs off instead. A
-    // retention move (no body) is retried within the budget, as before.
+    // A body over 1 MiB whose outcome stays unknown is sent twice at most: a large snapshot that a
+    // layer in front cuts off for its size, or a proxy times out, fails the same way again, and the
+    // snapshot thread backs off instead. A refused token, sent again with the token read again,
+    // does not count. A smaller body (a small snapshot, a retention move) is retried within the
+    // budget, as before.
     #[test]
-    fn a_body_is_sent_twice_at_most_while_its_outcome_stays_unknown() {
+    fn a_large_body_is_sent_twice_at_most_while_its_outcome_stays_unknown() {
         let (url, server) = serve(vec![
-            // The snapshot: no answer, then a 503.
+            // The large snapshot: its token refused, then no answer, then a 503.
+            answer("401 Unauthorized"),
             String::new(),
             answer("503 Service Unavailable"),
-            // The retention move: three answers with an unknown outcome, then accepted.
+            // A small snapshot: three answers with an unknown outcome, then accepted.
             answer("503 Service Unavailable"),
             String::new(),
             answer("502 Bad Gateway"),
             answer("204 No Content"),
         ]);
         let snapshot = format!("{url}/snapshot/7");
-        let publish = put_idempotent(&snapshot, "i1", &[7u8; 4096], &|| false)
+        let large = put_idempotent(&snapshot, "i1", &vec![7u8; (1 << 20) + 1], &|| false)
             .err()
             .unwrap();
-        assert!(matches!(publish, Error::PutUnknown {
+        assert!(matches!(large, Error::PutUnknown {
             last: Attempt::Status { status: 503, .. },
             ..
         }));
-        let retention = format!("{url}/retention/7");
-        let (status, _) = put_idempotent(&retention, "i1", b"", &|| false).unwrap();
+        let (status, _) = put_idempotent(&snapshot, "i1", &[7u8; 4096], &|| false).unwrap();
         assert_eq!(status, 204);
-        let paths: Vec<String> = server
-            .join()
-            .unwrap()
-            .iter()
-            .map(|r| r.split(' ').nth(1).unwrap().to_owned())
-            .collect();
-        assert_eq!(paths, [
-            "/b/s/snapshot/7",
-            "/b/s/snapshot/7",
-            "/b/s/retention/7",
-            "/b/s/retention/7",
-            "/b/s/retention/7",
-            "/b/s/retention/7",
-        ]);
+        assert_eq!(server.join().unwrap().len(), 7);
     }
 
     // One attempt whose outcome is unknown (no answer, an unmarked 5xx) and the append may be in

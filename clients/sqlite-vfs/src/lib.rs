@@ -87,8 +87,9 @@
 //!   offset. A publish or retention move refused with 402 holds snapshots until the next
 //!   acknowledged commit, like a commit refused by a layer that refuses other writes too, and
 //!   unlike one refused as `too_large`. A failed attempt waits before the next, twice as long
-//!   after each failure up to an hour, unless the database shrinks by more than a quarter (a body
-//!   over a size limit fails the same way until then).
+//!   after each failure, up to an hour while the body is too large and five minutes otherwise,
+//!   unless the database shrinks by more than a quarter (a body over a size limit fails the same
+//!   way until then).
 //!   Attach installs the latest snapshot when the local file is missing or behind it, then replays
 //!   the tail.
 //! * `SELECT ursula_status(path)` returns
@@ -123,7 +124,8 @@
 //! in bytes (32 MiB by default, from 64 KiB to 32 MiB: a value outside is taken to the nearer
 //! bound, and one that is not a number of bytes is ignored, both logged once as
 //! `setting_adjusted`). A larger transaction is refused as `too_large` without being sent. Test
-//! hook: `URSULA_VFS_SNAPSHOT_RETRY_MS` sets the wait after a first failed snapshot (100 ms).
+//! hook: `URSULA_VFS_SNAPSHOT_RETRY_MS` sets the wait after a first failed snapshot (100 ms, at
+//! least 1 ms).
 //!
 //! Module map:
 //!

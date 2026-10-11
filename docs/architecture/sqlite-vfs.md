@@ -483,8 +483,8 @@ snapshot (the server refuses).
 ### 4.4 Snapshot bodies on the server
 
 Bodies of at least `runtime.external_payload_min_size` (1 MiB) are stored in the cold tier when
-a cold backend is configured, up to 1 GiB; inline otherwise (up to 32 MiB). A superseded cold body
-stays readable for 5 minutes.
+a cold backend is configured, up to 1 GiB, and inline otherwise (up to 32 MiB). A superseded cold
+body stays readable for 5 minutes.
 
 Through `ursulagw` a body above its `--max-request-body-bytes` (32 MiB by default) is refused, and
 so is one above a proxy's limit, but the client does not always see the `413`. The gateway stops
@@ -495,32 +495,37 @@ on the platform), whose outcome is unknown. A proxy may also reset the connectio
 upload out. The attempt fails either way.
 
 A failed attempt is not repeated right away. Each attempt reads, compresses and sends the whole
-database, and a body over a size limit fails the same way every time until the database shrinks.
-So each failure doubles the wait before the next attempt, from 100 ms, up to 1 h when the body is
-too large and up to 5 min for anything else (an outage, a snapshot that does not read back, a
-local error), so that a snapshot follows soon after an outage. A body answered `413` is too large.
-A body over 1 MiB and larger than any this owner published or installed at attach may be too
-large as well when it got no answer after a connection carried it, a 5xx or a `408`. The thread
-then sends one `HEAD` to the stream on a new connection (`client::answers`). An answer below 500
-means the layers in front of the stream pass requests and the server is up, so the body is what
-failed. No answer, or a 5xx (a gateway whose servers are down), is an outage. A connection that
-never opened (refused, a host that did not resolve, a failed TLS handshake, a connect timeout)
-says nothing about the body, and neither does a failure of a body of at most 1 MiB, which was sent
-again until `URSULA_VFS_RETRY_MS` ran out: both are outages. Each wait is spread by a fifth either
-way, so owners that failed together do not try again together. A snapshot published (or found at
-its offset) ends the run. A commit's request meanwhile checks whether the database shrank: below
-three quarters of the image that last failed (after a `VACUUM`), the attempt starts at once. After
-an outage, the first commit acknowledged brings the next attempt forward, once a run, to a random
-point within the next 30 s (or within the rest of the wait, when that is shorter). Owners that an
-outage failed together spread out, and a snapshot that keeps failing while commits succeed still
-backs off. Within an attempt a body over 1 MiB is sent twice at most while its outcome stays
+database, and a body over a size limit fails the same way every time until the database shrinks. So
+each failure doubles the wait before the next attempt, from 100 ms, up to 1 h when the body is too
+large and up to 5 min for anything else (an outage, a snapshot that does not read back, a local
+error), so that a snapshot follows soon after an outage. A body answered `413` is too large. A body
+over 1 MiB and larger than any this owner published or installed at attach may be too large as well
+when its publish (not what follows a publish the stream accepted, such as the read-back) got no
+answer after a connection carried it, a 5xx or a `408`. The thread then sends one `HEAD` to the
+stream, on a new connection or one used within the last second (`client::answers`). An answer below
+500 that is no redirect means the layers in front of the stream pass requests and the server is up,
+so the body is what failed. No answer, a redirect or a 5xx (a gateway whose servers are down) is an
+outage. A 5xx that asks for a later attempt (`Retry-After`) or says it applied nothing
+(`x-ursula-not-applied`) puts the publish off, the way the server's ingress admission refuses a
+large body first under pressure: an outage, with no probe (a refusal for the size is a `413`). A
+connection that never opened (refused, a host that did not resolve, a failed TLS handshake, a
+resolve or connect timeout, 5 s each) says nothing about the body, and neither does a failure of a
+body of at most 1 MiB, which was sent again until `URSULA_VFS_RETRY_MS` ran out: both are outages.
+No probe goes out once the thread is stopped (a re-attach waits for it). Each wait is spread by a
+fifth either way, so owners that failed together do not try again together. A snapshot published (or
+found at its offset) ends the run. A commit's request meanwhile checks whether the database shrank:
+below three quarters of the image that last failed (after a `VACUUM`), the attempt starts at once.
+After an outage, the first commit acknowledged brings the next attempt forward, once a run, to a
+random point within the next 30 s (or within the rest of the wait, when that is shorter). Owners
+that an outage failed together spread out, and a snapshot that keeps failing while commits succeed
+still backs off. Within an attempt a body over 1 MiB is sent twice at most while its outcome stays
 unknown (a refused token, sent again, does not count, and a `307` counts like a `503`), and a
-smaller body is retried within `URSULA_VFS_RETRY_MS`. A vouched 5xx counts as a send like any
-other, and the second send ends the attempt without waiting for its `Retry-After`: the run's wait
-applies instead. A retention move that fails after the snapshot read back is logged
-(`retention_failed`) and tried again after the next snapshot. It neither extends the run nor
-shows in `snapshot_failures` or `snapshot_error`. The run lives in memory, so a new attach starts
-without a wait.
+smaller body is retried within `URSULA_VFS_RETRY_MS`. A vouched 5xx counts as a send like any other,
+and the second send ends the attempt without waiting for its `Retry-After`: the run's wait applies
+instead, and never ends before that `Retry-After`. A retention move that fails after the snapshot
+read back is logged (`retention_failed`) and tried again after the next snapshot. It neither extends
+the run nor shows in `snapshot_failures` or `snapshot_error`. The run lives in memory, so a new
+attach starts without a wait.
 
 `ursula_status` reports the run (`snapshot_failures`, and `snapshot_error`: a `413` with the body's
 size, or the failed write) and the compressed size of the latest body built (`snapshot_bytes`),
@@ -735,7 +740,7 @@ What attach does in each case:
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
 - A snapshot that cannot be taken (a long reader pins WAL frames) or published (body too large):
-  the log grows, nothing is lost; retention simply does not advance. A body too large is sent
+  the log grows, nothing is lost, and retention does not advance. A body too large is sent
   again every 48 to 72 minutes once its failures run long (an hour, give or take a fifth), and at
   once after the database shrank by more than a quarter (§4.4).
 
@@ -952,19 +957,24 @@ must say in its release notes to stop every owner of a stream before upgrading.
   commit is acknowledged, unless a layer refused a commit at that sequence before. A vouched 413
   leaves a layer's earlier refusal as it was too, and a due snapshot waits only while a layer's
   refusal that refuses other writes is recorded.
-- Units also cover snapshot failures. A `413` is about the size. A failure of a body over 1 MiB and
-  larger than any published or installed, with no answer after a connection carried it, a 5xx or a
-  `408`, is about the size when the stream answers the probe right after it, and an outage when it
-  does not. A refused connection, a host that did not resolve or a connect timeout, and any failure
-  of a smaller body, are outages, and anything else is neither. Each failure doubles the wait,
+- Units also cover snapshot failures. A `413` is about the size. A failed publish of a body over
+  1 MiB and larger than any published or installed, with no answer after a connection carried it,
+  a 5xx or a `408`, is about the size when the stream answers the probe right after it, and an
+  outage when it does not. A 5xx that asks for a later attempt or says it applied nothing, a
+  failure after the stream accepted the publish (a read-back answered 502 or 504), a refused
+  connection, a host that did not resolve, a resolve or connect timeout, and any failure of a
+  smaller body, are outages, and anything else is neither. The next attempt waits at least the
+  `Retry-After` of a publish put off. Each failure doubles the wait,
   from 100 ms up to 1 h for the size and 5 min otherwise, spread by a fifth, and a run of outages
   stops at 5 min. Only a snapshot at the offset ends the run, which keeps the size of the image
   that failed. A database below three quarters of that image is not held back, while one that
   grew, shrank less or was empty is. A commit brings the next attempt forward after an outage, to
   a random point within 30 s, once a run. Against a stand-in server that answers exactly the
   requests expected, a body over 1 MiB whose outcome stays unknown is sent twice (a refused token
-  does not count, a `307` does), and a smaller one until it is accepted. The probe counts an answer
-  below 500 alone: a 5xx, no answer or nothing listening is none.
+  does not count, a `307` does), and a smaller one until it is accepted. A large body put off with a
+  `Retry-After` of 30 s ends the call at once and keeps it. The probe counts an answer below 500
+  that is no redirect alone: a `307`, a 5xx, no answer or nothing listening is none. Both agents
+  resolve and connect within 5 s each.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -1042,12 +1052,16 @@ must say in its release notes to stop every owner of a stream before upgrading.
   `kind=outage`), the 1.6 MB body is sent twice, then the probe, and nothing more while nothing
   commits. The first commit after it brings the next attempt forward to within 30 s, and the next
   commits do not. With a first wait of a second, the gate opens only between two attempts, and the
-  snapshot thread publishes on its own, no sooner than the wait it logged. A retention move
-  answered 503 until the retry budget runs out is logged as `retention_failed`, the snapshot is
-  published with no failure counted, and the move after the next snapshot succeeds. Through a
-  real `ursula gateway` with a 512 KiB limit and a first body over 1 MiB, a snapshot over the limit
-  fails (a `413` or a failed write, `kind=size` either way, since the gateway answers the probe),
-  waits, and is published after a `VACUUM`.
+  snapshot thread publishes on its own, no sooner than the wait it logged. A retention move answered
+  503 until the retry budget runs out is logged as `retention_failed`, the snapshot is published
+  with no failure counted, and the move after the next snapshot succeeds. Commits after the second
+  failure of the outage bring nothing forward within the 30 s a brought-forward attempt would start
+  in. A publish put off with a 503 that asks for a second and is marked
+  `IngressBodyBytesLimitReached` (HEADs pass) is an outage that waits at least the second. After an
+  attach that installed a 1.6 MB snapshot, the failed publish of a 1.3 MB body is an outage, not a
+  body too large. Through a real `ursula gateway` with a 512 KiB limit and a first body over 1 MiB,
+  a snapshot over the limit fails (a `413` or a failed write, `kind=size` either way, since the
+  gateway answers the probe), waits, and is published after a `VACUUM`.
 - Same-minor compatibility (`test/compat.e2e.ts`, §7): the previous published patch of the minor
   and the build take over each other's streams on a new host and on the same one, both ways.
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + S3 (AWS S3 in CI,

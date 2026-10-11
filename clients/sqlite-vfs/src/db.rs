@@ -149,8 +149,10 @@ pub(crate) struct Db {
     pub(crate) snapshot_failing: Option<SnapshotFailing>,
     /// The compressed size of the latest snapshot body built, published or not.
     pub(crate) snapshot_bytes: Option<usize>,
-    /// The largest snapshot body this owner published, in bytes: a larger one that gets no answer
-    /// is taken to be over a size limit (`snapshotter::FailureKind::Size`).
+    /// The largest snapshot body this owner published, or installed at attach
+    /// (`attach::Applier::installed_bytes`), in bytes: the publish of a larger body that fails may
+    /// have failed for its size, which a probe of the stream decides
+    /// (`snapshotter::FailureKind::may_be_size`).
     pub(crate) snapshot_published_bytes: usize,
 }
 

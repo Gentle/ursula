@@ -150,15 +150,16 @@ it("a snapshot over a request size limit is reported and not sent again until th
 // The gate answers 503 to the snapshot's PUT and to the HEAD that probes the stream after it, an
 // outage: each attempt sends the 1.6 MB body twice at most. While nothing commits, the next attempt
 // waits (a minute here). The first commit after it brings that attempt forward, to within 30 s (the
-// stream takes writes again), once a run: the commits after it do not.
+// stream takes writes again), once a run: the commits after it do not, nor do commits after the
+// next failure, whose attempt waits two minutes.
 it("a large snapshot publish whose outcome stays unknown is sent twice at most, and a commit brings the next attempt forward once", async () => {
 	const path = streamPath();
 	const file = freshFile();
-	const [armed, checked, second] = [`${file}.armed`, `${file}.checked`, `${file}.second`];
+	const [armed, checked, second, third] = [`${file}.armed`, `${file}.checked`, `${file}.second`, `${file}.third`];
 	// The attach's HEAD and the fill pass the gate. The commit that makes the snapshot due (the
 	// second rewrite) is the last before a wait, so none runs between the first failure and its end.
 	const first = [...FILL, `@wait:${armed}`, ...rewrites(2)];
-	const steps = [...first, `@wait:${checked}`, "@status", ...rewrites(10, 40), `@wait:${second}`, "@status"];
+	const steps = [...first, `@wait:${checked}`, "@status", ...rewrites(10, 40), `@wait:${second}`, ...rewrites(5, 50), `@wait:${third}`, "@status"];
 	const child = runChild(file, gate.url + path, steps, ENV);
 	await child.waitFor((l) => l.step === FILL.length && l.phase === "start");
 	const before = await refusedSoFar();
@@ -180,7 +181,15 @@ it("a large snapshot publish whose outcome stays unknown is sent twice at most, 
 	expect((await failedSnapshots(child, 2, 40_000)).kind).toBe("outage");
 	await sleep(1500);
 	expect((await refusedSoFar()) - before).toBe(6);
+
+	// Five more commits after the second failure bring nothing forward: no attempt within the 30 s a
+	// brought-forward one would start in.
 	writeFileSync(second, "");
+	await child.waitFor((l) => l.step === steps.indexOf(`@wait:${third}`) && l.phase === "start");
+	await sleep(31_000);
+	expect((await refusedSoFar()) - before).toBe(6);
+	expect(child.stderr()).not.toMatch(/event=snapshot_failed .* failures=3 /);
+	writeFileSync(third, "");
 	const done = await statusAt(child, steps.length - 1);
 	expect(child.lines.filter((l) => l.ok === false)).toEqual([]);
 	expect(done).toMatchObject({ poisoned: false, snapshot: "-1", snapshot_failures: 2 });
@@ -216,6 +225,77 @@ it("after an outage the snapshot thread publishes on its own once the layer acce
 	expect(await child.exited).toMatchObject({ code: 0 });
 	expect(child.lines.filter((l) => l.ok === false)).toEqual([]);
 	expect((await offsets(path)).snapshot).toBe(snapshot);
+});
+
+// A layer that did not read a large body in time answers 408. The stream still answers the probe's
+// HEAD, so that body is taken for one too large, as a 413 is.
+it("a large publish answered 408 while the stream answers is a body too large", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const [armed, failed] = [`${file}.armed`, `${file}.failed`];
+	const steps = [...FILL, `@wait:${armed}`, ...rewrites(2), `@wait:${failed}`, "@status"];
+	const child = runChild(file, gate.url + path, steps, ENV);
+	await child.waitFor((l) => l.step === FILL.length && l.phase === "start");
+	await gate.refuse("", { status: 408, methods: ["PUT"], over: LIMIT });
+	writeFileSync(armed, "");
+	expect((await failedSnapshots(child, 1)).kind).toBe("size");
+	writeFileSync(failed, "");
+	const s = await statusAt(child, steps.length - 1);
+	expect(s).toMatchObject({ poisoned: false, snapshot: "-1", snapshot_failures: 1 });
+	expect(s.snapshot_error).toMatch(/^publish snapshot .+: 408: a body of \d+ bytes was not read in time/);
+	await child.exited;
+});
+
+// The server's ingress admission refuses a write under pressure with a 503 that asks for a second
+// (Retry-After) and says it applied nothing, and a large body first, while HEADs pass. That is no
+// sign of the body's size, which a layer refuses with a 413: an outage, with no probe, and the next
+// attempt waits at least the second asked for (100 ms otherwise, the default first wait here).
+it("a large publish put off with Retry-After and the not-applied marker is an outage, not a body too large", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const [armed, done] = [`${file}.armed`, `${file}.done`];
+	const steps = [...FILL, `@wait:${armed}`, ...rewrites(2), `@wait:${done}`];
+	const child = runChild(file, gate.url + path, steps, { URSULA_VFS_SNAPSHOT_MIN_BYTES: "1", CHILD_EXIT: "1" });
+	await child.waitFor((l) => l.step === FILL.length && l.phase === "start");
+	await gate.refuse("", { status: 503, methods: ["PUT"], over: LIMIT, headers: { "retry-after": "1", "x-ursula-not-applied": "IngressBodyBytesLimitReached" } });
+	writeFileSync(armed, "");
+	const { kind, retryMs } = await failedSnapshots(child, 1);
+	expect(kind).toBe("outage");
+	expect(retryMs).toBeGreaterThanOrEqual(900);
+	await gate.refuse(null);
+	await snapshotPast(path, "-1");
+	writeFileSync(done, "");
+	expect(await child.exited).toMatchObject({ code: 0 });
+	expect(child.lines.filter((l) => l.ok === false)).toEqual([]);
+});
+
+// An attach that installs a snapshot takes its body's size as the largest this owner published: a
+// smaller body whose publish fails is no sign of a size limit, since the stream took a larger one,
+// whatever the probe would say. The gate answers 503 to PUTs over 1 MiB and passes HEADs.
+it("after an attach installed a snapshot, a smaller body's failed publish is an outage", async () => {
+	const path = streamPath();
+	const [first, second] = [freshFile(), freshFile()];
+	// The first owner publishes the snapshot of a 1.6 MB database (24 rows) and leaves.
+	const published = `${first}.published`;
+	const a = runChild(first, gate.url + path, [...FILL, ...rewrites(2), `@wait:${published}`], { URSULA_VFS_SNAPSHOT_MIN_BYTES: "1", CHILD_EXIT: "1" });
+	const installed = await snapshotPast(path, "-1");
+	writeFileSync(published, "");
+	expect(await a.exited).toMatchObject({ code: 0 });
+
+	// The second owner, on a fresh file, installs it, keeps 20 rows (about 1.3 MB, still over 1 MiB),
+	// and commits until a snapshot is due.
+	const [failed, done] = [`${second}.failed`, `${second}.done`];
+	await gate.refuse("", { status: 503, methods: ["PUT"], over: 1 << 20 });
+	const steps = ["DELETE FROM t WHERE k >= 20", "VACUUM", ...rewrites(4), `@wait:${failed}`, "@status", `@wait:${done}`];
+	const b = runChild(second, gate.url + path, steps, { ...ENV, CHILD_EXIT: "1" });
+	expect((await failedSnapshots(b, 1)).kind).toBe("outage");
+	writeFileSync(failed, "");
+	const s = await statusAt(b, steps.indexOf("@status"));
+	expect(s).toMatchObject({ poisoned: false, snapshot: installed, snapshot_failures: 1 });
+	expect(s.snapshot_bytes).toBeGreaterThan(1 << 20);
+	writeFileSync(done, "");
+	expect(await b.exited).toMatchObject({ code: 0 });
+	expect(b.lines.filter((l) => l.ok === false)).toEqual([]);
 });
 
 // A retention move that fails does not fail the snapshot published before it: the move is logged and

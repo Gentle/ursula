@@ -71,12 +71,22 @@ fn bulk_agent() -> &'static ureq::Agent {
     })
 }
 
+/// How long resolving a host, and connecting to it (the TLS handshake included), may take, each:
+/// well below either agent's timeout. A host that does not answer fails the request as
+/// `Timeout::Resolve` or `Timeout::Connect`, before anything of it was sent (`before_connection`),
+/// rather than holding it for the whole timeout (ureq reports the earliest deadline, and a
+/// connection's starts when the host resolved).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// An agent whose requests time out after `timeout` and that keeps a connection for
-/// `max_idle_age` after its last request. The pool keeps ureq's bounds: at most 3 idle
-/// connections per host and 10 in all.
+/// `max_idle_age` after its last request. Resolving and connecting time out after
+/// `CONNECT_TIMEOUT` each. The pool keeps ureq's bounds: at most 3 idle connections per host and
+/// 10 in all.
 fn new_agent(timeout: Duration, max_idle_age: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
+        .timeout_resolve(Some(CONNECT_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
         .http_status_as_error(false)
         // Every redirect comes back to the caller, which sends a 307 again to the same URL and
         // fails on any other (`redirect_retried`). Followed, a redirect would go out without
@@ -199,19 +209,21 @@ pub(crate) fn before_connection(e: &ureq::Error) -> bool {
     }
 }
 
-/// Whether the stream at `url` answers a `HEAD` with a status below 500, in one attempt on a new
-/// connection: the layers in front of the stream pass a request without a body, and the server
-/// behind them is up (a gateway whose servers are down answers 502 or 503). The snapshot thread
-/// asks after a large body failed, to tell a body too large for a layer in front of the stream
-/// from an outage (`snapshotter::FailureKind`).
+/// Whether the stream at `url` answers a `HEAD` with a status below 500 that is no redirect, in one
+/// attempt, on a new connection or one used within the last second (`Resend::fresh`): the layers
+/// in front of the stream pass a request without a body, and the server behind them is up (a
+/// gateway whose servers are down answers 502 or 503). A redirect is no answer, as everywhere
+/// else in the client. The snapshot thread asks after a large body failed, to tell a body too
+/// large for a layer in front of the stream from an outage (`snapshotter::FailureKind`).
 pub(crate) fn answers(url: &str) -> bool {
     let resend = Resend {
         fresh: true,
         ..Resend::default()
     };
-    prepared(agent().head(url), resend)
-        .call()
-        .is_ok_and(|r| r.status().as_u16() < 500)
+    prepared(agent().head(url), resend).call().is_ok_and(|r| {
+        let status = r.status().as_u16();
+        status < 500 && !(300..400).contains(&status)
+    })
 }
 
 /// A token went out in clear (`authorized`), and the log said so.
@@ -1053,8 +1065,11 @@ pub(crate) const RESENT_UP_TO: usize = 1 << 20;
 /// a snapshot body over a gateway's limit stays a snapshot failure, which the snapshot thread
 /// counts. A body larger than [`RESENT_UP_TO`] is sent [`UNKNOWN_SENDS`] times at most while its
 /// outcome stays unknown (a refused token, sent again with the token read again, does not count),
-/// a smaller one (a small snapshot, a retention move) until the retry budget runs out. Returns the
-/// status and response. Gives up once `stopped` (a re-attach is waiting for the snapshot thread).
+/// a smaller one (a small snapshot, a retention move) until the retry budget runs out. The count
+/// is checked before the pause, so the last send of a large body ends the call without waiting
+/// for its Retry-After, which the error keeps when a 5xx put the request off (`Attempt::Deferred`,
+/// `Error::retry_after`). Returns the status and response. Gives up once `stopped` (a re-attach is
+/// waiting for the snapshot thread).
 pub(crate) fn put_idempotent(
     url: &str,
     incarnation: &str,
@@ -1095,6 +1110,18 @@ pub(crate) fn put_idempotent(
                             Some(e) => Err(e),
                             None => Ok((status, r)),
                         };
+                    }
+                    // A 5xx that asks for a later attempt or says it applied nothing: put off,
+                    // not about the body's size (`Attempt::Deferred`).
+                    (_, status)
+                        if status >= 500
+                            && (retry_after.is_some() || r.headers().contains_key(NOT_APPLIED)) =>
+                    {
+                        Attempt::Deferred {
+                            status,
+                            body: body_text(&mut r),
+                            retry_after,
+                        }
                     }
                     (_, status) => Attempt::Status {
                         status,
@@ -1814,16 +1841,22 @@ mod tests {
     }
 
     // The probe after a large snapshot body failed: the stream answers it only with a status below
-    // 500, on the first attempt. A 5xx (a gateway whose servers are down), no answer or nothing
-    // listening is none.
+    // 500 that is no redirect, on the first attempt. A redirect, a 5xx (a gateway whose servers are
+    // down), no answer or nothing listening is none.
     #[test]
     fn the_stream_answers_a_probe_only_below_500() {
         for (status, answered) in [
             ("200 OK", true),
             ("404 Not Found", true),
             ("401 Unauthorized", true),
+            (
+                "307 Temporary Redirect\r\nlocation: http://127.0.0.1:9/b/s",
+                false,
+            ),
+            ("500 Internal Server Error", false),
             ("502 Bad Gateway", false),
             ("503 Service Unavailable", false),
+            ("504 Gateway Timeout", false),
             ("", false),
         ] {
             let (url, server) = serve(vec![if status.is_empty() {
@@ -1839,6 +1872,52 @@ mod tests {
         let url = format!("http://{}/b/s", nothing.local_addr().unwrap());
         drop(nothing);
         assert!(!answers(&url), "nothing listening");
+    }
+
+    // A 5xx that asks for a later attempt (Retry-After) or says it applied nothing puts the request
+    // off (`Attempt::Deferred`), as the server's ingress admission does under pressure. The second
+    // send of a large body ends the call at once, without waiting the 30 s it asked for: the error
+    // keeps the Retry-After, for the snapshot thread's wait.
+    #[test]
+    fn a_large_body_put_off_ends_the_call_and_keeps_the_retry_after() {
+        let large = vec![7u8; (1 << 20) + 1];
+        let (url, server) = serve(vec![
+            String::new(),
+            answer("503 Service Unavailable\r\nretry-after: 30"),
+        ]);
+        let started = Instant::now();
+        let put = put_idempotent(&format!("{url}/snapshot/7"), "i1", &large, &|| false);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(matches!(put, Err(Error::PutUnknown {
+            last: Attempt::Deferred {
+                status: 503,
+                retry_after: Some(after),
+                ..
+            },
+            ..
+        }) if after == Duration::from_secs(30)));
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        let marked = || {
+            answer(&format!(
+                "503 Service Unavailable\r\n{}",
+                marker("IngressBodyBytesLimitReached")
+            ))
+        };
+        let (url, server) = serve(vec![marked(), marked()]);
+        let put = put_idempotent(&format!("{url}/snapshot/7"), "i1", &large, &|| false);
+        assert!(matches!(
+            put,
+            Err(Error::PutUnknown {
+                last: Attempt::Deferred {
+                    status: 503,
+                    retry_after: None,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     // A body over 1 MiB whose outcome stays unknown is sent twice at most: a large snapshot that a
@@ -2465,6 +2544,19 @@ mod tests {
             assert_eq!(config.max_idle_age(), Duration::from_secs(age));
             assert_eq!(config.max_idle_connections_per_host(), 3);
             assert_eq!(config.max_idle_connections(), 10);
+        }
+    }
+
+    // Both agents resolve and connect (the TLS handshake included) within 5 s each, well below
+    // their timeouts: a host that does not answer fails as `Timeout::Resolve` or `Timeout::Connect`
+    // (`before_connection`), not as the whole request's timeout.
+    #[test]
+    fn agents_resolve_and_connect_within_5_s() {
+        for agent in [agent(), bulk_agent()] {
+            let timeouts = agent.config().timeouts();
+            assert_eq!(timeouts.resolve, Some(Duration::from_secs(5)));
+            assert_eq!(timeouts.connect, Some(Duration::from_secs(5)));
+            assert!(timeouts.global > Some(Duration::from_secs(5)));
         }
     }
 

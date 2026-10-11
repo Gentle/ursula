@@ -161,16 +161,22 @@ pub(crate) enum FailureKind {
 
 impl FailureKind {
     /// Whether a failure may be about the body's size, which a probe of the stream then decides
-    /// (`snapshot_loop`). The body, `body` bytes, is over `RESENT_UP_TO` (a smaller one was sent
+    /// (`snapshot_loop`). Only the body's publish can fail for its size, so the stream has not
+    /// accepted it (`Taken::published`). The body is over `RESENT_UP_TO` (a smaller one was sent
     /// again until the retry budget ran out) and larger than any this owner published or
     /// installed (`largest_published`). And the failure is one a size limit in front of the stream
     /// causes: no answer after a connection carried the request (a layer that stops reading at
-    /// its limit closes the connection), a 5xx, or a 408. A connection that never opened (a
-    /// refused connection, a host that did not resolve, a failed TLS handshake, a connect timeout)
-    /// says nothing about the body.
-    fn may_be_size(e: &Error, body: Option<usize>, largest_published: usize) -> bool {
-        let large = body.is_some_and(|bytes| bytes > RESENT_UP_TO && bytes > largest_published);
-        large
+    /// its limit closes the connection), a 5xx that neither asked for a later attempt nor said it
+    /// applied nothing (`Attempt::Deferred`: the server's ingress admission refuses a large body
+    /// first, and a refusal for the size is a 413), or a 408. A connection that never opened (a
+    /// refused connection, a host that did not resolve, a failed TLS handshake, a resolve or
+    /// connect timeout) says nothing about the body.
+    fn may_be_size(e: &Error, taken: &Taken, largest_published: usize) -> bool {
+        let large = taken
+            .body
+            .is_some_and(|bytes| bytes > RESENT_UP_TO && bytes > largest_published);
+        !taken.published
+            && large
             && match e {
                 Error::PutUnknown {
                     last: Attempt::Transport(e),
@@ -179,8 +185,8 @@ impl FailureKind {
                 Error::PutUnknown {
                     last: Attempt::Status { status, .. },
                     ..
-                }
-                | Error::Status { status, .. } => *status >= 500 || *status == 408,
+                } => *status >= 500,
+                Error::SnapshotTimedOut { .. } => true,
                 _ => false,
             }
     }
@@ -218,11 +224,14 @@ impl FailureKind {
 }
 
 /// What a snapshot attempt took, as far as it got (`snapshot_once`): the image's size in pages,
-/// and the body's size in bytes.
+/// the body's size in bytes, and whether the stream accepted the body's publish (a 2xx). What
+/// fails after the publish (the read-back, the `HEAD` of a covered snapshot) is not about the
+/// body's size ([`FailureKind::may_be_size`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Taken {
     pub(crate) pages: Option<u32>,
     pub(crate) body: Option<usize>,
+    pub(crate) published: bool,
 }
 
 /// Snapshot attempts that failed in a row, since the last one that published a snapshot at its
@@ -329,13 +338,20 @@ fn record_attempt(
                 ),
                 None => (1, first, false),
             };
+            // Never sooner than the server, or a layer in front of it, asked for.
+            let until = [Some(jittered(wait)), e.retry_after()]
+                .into_iter()
+                .flatten()
+                .max()
+                .and_then(|after| now.checked_add(after))
+                .unwrap_or(now);
             d.snapshot_failing = Some(SnapshotFailing {
                 count,
                 error: e.to_string(),
                 kind,
                 pages: taken.pages.unwrap_or(d.pages),
                 wait,
-                until: now.checked_add(jittered(wait)).unwrap_or(now),
+                until,
                 brought_forward,
             });
         }
@@ -363,16 +379,17 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
         let mut taken = Taken::default();
         let attempt = snapshot_once(db, snapper, &mut taken);
         // After a failure that may be about the body's size, whether the stream answers a request
-        // without a body (`client::answers`): asked outside the lock.
+        // without a body (`client::answers`): asked outside the lock. Not once stopped: a
+        // re-attach waits for this thread, and a stop cut the attempt short.
         let answered = match &attempt {
-            Err(e) => {
+            Err(e) if !snapper.stopped() => {
                 let (largest, url) = {
                     let d = lock(db);
                     (d.snapshot_published_bytes, d.url.clone())
                 };
-                FailureKind::may_be_size(e, taken.body, largest).then(|| answers(&url))
+                FailureKind::may_be_size(e, &taken, largest).then(|| answers(&url))
             }
-            Ok(_) => None,
+            Err(_) | Ok(_) => None,
         };
         let (path, url, failing, due) = {
             let mut d = lock(db);
@@ -557,7 +574,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper, taken: &mut Taken) -> Result
         Err(e) => return refused(e, "snapshot publish"),
     };
     match published {
-        (200..=299, _) => {}
+        (200..=299, _) => taken.published = true,
         (412, _) => {
             fence(
                 format!("snapshot at {offset} not published"),
@@ -588,6 +605,13 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper, taken: &mut Taken) -> Result
         }
         (413, mut r) => {
             return Err(Error::SnapshotTooLarge {
+                url: format!("{url}/snapshot/{offset}"),
+                bytes: body.len(),
+                body: body_text(&mut r),
+            });
+        }
+        (408, mut r) => {
+            return Err(Error::SnapshotTimedOut {
                 url: format!("{url}/snapshot/{offset}"),
                 bytes: body.len(),
                 body: body_text(&mut r),
@@ -736,10 +760,12 @@ mod tests {
     }
 
     /// The image of `pages` and a body of `body` bytes.
+    /// What an attempt that built a body of `body` bytes took, the stream not having accepted it.
     fn took(pages: u32, body: usize) -> Taken {
         Taken {
             pages: Some(pages),
             body: Some(body),
+            published: false,
         }
     }
 
@@ -780,46 +806,65 @@ mod tests {
         }
     }
 
-    // A failure may be about the body's size only for a body over 1 MiB and larger than any this
-    // owner published or installed, when it got no answer after a connection carried it, a 5xx or
-    // a 408. A connection that never opened (refused, a host that did not resolve) says nothing
-    // about the body, and neither does a small body, which was sent again until the budget ran out.
+    // A failure may be about the body's size only for a publish the stream did not accept, of a
+    // body over 1 MiB and larger than any this owner published or installed, when it got no answer
+    // after a connection carried it, a 5xx that neither asked for a later attempt nor said it
+    // applied nothing, or a 408. A connection that never opened (refused, a host that did not
+    // resolve, a resolve or connect timeout) says nothing about the body, and neither does a small
+    // body, which was sent again until the budget ran out, nor anything after the publish.
     #[test]
-    fn a_failure_may_be_about_the_size_only_for_a_large_body_that_went_out() {
-        let large = Some(2 << 20);
-        let may_be_size = |e: &Error, body: Option<usize>, largest: usize| {
-            FailureKind::may_be_size(e, body, largest)
-        };
-        let status = |status| Error::Status {
-            op: "put",
+    fn a_failure_may_be_about_the_size_only_for_a_large_publish_that_went_out() {
+        let large = took(400, 2 << 20);
+        let unknown = |last| Error::PutUnknown {
             url: "u".into(),
-            status,
-            body: String::new(),
+            last,
         };
-        let unknown_status = |status| Error::PutUnknown {
-            url: "u".into(),
-            last: Attempt::Status {
+        let status = |status| {
+            unknown(Attempt::Status {
                 status,
                 body: String::new(),
-            },
+            })
         };
-        assert!(may_be_size(&unanswered(), large, 1000));
-        assert!(may_be_size(&unknown_status(503), large, 1000));
-        assert!(may_be_size(&status(408), large, 1000));
-        assert!(!may_be_size(&status(404), large, 1000));
+        let deferred = |retry_after| {
+            unknown(Attempt::Deferred {
+                status: 503,
+                body: String::new(),
+                retry_after,
+            })
+        };
+        let timed_out = Error::SnapshotTimedOut {
+            url: "u".into(),
+            bytes: 2 << 20,
+            body: String::new(),
+        };
+        assert!(FailureKind::may_be_size(&unanswered(), &large, 1000));
+        assert!(FailureKind::may_be_size(&status(503), &large, 1000));
+        assert!(FailureKind::may_be_size(&timed_out, &large, 1000));
         assert!(
-            !may_be_size(&unanswered(), large, 2 << 20),
+            !FailureKind::may_be_size(&deferred(Some(Duration::from_secs(1))), &large, 0),
+            "a 503 that asks for a later attempt"
+        );
+        assert!(
+            !FailureKind::may_be_size(&deferred(None), &large, 0),
+            "a 503 that says it applied nothing"
+        );
+        assert!(!FailureKind::may_be_size(&status(307), &large, 0));
+        assert!(
+            !FailureKind::may_be_size(&unanswered(), &large, 2 << 20),
             "as large as one published"
         );
         assert!(
-            !may_be_size(&unanswered(), Some(1 << 20), 0),
+            !FailureKind::may_be_size(&unanswered(), &took(400, 1 << 20), 0),
             "not over 1 MiB"
         );
         assert!(
-            !may_be_size(&unanswered(), Some(1000), 0),
+            !FailureKind::may_be_size(&unanswered(), &took(400, 1000), 0),
             "small, with no baseline"
         );
-        assert!(!may_be_size(&unanswered(), None, 0), "no body");
+        assert!(
+            !FailureKind::may_be_size(&unanswered(), &Taken::default(), 0),
+            "no body"
+        );
         for (name, e) in [
             (
                 "refused",
@@ -828,13 +873,79 @@ mod tests {
             ("unresolved", ureq::Error::HostNotFound),
             ("failed", ureq::Error::ConnectionFailed),
             (
+                "resolve timeout",
+                ureq::Error::Timeout(ureq::Timeout::Resolve),
+            ),
+            (
                 "connect timeout",
                 ureq::Error::Timeout(ureq::Timeout::Connect),
             ),
         ] {
-            assert!(!may_be_size(&unconnected(e), large, 0), "{name}");
+            assert!(
+                !FailureKind::may_be_size(&unconnected(e), &large, 0),
+                "{name}"
+            );
         }
-        assert!(!may_be_size(&too_large().unwrap_err(), large, 0));
+        assert!(!FailureKind::may_be_size(
+            &too_large().unwrap_err(),
+            &large,
+            0
+        ));
+    }
+
+    // Once the stream accepted the publish, what fails after it is not about the body's size: a
+    // read-back answered 502 (a node restarting) or 504 (a slow read of a cold body), or the HEAD
+    // of a covered snapshot. It is an outage, with no probe, however large the body.
+    #[test]
+    fn a_large_body_that_fails_after_its_publish_is_an_outage() {
+        let published = Taken {
+            published: true,
+            ..took(400, 2 << 20)
+        };
+        let now = Instant::now();
+        for status in [502, 504] {
+            let read_back = Error::Status {
+                op: "get snapshot",
+                url: "u".into(),
+                status,
+                body: String::new(),
+            };
+            assert!(!FailureKind::may_be_size(&read_back, &published, 0));
+            assert!(!FailureKind::may_be_size(
+                &read_back,
+                &took(400, 2 << 20),
+                0
+            ));
+            let mut d = Db::for_tests();
+            record_attempt(&mut d, &Err(read_back), published, None, now);
+            assert_eq!(
+                d.snapshot_failing.as_ref().map(|f| f.kind),
+                Some(FailureKind::Outage),
+                "{status}"
+            );
+        }
+        assert!(!FailureKind::may_be_size(&unanswered(), &published, 0));
+    }
+
+    // A publish the server put off with a Retry-After is not attempted again sooner, whatever the
+    // run's wait (100 ms here, after a first failure).
+    #[test]
+    fn a_failed_attempt_waits_at_least_the_retry_after_it_got() {
+        let now = Instant::now();
+        let mut d = Db::for_tests();
+        let put_off = Error::PutUnknown {
+            url: "u".into(),
+            last: Attempt::Deferred {
+                status: 503,
+                body: String::new(),
+                retry_after: Some(Duration::from_secs(30)),
+            },
+        };
+        record_attempt(&mut d, &Err(put_off), took(400, 2 << 20), None, now);
+        let failing = d.snapshot_failing.as_ref().unwrap();
+        assert_eq!(failing.kind, FailureKind::Outage);
+        assert!(failing.wait < Duration::from_secs(1));
+        assert_eq!(failing.until.duration_since(now), Duration::from_secs(30));
     }
 
     // A 413 is about the body's size, and so is a failure that may be (above) when the stream

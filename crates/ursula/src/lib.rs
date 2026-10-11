@@ -4087,6 +4087,14 @@ impl PreProposalRefusal {
 /// request that can propose more than one command must not use this: a
 /// refusal of a later command says nothing about the earlier ones.
 ///
+/// A close and an append with an external payload can still propose a
+/// `TouchStreamAccess` before their write: when the stream has expired, the
+/// engine proposes it after its leadership check to apply the expiry. That
+/// command can commit, so no refusal that [`PreProposalRefusal::of`]
+/// classifies may be raised after it. None is: the core worker refuses before
+/// any engine runs, the leadership check runs before the touch, and cold
+/// admission covers only inline creates and appends, which propose no touch.
+///
 /// [`NOT_APPLIED_HEADER`]: ursula_proto::headers::NOT_APPLIED_HEADER
 async fn one_command_error_response(
     state: &HttpState,

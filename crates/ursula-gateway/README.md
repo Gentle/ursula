@@ -131,8 +131,9 @@ redirect a write after it proposed it. A node marks only the redirects it
 sends before it proposes a write, so a leader's admission refusal reached
 through such a redirect keeps its marker. The other answers the gateway gives
 when an upstream fails carry no marker: the `502` and `504`, and the `503`
-for a leader it could not connect to after a redirect, since the node that
-redirected may have proposed the request.
+for a leader it could not connect to after a redirect. The gateway leaves
+every failure of the leader hop unmarked, even after a marked redirect: it
+does not combine a redirect's marker with a failed second exchange.
 
 From 0.7.3 the gateway sets `x-ursula-not-applied-checked: 1`, the vouch, on
 every response it returns: forwarded responses, its own refusals and its own

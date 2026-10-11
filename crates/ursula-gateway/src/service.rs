@@ -123,11 +123,15 @@ fn access_control(args: &GatewayArgs) -> Result<Option<AccessControl>, Box<dyn s
     let resolver = JwtPrincipalResolver::new(jwt_config)?;
     let authorizer = StaticPolicyAuthorizer::from_file(policy_path)?;
 
-    tracing::info!(policy = %policy_path.display(), "gateway access control enabled");
-    Ok(Some(AccessControl::new(
-        Arc::new(resolver),
-        Arc::new(authorizer),
-    )))
+    tracing::info!(
+        policy = %policy_path.display(),
+        public_metrics = args.auth_public_metrics,
+        "gateway access control enabled"
+    );
+    Ok(Some(
+        AccessControl::new(Arc::new(resolver), Arc::new(authorizer))
+            .with_public_metrics(args.auth_public_metrics),
+    ))
 }
 
 fn gateway_config(args: &GatewayArgs) -> GatewayConfig {
@@ -204,6 +208,17 @@ pub struct GatewayArgs {
     #[arg(long, requires = "auth_issuer")]
     auth_policy: Option<PathBuf>,
 
+    /// Answer `GET /__ursula/gateway/metrics` with the gateway's own counters
+    /// for every caller, with or without a token, as a gateway without access
+    /// control does. Requires access control (`--auth-issuer`). Without this
+    /// flag an access-controlled gateway answers that path 404, like every
+    /// other `/__ursula/*` path. The counters hold no tenant data, but they
+    /// show traffic volume: set it only where untrusted clients cannot reach
+    /// the listener, or where a proxy in front of the gateway denies
+    /// `/__ursula/*`.
+    #[arg(long, requires = "auth_issuer")]
+    auth_public_metrics: bool,
+
     /// TOML per-tenant quota policy. Requires access control: limits are
     /// keyed by the classified bucket resource.
     #[arg(long, requires = "auth_issuer")]
@@ -245,12 +260,17 @@ mod tests {
     use std::time::Duration;
 
     use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::http::StatusCode;
     use clap::Parser;
     use tokio::sync::oneshot;
     use ursula_observability::serve::serve_until_shutdown;
 
     use super::GatewayArgs;
+    use super::access_control;
     use super::gateway_config;
+    use crate::Gateway;
 
     #[derive(Parser)]
     struct Cli {
@@ -287,6 +307,53 @@ mod tests {
         assert!(matches!(
             refused.map(|_| ()).unwrap_err().kind(),
             clap::error::ErrorKind::ValueValidation
+        ));
+    }
+
+    // An access-controlled gateway answers its metrics path 404 unless
+    // `--auth-public-metrics` makes the metrics public (#548). The flag
+    // requires `--auth-issuer`: a gateway without access control serves the
+    // metrics anyway.
+    #[tokio::test]
+    async fn auth_public_metrics_serves_the_metrics_of_an_access_controlled_gateway() {
+        let policy_file = tempfile::NamedTempFile::new().expect("an empty policy file");
+        let policy = policy_file.path().to_str().expect("a UTF-8 path");
+        let auth = [
+            "--auth-issuer",
+            "https://issuer.example",
+            "--auth-audience",
+            "https://streams.example",
+            "--auth-policy",
+            policy,
+        ];
+        for (flag, status) in [
+            (None, StatusCode::NOT_FOUND),
+            (Some("--auth-public-metrics"), StatusCode::OK),
+        ] {
+            let argv = ["ursulagw", "--upstream", "http://node:4437"]
+                .into_iter()
+                .chain(auth)
+                .chain(flag);
+            let args = Cli::try_parse_from(argv).unwrap().args;
+            let gateway = Gateway::with_access_control(
+                gateway_config(&args),
+                access_control(&args).unwrap().expect("access control"),
+            );
+            let request = Request::get("/__ursula/gateway/metrics")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(gateway.handle(request).await.status(), status, "{flag:?}");
+        }
+
+        let refused = Cli::try_parse_from([
+            "ursulagw",
+            "--upstream",
+            "http://node:4437",
+            "--auth-public-metrics",
+        ]);
+        assert!(matches!(
+            refused.map(|_| ()).unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         ));
     }
 

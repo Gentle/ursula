@@ -1081,6 +1081,136 @@ async fn access_control_fails_closed_for_unclassified_routes() {
     assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
 
+/// An upstream that answers every request `200` with an empty body, and
+/// counts the requests.
+async fn counting_upstream() -> (TestUpstream, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let upstream = spawn_upstream(Router::new().fallback(any(move || {
+        let upstream_hits = Arc::clone(&upstream_hits);
+        async move {
+            upstream_hits.fetch_add(1, Ordering::Relaxed);
+            StatusCode::OK
+        }
+    })))
+    .await;
+    (upstream, hits)
+}
+
+/// `method` on the gateway's metrics path, with `token` as a bearer
+/// credential when set.
+fn metrics_request(method: Method, token: Option<&str>) -> Request<Body> {
+    let mut request = Request::builder().method(method).uri(GATEWAY_METRICS_PATH);
+    if let Some(token) = token {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    request.body(Body::empty()).expect("request")
+}
+
+/// The gateway's own metrics in `response`: `200` with its counters as JSON,
+/// unmarked and vouched for. A forwarded answer has no such body.
+async fn served_metrics(response: AxumResponse) -> serde_json::Value {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(not_applied(&response), None);
+    assert_eq!(vouch(&response), Some("1"));
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("metrics body")
+        .to_bytes();
+    serde_json::from_slice(&body).expect("the gateway's metrics as JSON")
+}
+
+/// Without access control the gateway answers its metrics path itself, to
+/// any caller (#548).
+#[tokio::test]
+async fn gateway_without_access_control_serves_its_metrics() {
+    let (upstream, hits) = counting_upstream().await;
+    let gateway = Gateway::new(test_config(vec![upstream.url.clone()]));
+
+    let metrics = served_metrics(gateway.handle(metrics_request(Method::GET, None)).await).await;
+
+    assert_eq!(metrics["leader_searches"], 0);
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+/// An access-controlled gateway can face the internet, so by default it
+/// answers its metrics path `404`, like every other `/__ursula/*` path, to
+/// every caller: without a token, with a valid one, and with an invalid one.
+/// It does not even check the token, so no `401` sets the path apart from a
+/// missing one (#548).
+#[tokio::test]
+async fn access_control_conceals_the_gateway_metrics() {
+    let (upstream, hits) = counting_upstream().await;
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
+    let gateway = gateway_with_access_control(
+        upstream.url.clone(),
+        Arc::clone(&resolver),
+        Arc::clone(&authorizer),
+    );
+
+    for token in [None, Some("valid-token"), Some("bogus-token")] {
+        let response = gateway.handle(metrics_request(Method::GET, token)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{token:?}");
+        assert_eq!(not_applied(&response), Some("NotFound"), "{token:?}");
+        assert_eq!(vouch(&response), Some("1"), "{token:?}");
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+    assert!(
+        authorizer
+            .requests
+            .lock()
+            .expect("authorization requests")
+            .is_empty()
+    );
+}
+
+/// Access control that makes the metrics public lets any caller read them,
+/// with a token or without, valid or not, as without access control, and
+/// opens nothing else: other methods on the path, and other `/__ursula/*`
+/// paths, still answer `404` (#548).
+#[tokio::test]
+async fn access_control_with_public_metrics_serves_them_to_any_caller() {
+    let (upstream, hits) = counting_upstream().await;
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    // Conceals every resource, so a metrics request that reached it would
+    // answer `404`.
+    let authorizer = Arc::new(RecordingAuthorizer::new(
+        AuthorizationDecision::ConcealAsNotFound,
+    ));
+    let gateway = Gateway::with_access_control(
+        test_config(vec![upstream.url.clone()]),
+        AccessControl::new(resolver.clone(), authorizer.clone()).with_public_metrics(true),
+    );
+
+    for token in [None, Some("valid-token"), Some("bogus-token")] {
+        let metrics =
+            served_metrics(gateway.handle(metrics_request(Method::GET, token)).await).await;
+        assert_eq!(metrics["leader_searches"], 0, "{token:?}");
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+    assert!(
+        authorizer
+            .requests
+            .lock()
+            .expect("authorization requests")
+            .is_empty()
+    );
+
+    for (case, request) in [
+        ("POST metrics", metrics_request(Method::POST, None)),
+        ("node metrics", get_path("/__ursula/metrics")),
+    ] {
+        let response = gateway.handle(request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{case}");
+        assert_eq!(not_applied(&response), Some("NotFound"), "{case}");
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn gateway_rejects_body_larger_than_configured_limit_before_forwarding() {
     let hits = Arc::new(AtomicUsize::new(0));

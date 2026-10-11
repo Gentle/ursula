@@ -103,6 +103,8 @@ const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
 const LONG_POLL_RESPONSE_HEADER_GRACE: Duration = Duration::from_secs(2);
+/// The gateway's own counters ([`GatewayMetricsSnapshot`]), which it answers
+/// itself unless access control hides them (see [`Gateway::serves_metrics`]).
 const GATEWAY_METRICS_PATH: &str = "/__ursula/gateway/metrics";
 const LEADER_AFFINITY_MAX_STREAMS: usize = 16_384;
 /// The most hops the gateway sends one request on after Raft leader
@@ -252,6 +254,8 @@ impl Gateway {
     }
 
     /// Installs provider-neutral authentication and authorization hooks.
+    /// The gateway then answers its metrics path `404` unless
+    /// [`AccessControl::with_public_metrics`] makes the metrics public.
     ///
     /// [`Gateway::new`] intentionally leaves access control disabled so
     /// self-hosted deployments retain the original pass-through behavior.
@@ -310,7 +314,7 @@ impl Gateway {
 
     async fn handle_inner(&self, req: Request<Body>) -> AxumResponse {
         let (mut parts, body) = req.into_parts();
-        if parts.method == Method::GET && parts.uri.path() == GATEWAY_METRICS_PATH {
+        if self.serves_metrics(&parts) {
             return axum::Json(self.metrics_snapshot()).into_response();
         }
         self.metrics.requests.fetch_add(1, Ordering::Relaxed);
@@ -934,6 +938,24 @@ impl Gateway {
                 .leader_cache_evictions
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Whether the gateway answers the request with its own counters itself,
+    /// before [`Gateway::gate`]: a `GET` on [`GATEWAY_METRICS_PATH`], without
+    /// access control or with access control that makes the metrics public
+    /// ([`AccessControl::with_public_metrics`]). Otherwise the request goes
+    /// through `gate`. With access control, `gate` answers it `404`, as it
+    /// answers every other `/__ursula/*` path: an access-controlled gateway
+    /// can face the internet, and the counters show its traffic volume
+    /// (#548). Without access control, the gateway forwards it like any other
+    /// request.
+    fn serves_metrics(&self, parts: &axum::http::request::Parts) -> bool {
+        parts.method == Method::GET
+            && parts.uri.path() == GATEWAY_METRICS_PATH
+            && self
+                .access_control
+                .as_ref()
+                .is_none_or(AccessControl::public_metrics)
     }
 
     fn metrics_snapshot(&self) -> GatewayMetricsSnapshot {

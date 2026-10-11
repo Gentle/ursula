@@ -383,8 +383,8 @@ export class AuthGateway {
 		this.jwks = jwks;
 	}
 
-	/** Starts the gateway, its JWKS and its policy file (written to `dir`). */
-	static async start(upstreams: readonly string[], dir: string): Promise<AuthGateway> {
+	/** Starts the gateway, with `args` after its own, its JWKS and its policy file (written to `dir`). */
+	static async start(upstreams: readonly string[], dir: string, args: readonly string[] = []): Promise<AuthGateway> {
 		const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 		const jwks = createServer((_, res) => {
 			res.writeHead(200, { "content-type": "application/json" });
@@ -395,7 +395,7 @@ export class AuthGateway {
 		writeFileSync(policy, `[[bucket]]\nid = "sqlite-e2e"\nowners = [{ issuer = "${issuer}", subject = "vfs-e2e" }]\n`);
 		const auth = ["--auth-issuer", issuer, "--auth-audience", AuthGateway.audience, "--auth-policy", policy, "--auth-jwks-url", `${issuer}/jwks.json`];
 		try {
-			const { url, proc } = await startGateway(upstreams, auth, dir);
+			const { url, proc } = await startGateway(upstreams, [...auth, ...args], dir);
 			return new AuthGateway(url, issuer, privateKey, proc, jwks);
 		} catch (e) {
 			jwks.close();

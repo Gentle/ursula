@@ -2397,6 +2397,57 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     assert!(location.ends_with(&format!("/{}", stream_id)));
     assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
 
+    // The node hosts no replica of the group, so it refuses every write
+    // before any engine could propose it, a delete included, and marks the
+    // redirect. Only a gateway adds the vouch.
+    let target = format!("{}/{}", peers[0].1, stream_id);
+    let writes = [
+        ("create", response),
+        (
+            "append",
+            no_redirect_client
+                .post(&target)
+                .header(CONTENT_TYPE, "text/plain")
+                .body("abc")
+                .send()
+                .await
+                .expect("append on the non-voter"),
+        ),
+        (
+            "close",
+            no_redirect_client
+                .post(&target)
+                .header(HEADER_STREAM_CLOSED, "true")
+                .send()
+                .await
+                .expect("close on the non-voter"),
+        ),
+        (
+            "delete",
+            no_redirect_client
+                .delete(&target)
+                .send()
+                .await
+                .expect("delete on the non-voter"),
+        ),
+    ];
+    for (write, response) in &writes {
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{write}");
+        assert_eq!(
+            response
+                .headers()
+                .get(NOT_APPLIED_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("GroupNotHosted"),
+            "{write}"
+        );
+        assert!(
+            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+            "{write}"
+        );
+    }
+    assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
+
     for node in nodes {
         node.shutdown().await;
     }

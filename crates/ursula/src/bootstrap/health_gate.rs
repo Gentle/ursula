@@ -218,10 +218,11 @@ pub(crate) struct ShedPlan {
 /// [`crate::bootstrap::participation::PeerParticipation`]) and that
 /// `can_take_over` accepts (the registry's handoff check). Of those, each
 /// handoff goes to the one that leads the fewest groups, counting the
-/// `in_flight` handoffs that have not moved yet and the ones planned before
-/// it, so the handoffs spread over the peers. A candidate's `avoid` target is
-/// passed over while another target qualifies. A candidate without a target
-/// is stranded, and the candidates after it are still planned.
+/// `in_flight` handoffs (submitted, with the leadership not moved yet) and
+/// the ones planned before it, so the handoffs spread over the peers. A
+/// candidate's `avoid` target is passed over while another target qualifies.
+/// A candidate without a target is stranded, and the candidates after it are
+/// still planned.
 pub(crate) fn plan_shed_handoffs(
     snaps: &[RaftGroupMetricsSnapshot],
     node_id: u64,
@@ -237,12 +238,7 @@ pub(crate) fn plan_shed_handoffs(
         .collect();
     let mut load = leader_counts(snaps);
     for handoff in in_flight {
-        let landed = by_group
-            .get(&handoff.group_id)
-            .is_some_and(|snap| snap.current_leader == Some(handoff.target));
-        if !landed {
-            add_load(&mut load, handoff.target);
-        }
+        add_load(&mut load, handoff.target);
     }
 
     let mut plan = ShedPlan::default();
@@ -646,12 +642,17 @@ impl LeadershipShed {
         }
         self.report_stranded(&step.stranded, may_campaign, now);
         if step.changed() {
-            let still_led = self.drain.still_led(&snaps, self.node_id);
             if self.drain.is_empty() {
+                // Leaderships the node gained after the shed began are left
+                // alone, so it can still lead some.
+                let leaders = snaps
+                    .iter()
+                    .filter(|snap| snap.current_leader == Some(self.node_id))
+                    .count();
                 tracing::info!(
                     reason = %self.reason,
                     node_id = self.node_id,
-                    still_led,
+                    leaders,
                     "leadership-shed: no leadership left to hand off"
                 );
             } else {
@@ -659,7 +660,7 @@ impl LeadershipShed {
                     reason = %self.reason,
                     node_id = self.node_id,
                     pending = self.drain.len(),
-                    still_led,
+                    still_led = self.drain.still_led(&snaps, self.node_id),
                     submitted = step.submitted.len(),
                     "leadership-shed: handing off leaderships"
                 );
@@ -668,27 +669,35 @@ impl LeadershipShed {
         step
     }
 
-    /// Reports each stranded group once per [`STRANDED_REPORT_INTERVAL`].
+    /// Reports the stranded groups in one line per step, each group at most
+    /// once per [`STRANDED_REPORT_INTERVAL`].
     fn report_stranded(&mut self, stranded: &[u32], may_campaign: &HashSet<u64>, now: Instant) {
         let drain = &self.drain;
         self.stranded_reported
             .retain(|group_id, _| drain.contains(*group_id));
-        for group_id in stranded {
-            let due = self.stranded_reported.get(group_id).is_none_or(|reported| {
-                now.saturating_duration_since(*reported) >= STRANDED_REPORT_INTERVAL
-            });
-            if due {
-                self.stranded_reported.insert(*group_id, now);
-                tracing::warn!(
-                    reason = %self.reason,
-                    node_id = self.node_id,
-                    raft_group_id = *group_id,
-                    ?may_campaign,
-                    "leadership-shed: no peer that may campaign can take over this leadership \
-                     now; it stays pending"
-                );
-            }
+        let due: Vec<u32> = stranded
+            .iter()
+            .copied()
+            .filter(|group_id| {
+                self.stranded_reported.get(group_id).is_none_or(|reported| {
+                    now.saturating_duration_since(*reported) >= STRANDED_REPORT_INTERVAL
+                })
+            })
+            .collect();
+        if due.is_empty() {
+            return;
         }
+        for group_id in &due {
+            self.stranded_reported.insert(*group_id, now);
+        }
+        tracing::warn!(
+            reason = %self.reason,
+            node_id = self.node_id,
+            groups = ?due,
+            ?may_campaign,
+            "leadership-shed: no peer can take over these leaderships now, because none may \
+             campaign or the handoff check refused each; they stay pending"
+        );
     }
 }
 

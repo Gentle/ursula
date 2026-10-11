@@ -155,10 +155,12 @@ applied although the first attempt committed (see
 In a service mesh, also turn off retries for the stream routes, both to the
 gateway Service and from the gateway to the server pods. Istio before 1.24,
 for example, resends a request up to twice by default when it gets a `503`,
-and any version does so on a route whose `retryOn` includes `503`, `5xx`,
-`gateway-error` or `reset`. Nothing between the gateway and the nodes may
-resend a request, so set `gateway.upstreams` only to URLs that reach the
-nodes themselves.
+and any version resends requests on a route whose `retryOn` includes `503`,
+`5xx`, `gateway-error` or `reset`. Istio 1.24 to 1.26 restores the default
+`503` retry when istiod runs with `EXCLUDE_UNSAFE_503_FROM_DEFAULT_RETRY=false`,
+which `compatibilityVersion=1.23` sets. Nothing between the gateway and the
+nodes may resend a request, so set `gateway.upstreams` only to URLs that
+reach the nodes themselves.
 
 The internal server Service and headless peer Service expose the same
 `server.ports.client` process port. Ursula's current static peer URL is used

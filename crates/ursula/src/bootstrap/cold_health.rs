@@ -167,9 +167,11 @@ pub fn spawn_cold_health_gate(
                 ColdHealthDecision::NoChange => {}
             }
             if shed.is_draining() {
-                let may_campaign = participation.campaign_eligible_nodes(&registry).await;
-                shed.step(&may_campaign, &snap.per_group_cold_hot_bytes)
-                    .await;
+                let targets = participation
+                    .campaign_stances(&registry)
+                    .await
+                    .shed_targets();
+                shed.step(&targets, &snap.per_group_cold_hot_bytes).await;
             }
         }
     });

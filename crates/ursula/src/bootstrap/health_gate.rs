@@ -180,7 +180,8 @@ pub(crate) struct ShedHandoff {
 pub(crate) struct ShedCandidate {
     pub group_id: u32,
     /// The target of an earlier handoff that did not move this leadership.
-    /// The planner passes it over while another target qualifies.
+    /// The planner passes it over while another target qualifies, and takes
+    /// the targets from [`ShedTargets`]' retry nodes.
     pub avoid: Option<u64>,
 }
 
@@ -204,6 +205,44 @@ impl ShedCandidate {
     }
 }
 
+/// The nodes a shed may hand a leadership to on one tick, from what the
+/// peers answered about their campaign policy
+/// ([`crate::bootstrap::participation::CampaignStances`]). A leadership's
+/// first handoff of the shed and a leadership whose earlier handoff did not
+/// move it can have different targets: a peer that did not answer may be
+/// worth one try, but not a second one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ShedTargets {
+    /// The nodes that may take a leadership's first handoff.
+    first: HashSet<u64>,
+    /// The nodes that may take a leadership whose earlier handoff did not
+    /// move it.
+    retry: HashSet<u64>,
+}
+
+impl ShedTargets {
+    pub(crate) fn new(first: HashSet<u64>, retry: HashSet<u64>) -> Self {
+        Self { first, retry }
+    }
+
+    /// `nodes` may take every handoff.
+    pub(crate) fn for_every_handoff(nodes: HashSet<u64>) -> Self {
+        Self {
+            first: nodes.clone(),
+            retry: nodes,
+        }
+    }
+
+    /// Whether `node` may take `candidate`'s handoff. A candidate with a
+    /// target to avoid is one whose earlier handoff did not move it.
+    fn admit(&self, candidate: &ShedCandidate, node: u64) -> bool {
+        match candidate.avoid {
+            None => self.first.contains(&node),
+            Some(_) => self.retry.contains(&node),
+        }
+    }
+}
+
 /// A tick's handoffs, and the candidates that no peer could take over.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ShedPlan {
@@ -214,8 +253,7 @@ pub(crate) struct ShedPlan {
 
 /// Plans at most `limit` handoffs of `candidates`, the groups `node_id`
 /// leads that it may hand off, in the order given. A target must be another
-/// voter of the group that may campaign (`may_campaign`, from
-/// [`crate::bootstrap::participation::PeerParticipation`]) and that
+/// voter of the group that `targets` admits for the candidate and that
 /// `can_take_over` accepts (the registry's handoff check). Of those, each
 /// handoff goes to the one that leads the fewest groups, counting the
 /// `in_flight` handoffs (submitted, with the leadership not moved yet) and
@@ -229,7 +267,7 @@ pub(crate) fn plan_shed_handoffs(
     candidates: impl IntoIterator<Item = ShedCandidate>,
     in_flight: &[ShedHandoff],
     limit: usize,
-    may_campaign: &HashSet<u64>,
+    targets: &ShedTargets,
     can_take_over: impl Fn(RaftGroupId, u64) -> bool,
 ) -> ShedPlan {
     let by_group: HashMap<u32, &RaftGroupMetricsSnapshot> = snaps
@@ -258,7 +296,9 @@ pub(crate) fn plan_shed_handoffs(
             .iter()
             .copied()
             .filter(|voter| {
-                *voter != node_id && may_campaign.contains(voter) && can_take_over(group, *voter)
+                *voter != node_id
+                    && targets.admit(&candidate, *voter)
+                    && can_take_over(group, *voter)
             })
             .collect();
         let preferred = qualifying
@@ -357,12 +397,14 @@ impl ShedDrain {
     /// Follows the pending leaderships to `snaps`, taken at `now`, and plans
     /// this tick's handoffs with [`plan_shed_handoffs`]: at most `limit` new
     /// submissions of the queued groups this node leads, the hottest first
-    /// by `heat` (hot bytes by group id), ties by group id.
+    /// by `heat` (hot bytes by group id), ties by group id, each to a node
+    /// that `targets` admits.
     ///
     /// A group another node leads, or that this node no longer hosts, has
     /// moved and leaves the drain. A group no node leads stays as it is
     /// until an election settles. A submitted group this node still leads
-    /// after its deadline is queued again.
+    /// after its deadline is queued again, and from then on only
+    /// `targets`' retry nodes may take it.
     pub(crate) fn tick(
         &mut self,
         snaps: &[RaftGroupMetricsSnapshot],
@@ -370,7 +412,7 @@ impl ShedDrain {
         now: Instant,
         limit: usize,
         heat: &[u64],
-        may_campaign: &HashSet<u64>,
+        targets: &ShedTargets,
         can_take_over: impl Fn(RaftGroupId, u64) -> bool,
     ) -> DrainTick {
         let leaders: HashMap<u32, Option<u64>> = snaps
@@ -441,7 +483,7 @@ impl ShedDrain {
             candidates,
             &in_flight,
             limit,
-            may_campaign,
+            targets,
             can_take_over,
         );
         DrainTick {
@@ -575,12 +617,12 @@ impl LeadershipShed {
 
     /// Hands off this tick's share of the pending leaderships: as many new
     /// submissions as the shed's [`ShedPace`] allows, the hottest group first
-    /// (`heat` holds the node's hot bytes by group id), each to a voter in
-    /// `may_campaign` that the registry's handoff check accepts. A submitted
+    /// (`heat` holds the node's hot bytes by group id), each to a voter that
+    /// `targets` admits and the registry's handoff check accepts. A submitted
     /// handoff stays pending until another node leads the group, and is
-    /// submitted again if this node still leads it after Raft gave up on
-    /// the transfer.
-    pub(crate) async fn step(&mut self, may_campaign: &HashSet<u64>, heat: &[u64]) -> ShedStep {
+    /// submitted again, to a retry target, if this node still leads it after
+    /// Raft gave up on the transfer.
+    pub(crate) async fn step(&mut self, targets: &ShedTargets, heat: &[u64]) -> ShedStep {
         let now = Instant::now();
         let snaps = self.registry.metrics_snapshot();
         let registry = &self.registry;
@@ -590,7 +632,7 @@ impl LeadershipShed {
             now,
             self.pace.handoffs_per_step(),
             heat,
-            may_campaign,
+            targets,
             |group, target| registry.check_handoff(group, target).is_ok(),
         );
         for handoff in &tick.stalled {
@@ -640,7 +682,7 @@ impl LeadershipShed {
                 }
             }
         }
-        self.report_stranded(&step.stranded, may_campaign, now);
+        self.report_stranded(&step.stranded, targets, now);
         if step.changed() {
             if self.drain.is_empty() {
                 // Leaderships the node gained after the shed began are left
@@ -671,7 +713,7 @@ impl LeadershipShed {
 
     /// Reports the stranded groups in one line per step, each group at most
     /// once per [`STRANDED_REPORT_INTERVAL`].
-    fn report_stranded(&mut self, stranded: &[u32], may_campaign: &HashSet<u64>, now: Instant) {
+    fn report_stranded(&mut self, stranded: &[u32], targets: &ShedTargets, now: Instant) {
         let drain = &self.drain;
         self.stranded_reported
             .retain(|group_id, _| drain.contains(*group_id));
@@ -694,7 +736,7 @@ impl LeadershipShed {
             reason = %self.reason,
             node_id = self.node_id,
             groups = ?due,
-            ?may_campaign,
+            ?targets,
             "leadership-shed: no peer can take over these leaderships now, because none may \
              campaign or the handoff check refused each; they stay pending"
         );
@@ -731,6 +773,7 @@ mod tests {
     use super::ShedDrain;
     use super::ShedHandoff;
     use super::ShedPlan;
+    use super::ShedTargets;
     use super::TickHealth;
     use super::plan_shed_handoffs;
 
@@ -758,8 +801,13 @@ mod tests {
         }
     }
 
-    fn every_node() -> HashSet<u64> {
-        HashSet::from([1, 2, 3])
+    /// Targets that admit `nodes` for every handoff.
+    fn only(nodes: &[u64]) -> ShedTargets {
+        ShedTargets::for_every_handoff(nodes.iter().copied().collect())
+    }
+
+    fn every_node() -> ShedTargets {
+        only(&[1, 2, 3])
     }
 
     fn handoff(group_id: u32, target: u64) -> ShedHandoff {
@@ -1002,7 +1050,7 @@ mod tests {
             ShedCandidate::every_group_led_by(&snaps, ME),
             &[],
             usize::MAX,
-            &HashSet::from([1, 2]),
+            &only(&[1, 2]),
             |_, _| true,
         );
         assert_eq!(plan.handoffs.len(), 6);
@@ -1018,7 +1066,7 @@ mod tests {
             ShedCandidate::every_group_led_by(&snaps, ME),
             &[],
             usize::MAX,
-            &HashSet::from([1]),
+            &only(&[1]),
             |_, _| true,
         );
         assert!(plan.handoffs.is_empty());
@@ -1140,11 +1188,52 @@ mod tests {
             at(start, 16),
             SHED_HANDOFFS_PER_TICK,
             &[],
-            &HashSet::from([1, 3]),
+            &only(&[1, 3]),
             |_, _| true,
         );
         assert_eq!(only_three.stalled, vec![handoff(0, 3)]);
         assert_eq!(only_three.plan.handoffs, vec![handoff(0, 3)]);
+    }
+
+    #[test]
+    fn a_handoff_that_did_not_move_goes_only_to_a_retry_target() {
+        let snaps = vec![snap(0, Some(ME)), snap(1, Some(ME))];
+        let mut drain = ShedDrain::of_groups_led_by(&snaps, ME);
+        let start = Instant::now();
+        // Nodes 2 and 3 did not answer: either may take a first handoff, and
+        // none may take a second one.
+        let unanswered = ShedTargets::new(HashSet::from([2, 3]), HashSet::new());
+        let plan = |drain: &mut ShedDrain, now: Instant, targets: &ShedTargets| {
+            drain.tick(
+                &snaps,
+                ME,
+                now,
+                SHED_HANDOFFS_PER_TICK,
+                &[],
+                targets,
+                |_, _| true,
+            )
+        };
+
+        let first = plan(&mut drain, start, &unanswered);
+        assert_eq!(first.plan.handoffs, vec![handoff(0, 2), handoff(1, 3)]);
+        // Group 0's transfer is refused outright, so it was never handed
+        // off and keeps its first-handoff targets. Group 1's is accepted
+        // and does not move the leadership.
+        drain.record(handoff(0, 2), &Err("refused"), start, SETTLE);
+        drain.record(handoff(1, 3), &Ok::<(), &str>(()), start, SETTLE);
+
+        let stalled = plan(&mut drain, at(start, 8), &unanswered);
+        assert_eq!(stalled.stalled, vec![handoff(1, 3)]);
+        assert_eq!(stalled.plan.handoffs, vec![handoff(0, 2)]);
+        assert_eq!(stalled.plan.stranded, vec![1]);
+        drain.record(handoff(0, 2), &Ok::<(), &str>(()), at(start, 8), SETTLE);
+
+        // Node 2 answers that it may campaign: the stalled group goes to it.
+        let answered = ShedTargets::new(HashSet::from([2, 3]), HashSet::from([2]));
+        let retried = plan(&mut drain, at(start, 9), &answered);
+        assert!(retried.stalled.is_empty());
+        assert_eq!(retried.plan.handoffs, vec![handoff(1, 2)]);
     }
 
     #[test]

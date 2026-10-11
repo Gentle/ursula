@@ -108,8 +108,10 @@ pub(crate) fn cluster_egress_probe_groups(
 /// sheds, hands every leadership it held when it shed to its peers at once,
 /// and plans again on every tick for the ones still pending. The peers'
 /// answers to `participation` travel the path the gate judges impaired, so
-/// it passes over only a peer that answered that it may not campaign, and
-/// leaves a peer that did not answer to the registry's handoff check.
+/// a leadership's first handoff may also go to a peer that did not answer,
+/// while a leadership whose handoff did not move goes only to a peer that
+/// answered that it may campaign
+/// ([`crate::bootstrap::participation::CampaignStances::shed_targets_over_impaired_path`]).
 pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
     participation: &PeerParticipation,
@@ -212,7 +214,8 @@ pub fn spawn_egress_gate(
             }
             if shed.is_draining() {
                 let stances = participation.campaign_stances(&registry).await;
-                shed.step(&stances.not_known_to_refuse(), &[]).await;
+                shed.step(&stances.shed_targets_over_impaired_path(), &[])
+                    .await;
             }
         }
     });

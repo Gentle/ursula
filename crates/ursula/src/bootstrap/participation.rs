@@ -4,11 +4,12 @@
 //! balancer, the shutdown handoff and the snapshot-store and cold-health
 //! gates hand leaderships only to the nodes known to be allowed to campaign.
 //! The cluster-egress gate, whose questions travel the path it judges
-//! impaired, passes over only the nodes that answered that they may not. A
-//! node that may not campaign (under drain, behind its recovery gate, or
-//! shedding for its snapshot store, cluster egress or WAL disk) refuses a
-//! transfer without telling the leader, which then forwards writes to it
-//! until Raft abandons the transfer.
+//! impaired, may also try a peer that did not answer, once per leadership
+//! ([`CampaignStances::shed_targets_over_impaired_path`]). A node that may
+//! not campaign (under drain, behind its recovery gate, or shedding for its
+//! snapshot store, cluster egress or WAL disk) refuses a transfer without
+//! telling the leader, which then forwards writes to it until Raft abandons
+//! the transfer.
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -16,6 +17,8 @@ use std::collections::HashSet;
 use futures_util::future::join_all;
 use ursula_proto::admin::LeadershipShedStatus;
 use ursula_raft::RaftGroupHandleRegistry;
+
+use crate::bootstrap::health_gate::ShedTargets;
 
 /// What a node's leadership-shed policy lets it do, as far as this node
 /// knows.
@@ -31,8 +34,10 @@ pub(crate) enum CampaignStance {
 
 /// The campaign stance of each node: this node's from its own policy, and
 /// each peer's from its answer.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CampaignStances {
+    /// This node.
+    node_id: u64,
     by_node: BTreeMap<u64, CampaignStance>,
 }
 
@@ -42,12 +47,36 @@ impl CampaignStances {
         self.nodes(|stance| stance == CampaignStance::MayCampaign)
     }
 
-    /// The nodes not known to refuse: the ones allowed to campaign and the
-    /// ones that did not answer. A planner that uses this set leaves a node
-    /// that did not answer to the registry's handoff check, whose Raft acks
-    /// are fresher evidence than a lost request.
-    pub(crate) fn not_known_to_refuse(&self) -> HashSet<u64> {
-        self.nodes(|stance| stance != CampaignStance::MayNotCampaign)
+    /// Where a gate that asks its peers over a healthy path hands leaderships
+    /// off: only to the nodes known to be allowed to campaign, on every
+    /// handoff.
+    pub(crate) fn shed_targets(&self) -> ShedTargets {
+        ShedTargets::for_every_handoff(self.may_campaign())
+    }
+
+    /// Where a gate whose questions travel the path it judges impaired, the
+    /// cluster-egress gate, hands leaderships off. A lost answer there says
+    /// little about the peer, so a leadership's first handoff may also go to
+    /// a peer that did not answer, and the registry's handoff check, whose
+    /// Raft acks are fresher evidence than a lost request, decides. A peer
+    /// that may not campaign still refuses that handoff without a word, so a
+    /// leadership whose handoff did not move goes only to a peer that
+    /// answered that it may campaign. A peer that never answers thus costs
+    /// each leadership at most one stalled handoff per shed. And on a tick
+    /// when a peer answered that it may not campaign, the shed may be
+    /// cluster-wide, so first handoffs pass over the peers that did not
+    /// answer too.
+    pub(crate) fn shed_targets_over_impaired_path(&self) -> ShedTargets {
+        let may_campaign = self.may_campaign();
+        let a_peer_refuses = self.by_node.iter().any(|(node_id, stance)| {
+            *node_id != self.node_id && *stance == CampaignStance::MayNotCampaign
+        });
+        let first = if a_peer_refuses {
+            may_campaign.clone()
+        } else {
+            self.nodes(|stance| stance != CampaignStance::MayNotCampaign)
+        };
+        ShedTargets::new(first, may_campaign)
     }
 
     fn nodes(&self, keep: impl Fn(CampaignStance) -> bool) -> HashSet<u64> {
@@ -56,6 +85,18 @@ impl CampaignStances {
             .filter(|(_, stance)| keep(**stance))
             .map(|(node_id, _)| *node_id)
             .collect()
+    }
+
+    /// The stances of `node_id` and its peers as given.
+    #[cfg(test)]
+    pub(crate) fn of_nodes(
+        node_id: u64,
+        stances: impl IntoIterator<Item = (u64, CampaignStance)>,
+    ) -> Self {
+        Self {
+            node_id,
+            by_node: stances.into_iter().collect(),
+        }
     }
 
     #[cfg(test)]
@@ -110,7 +151,10 @@ impl PeerParticipation {
             CampaignStance::MayNotCampaign
         };
         by_node.insert(self.node_id, own);
-        CampaignStances { by_node }
+        CampaignStances {
+            node_id: self.node_id,
+            by_node,
+        }
     }
 
     /// The nodes known to be allowed to campaign
@@ -171,7 +215,9 @@ mod tests {
     use ursula_raft::RaftGroupHandleRegistry;
 
     use super::CampaignStance;
+    use super::CampaignStances;
     use super::PeerParticipation;
+    use crate::bootstrap::health_gate::ShedTargets;
 
     /// A peer that answers its leadership-shed state with `should_campaign`.
     async fn answering_peer(should_campaign: bool) -> (String, tokio::task::JoinHandle<()>) {
@@ -211,7 +257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_peer_that_answers_that_it_may_not_campaign_is_known_to_refuse() {
+    async fn each_peer_has_the_stance_it_answered() {
         let (willing, willing_task) = answering_peer(true).await;
         let (refusing, refusing_task) = answering_peer(false).await;
         let (silent, _listener) = silent_peer().await;
@@ -236,7 +282,6 @@ mod tests {
         assert_eq!(stances.of(3), Some(CampaignStance::MayNotCampaign));
         assert_eq!(stances.of(4), Some(CampaignStance::Unknown));
         assert_eq!(stances.may_campaign(), HashSet::from([1, 2]));
-        assert_eq!(stances.not_known_to_refuse(), HashSet::from([1, 2, 4]));
         assert_eq!(
             participation.campaign_eligible_nodes(&registry).await,
             HashSet::from([1, 2])
@@ -246,9 +291,72 @@ mod tests {
         registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
         let stances = participation.campaign_stances(&registry).await;
         assert_eq!(stances.of(1), Some(CampaignStance::MayNotCampaign));
-        assert_eq!(stances.not_known_to_refuse(), HashSet::from([2, 4]));
+        assert_eq!(stances.may_campaign(), HashSet::from([2]));
 
         willing_task.abort();
         refusing_task.abort();
+    }
+
+    #[test]
+    fn a_gate_that_asks_over_a_healthy_path_hands_off_only_to_nodes_that_may_campaign() {
+        let stances = CampaignStances::of_nodes(1, [
+            (1, CampaignStance::MayNotCampaign),
+            (2, CampaignStance::MayCampaign),
+            (3, CampaignStance::Unknown),
+            (4, CampaignStance::MayNotCampaign),
+        ]);
+        assert_eq!(
+            stances.shed_targets(),
+            ShedTargets::for_every_handoff(HashSet::from([2]))
+        );
+    }
+
+    #[test]
+    fn over_an_impaired_path_a_peer_that_did_not_answer_takes_only_first_handoffs() {
+        // This node sheds, so it may not campaign. That is no sign that the
+        // shed is cluster-wide.
+        let stances = CampaignStances::of_nodes(1, [
+            (1, CampaignStance::MayNotCampaign),
+            (2, CampaignStance::MayCampaign),
+            (3, CampaignStance::Unknown),
+        ]);
+        assert_eq!(
+            stances.shed_targets_over_impaired_path(),
+            ShedTargets::new(HashSet::from([2, 3]), HashSet::from([2]))
+        );
+
+        let silent = CampaignStances::of_nodes(1, [
+            (1, CampaignStance::MayNotCampaign),
+            (2, CampaignStance::Unknown),
+            (3, CampaignStance::Unknown),
+        ]);
+        assert_eq!(
+            silent.shed_targets_over_impaired_path(),
+            ShedTargets::new(HashSet::from([2, 3]), HashSet::new())
+        );
+    }
+
+    #[test]
+    fn over_an_impaired_path_a_peer_that_refuses_rules_out_the_ones_that_did_not_answer() {
+        let stances = CampaignStances::of_nodes(1, [
+            (1, CampaignStance::MayNotCampaign),
+            (2, CampaignStance::MayNotCampaign),
+            (3, CampaignStance::Unknown),
+            (4, CampaignStance::MayCampaign),
+        ]);
+        assert_eq!(
+            stances.shed_targets_over_impaired_path(),
+            ShedTargets::for_every_handoff(HashSet::from([4]))
+        );
+
+        let refused = CampaignStances::of_nodes(1, [
+            (1, CampaignStance::MayNotCampaign),
+            (2, CampaignStance::MayNotCampaign),
+            (3, CampaignStance::Unknown),
+        ]);
+        assert_eq!(
+            refused.shed_targets_over_impaired_path(),
+            ShedTargets::default()
+        );
     }
 }

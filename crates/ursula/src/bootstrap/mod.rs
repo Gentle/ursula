@@ -52,6 +52,7 @@ mod test_reexports {
     pub(crate) use super::health_gate::ShedHandoff;
     pub(crate) use super::health_gate::ShedPace;
     pub(crate) use super::health_gate::ShedPlan;
+    pub(crate) use super::health_gate::ShedTargets;
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
     pub(crate) use super::participation::PeerParticipation;

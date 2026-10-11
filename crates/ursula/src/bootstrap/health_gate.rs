@@ -746,9 +746,9 @@ impl LeadershipShed {
             groups = ?due,
             may_take_first_handoff = ?peers(&targets.first),
             may_take_retry = ?peers(&targets.retry),
-            "leadership-shed: no peer can take over these leaderships now, because each peer \
-             answered that it may not campaign, did not answer, or failed the handoff check; \
-             they stay pending"
+            "leadership-shed: no peer can take over these leaderships now, because each other \
+             voter of these groups answered that it may not campaign, did not answer, or failed \
+             the handoff check; they stay pending"
         );
     }
 }

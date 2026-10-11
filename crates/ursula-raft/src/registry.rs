@@ -325,6 +325,26 @@ pub enum QuorumProofError {
     },
 }
 
+/// A self-election ([`RaftGroupHandleRegistry::request_self_election`]) this
+/// node refused or OpenRaft did not start.
+#[derive(Debug, thiserror::Error)]
+pub enum SelfElectionError {
+    #[error("Raft group {group:?} is in term {observed}, not the requested {requested}")]
+    TermChanged {
+        group: RaftGroupId,
+        requested: u64,
+        observed: u64,
+    },
+    #[error(transparent)]
+    Transfer(#[from] IncomingTransferError),
+    #[error("OpenRaft rejected the self-election for {group:?}: {source}")]
+    Rejected {
+        group: RaftGroupId,
+        #[source]
+        source: openraft::raft::TransferLeaderError<UrsulaRaftTypeConfig>,
+    },
+}
+
 /// Confirm a fresh ReadIndex under the same committed leader vote.
 pub(crate) async fn confirm_recovery_barrier(
     group: RaftGroupId,
@@ -347,6 +367,7 @@ pub(crate) async fn confirm_recovery_barrier(
     Ok((after.vote, index))
 }
 
+pub use crate::election::IncomingTransferError;
 pub use crate::election::LeadershipTransferError;
 
 impl RaftGroupHandleRegistry {
@@ -1088,24 +1109,77 @@ impl RaftGroupHandleRegistry {
         })
     }
 
+    /// Hands a leadership transfer this node received from a leader to
+    /// OpenRaft once the election policy accepts it.
     pub async fn handle_transfer_leader(
         &self,
         raft_group_id: RaftGroupId,
         request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
-    ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, GroupEngineError>
+    ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, IncomingTransferError>
     {
         let entry = self.entry(raft_group_id)?;
-        let raft = entry.raft();
-        if *request.to_node_id() == raft.metrics().borrow_watched().id
-            && !self.election.may_campaign(entry.recovery.as_deref())
-        {
-            return Err(GroupEngineError::new(
-                "the recovery gate is closed; refusing leadership transfer",
-            ));
+        self.deliver_transfer(raft_group_id, &entry, request).await
+    }
+
+    /// Starts an election on this node's replica of `group` while it is in
+    /// `current_term`: a leadership transfer to itself, held to the policy
+    /// of every transfer it receives. A replica that already leads, or may
+    /// not campaign, is refused. OpenRaft acts on a transfer only while the
+    /// replica holds the vote it carries, so the transfer carries the vote
+    /// the replica observes. Success means OpenRaft took the transfer, not
+    /// that the replica won the election.
+    ///
+    /// A replica whose Raft core stopped is refused first
+    /// ([`IncomingTransferError::Raft`]): its metrics keep the last vote, so
+    /// one that led when it stopped would otherwise read as the leader. A
+    /// core that panicked never reports that it stopped (its metrics keep
+    /// their last values), so it is refused as what they show.
+    pub async fn request_self_election(
+        &self,
+        group: RaftGroupId,
+        current_term: u64,
+    ) -> Result<(), SelfElectionError> {
+        let entry = self.entry(group).map_err(IncomingTransferError::Group)?;
+        let observed = entry.raft().metrics().borrow_watched().clone();
+        if let Err(source) = observed.running_state {
+            return Err(IncomingTransferError::Raft { group, source }.into());
         }
+        if observed.current_term != current_term {
+            return Err(SelfElectionError::TermChanged {
+                group,
+                requested: current_term,
+                observed: observed.current_term,
+            });
+        }
+        let request = TransferLeaderRequest::new(observed.vote, observed.id, None);
+        self.deliver_transfer(group, &entry, request)
+            .await?
+            .map_err(|source| SelfElectionError::Rejected { group, source })
+    }
+
+    /// Hands `request` to the entry's Raft once
+    /// [`ElectionPolicy::validate_incoming_transfer`] accepts it, so the gate
+    /// checked is the gate of the Raft that takes the transfer.
+    async fn deliver_transfer(
+        &self,
+        group: RaftGroupId,
+        entry: &ActiveGroup,
+        request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
+    ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, IncomingTransferError>
+    {
+        let raft = entry.raft();
+        // Read first: a metrics guard held through the policy check would hold up the core's
+        // next metrics update while the check takes the recovery gate's locks.
+        let node_id = raft.metrics().borrow_watched().id;
+        self.election.validate_incoming_transfer(
+            group,
+            node_id,
+            &request,
+            entry.recovery.as_deref(),
+        )?;
         raft.handle_transfer_leader(request)
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft handle_transfer_leader: {err}")))
+            .map_err(|source| IncomingTransferError::Raft { group, source })
     }
 
     pub async fn build_snapshot_for_transfer(

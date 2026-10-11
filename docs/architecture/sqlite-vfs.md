@@ -57,9 +57,26 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   rewrites of spilled frames, padding) go straight to it, and when the write transaction ends (the
   WAL write lock is released) the sidecar advances. Nothing is fsynced, except the db file before
   a commit that starts a new WAL generation, once per WAL wrap (§6).
-- **Outcome unknown** (timeout, connection loss, a 5xx without a vouched `x-ursula-not-applied`,
-  below): retried with the same sequence until the server answers, for up to `URSULA_VFS_RETRY_MS`
-  (30 s). The server deduplicates.
+- **Outcome unknown** (timeout, connection loss, a `307`, a 5xx without a vouched
+  `x-ursula-not-applied`, below): retried with the same sequence until the server answers, for up to
+  `URSULA_VFS_RETRY_MS` (30 s). The server deduplicates.
+- **Redirects** are never followed, by any request. Followed, a request would go out without the
+  token (the HTTP client drops it on every redirect), and a `301`, `302` or `303` would turn an
+  append into a `GET`. A `307` keeps the method and the body, and says that the request belongs
+  elsewhere for now. The gateway passes a server's redirect to a moved leader on to the client when
+  it does not follow it itself: a second redirect after the one it follows, or one to an address
+  that is not among its upstreams. The VFS sends the request again to the same URL, with the same
+  sequence and no sooner than `Retry-After`, like a `503`. After a second redirect, the gateway still
+  holds the node the first one pointed at (it caches the target of a redirect it follows, and
+  passes the second on without changing that): it sends the next attempt there, and follows that
+  node's redirect to the leader. After a redirect it could not map, the next attempt goes wherever
+  the gateway sends it, a follower again possibly, until one reaches the leader or the budget runs
+  out. For an append a `307` is an unknown outcome: a leader that loses
+  its leadership answers so, and what it proposed may still be committed. Any other redirect fails
+  the write as a definite rejection does (below), a `308` among them: neither the server nor the
+  gateway sends one, while a proxy that redirects `http://` to `https://` does (ingress-nginx and
+  Caddy by default), and the error names its `Location`. So the stream URL must reach the stream's
+  leader by itself (§7).
 - **401** (an authorizer in front of the stream, such as `ursula gateway --auth-*`, refused the
   token): retried within the same budget, with the token read again (§7). On a synchronous host
   (node:sqlite) a set token cannot change meanwhile, because the committing thread is the one that
@@ -69,10 +86,10 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   and vouched for (below), and fails the write otherwise. Neither is a fence: only the server's 403
   carries `Producer-Epoch` (one classifier, `refused`, tells them apart for every request).
 - **403 with `Producer-Epoch`** (a newer epoch claimed the stream), a 403 without it that is not
-  marked and vouched for, a definite rejection (any other 4xx but 402, unless marked and vouched
-  for as below), or a budget that runs out after an attempt whose outcome is unknown: the write
-  fails with `SQLITE_IOERR_WRITE`, SQLite rolls the transaction back, nothing of it reaches the
-  local WAL, and the database is poisoned until it is re-attached.
+  marked and vouched for, a definite rejection (any other 4xx but 402, unless marked and vouched for
+  as below, or a redirect but `307`), or a budget that runs out after an attempt whose outcome is
+  unknown: the write fails with `SQLITE_IOERR_WRITE`, SQLite rolls the transaction back, nothing of
+  it reaches the local WAL, and the database is poisoned until it is re-attached.
 - **Refused before it reached the stream.** An attempt answered 401, 402 (a layer such as an
   authorizer or a quota or billing service refuses writes until something is paid or settled) or
   429, or any refusal (a 4xx or 5xx) that carries both the marker `x-ursula-not-applied: <reason>`
@@ -105,9 +122,9 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   `payment_reason`, its fields since 0.7.1. The extension logs `writes_refused`
   (`payment_required` for a 402) when refusals of a kind start, and `writes_resumed` at the first
   acknowledged commit after them.
-- This holds only while no attempt of the append can have reached the stream. After an attempt
-  whose outcome is unknown (no answer, or a 5xx without a vouched marker) the append may be in the
-  stream, and the next commit, sent with the same sequence, would be answered as its duplicate,
+- This holds only while no attempt of the append can have reached the stream. After an attempt whose
+  outcome is unknown (no answer, a `307`, or a 5xx without a vouched marker) the append may be in
+  the stream, and the next commit, sent with the same sequence, would be answered as its duplicate,
   its pages never sent. Refusals after that attempt say nothing about it. So a 402 there is retried
   like an unknown outcome, until an answer settles it (the duplicate's receipt, once the layer
   forwards the append again) or the budget runs out, a 403 there fails the write, and a budget that
@@ -321,9 +338,12 @@ new claim (epoch + 1) is the first frame after it (read and decoded from that of
 the stream (§2), or a read of it answered 402, fails the commit alone, as a refused commit does.
 Reads in
 recovery use `consistency=leader` (a follower may lag an acknowledged append). Catch-up reads,
-`HEAD` and snapshot `GET`s retry `429` and `503` (a leader that could not confirm its leadership in
-time) like appends: no sooner than `Retry-After`, with backoff, within `URSULA_VFS_RETRY_MS`; the
-snapshot thread's retries also end at its stop flag.
+`HEAD` and snapshot `GET`s retry `429`, `503` (a leader that could not confirm its leadership in
+time) and a `307` (§2) like appends: no sooner than `Retry-After`, with backoff, within
+`URSULA_VFS_RETRY_MS`. So is a read that got no answer (its connection reset or closed under it,
+or a timeout), sent again on a new connection (§7). A refused connection fails it at once. The snapshot thread's retries also end at its stop flag. A redirect that
+lasts the whole budget fails the read with its status, so attach never takes it for a missing
+stream (a `404`) or a superseded snapshot.
 
 ## 4. Snapshots and retention (M3)
 
@@ -691,15 +711,37 @@ rebuild, delete `<db>`.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
   by the server at 1 GiB compressed (32 MiB inline or through the gateway).
 - Producer expiry after 7 idle days; the owner reclaims only if nobody wrote meanwhile.
+- Redirects are never followed (§2), so the stream URL must reach the stream's leader by itself:
+  through a gateway, or on a single-node server. A URL that names one node of a multi-node cluster
+  works only while that node leads the stream's group. A URL that a proxy redirects (from `http://`
+  to `https://`, say, usually with a `308`) fails at once with the redirect's `Location`, so name
+  the address the redirect points to.
 - HTTP, or TLS for `https://` URLs with the bundled Mozilla roots, or only the certificate
   authorities in `URSULA_VFS_CA_FILE`. One bearer token per process: `ursula_set_token`, else the
   content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a 401. A read of
   the file that finds no token (empty, half-written, missing) keeps the last one it held: sent
   without one, a request is concealed as a missing stream (404). That fails an attach, and fails a
   commit at once, alone when the 404 carries `x-ursula-not-applied` and its vouch (Ursula's gateway
-  from 0.7.3, §2) and with a poison otherwise. A token sent over `http://` to a host that is not loopback is
-  logged once (`token_in_clear`). The SQL functions are direct-only: a trigger or view of an
-  untrusted database cannot call them.
+  from 0.7.3, §2) and with a poison otherwise. A token sent over `http://` to a host that is not
+  loopback is logged once (`token_in_clear`). The SQL functions are direct-only: a trigger or view
+  of an untrusted database cannot call them.
+- Appends, reads and `HEAD`s keep a connection for 90 s after its last request
+  (`URSULA_VFS_IDLE_MS`, ureq's default is 15 s), so a writer that commits every 15 to 90 s reuses
+  its connection instead of opening a new TCP and TLS connection per commit, which behind a reverse
+  proxy or a CDN sometimes costs about a second more. Snapshot transfers keep 15 s: one snapshot's
+  requests follow each other within seconds, and a dead connection would hold a transfer for its
+  whole 120 s timeout, past the retry budget. Before reusing a connection, the client reads its
+  socket once without blocking and drops one the server or a proxy closed while it sat idle. One
+  closed just as a request goes out, and one that a NAT, a load balancer or a firewall dropped
+  without telling either end, still look open: a request sent on it fails, at once when the device
+  answers with a reset and after its timeout when nothing answers (10 s). A request that got no
+  answer is sent again on a new connection, which also drops the other pooled connections idle for
+  more than 1 s (such a device left them dead too, and ureq takes the oldest first): an append or a
+  snapshot `PUT` while its outcome is unknown, and a read, `HEAD` or create within
+  `URSULA_VFS_RETRY_MS`. A refused connection fails a read at once. Many such devices drop
+  connections idle for about 4 minutes, so the 90 s stays well below that. Behind one that drops
+  them sooner, set `URSULA_VFS_IDLE_MS` below its limit: otherwise the first request after a longer
+  pause waits out one timeout.
 
 ### Versions
 
@@ -736,26 +778,30 @@ must say in its release notes to stop every owner of a stream before upgrading.
   frame ending at the answered offset, or anywhere in a read-back that ran past it; a re-claim also
   only as the first frame after the owner's offset). A 402 fails a request alone with the layer's
   explanation, and ends an append only while no attempt of it can have reached the stream: after a
-  401 or a 429 it does, after no answer or a 5xx it is retried until an answer settles the outcome,
-  and an outcome still unknown when the budget runs out fails as unknown. Answers that applied
-  nothing (401, 429, any answer marked `x-ursula-not-applied` with its vouch, an empty marker
-  included) refuse an append when the budget runs out on them, with the last one's kind and reason
-  (a long marker cut to 256 bytes). A vouched 4xx, an authorizer's 403 among them, refuses it at
-  once, and an unmarked 403 fails it. One attempt whose outcome is unknown among them, before or
+  401 or a 429 it does, after no answer, a 5xx or a 307 it is retried until an answer settles the
+  outcome, and an outcome still unknown when the budget runs out fails as unknown. Answers that
+  applied nothing (401, 429, any answer marked `x-ursula-not-applied` with its vouch, an empty
+  marker included) refuse an append when the budget runs out on them, with the last one's kind and
+  reason (a long marker cut to 256 bytes). A vouched 4xx, an authorizer's 403 among them, refuses it
+  at once, and an unmarked 403 fails it. One attempt whose outcome is unknown among them, before or
   after, keeps the append unknown. The marker without the vouch, or the vouch without the marker,
   proves nothing: a 503 so answered is an unknown outcome, a 403 or a 413 a failure, a claim fails,
   and a 401, 402 or 429 still refuses by its status. Against a stand-in server, a commit refused
   this way (`Db::append_commit`: pressure, a refused token, a 402, a 429, a vouched 403 or 413)
-  leaves the owner unpoisoned with its epoch, sequence and offset, the next commit goes out with
-  the same sequence, and a re-claim refused this way refuses the commit too. An unmarked 403, the
-  marker alone or the vouch alone, and one attempt marked alone among vouched refusals poison. A
-  poison clears the refusal (and a refusal after a poison is not recorded), no snapshot is taken
-  while any refusal is recorded, `ursula_status` reports the kind and the reason (a 402 also in its
-  0.7.1 fields), a refused attach gets `SQLITE_AUTH` for a 402 and `SQLITE_IOERR_AUTH` otherwise,
-  and the attach mode parses. A 204 to a commit while no earlier attempt of it can have reached the
-  stream is told apart from an acknowledgement, and at the sequence a refused commit left free it
-  poisons, while a 200 there, a 204 at a sequence no refused commit used, and a 204 after an
-  attempt whose outcome is unknown are acknowledged.
+  leaves the owner unpoisoned with its epoch, sequence and offset, the next commit goes out with the
+  same sequence, and a re-claim refused this way refuses the commit too. An unmarked 403, the marker
+  alone or the vouch alone, and one attempt marked alone among vouched refusals poison. A poison
+  clears the refusal (and a refusal after a poison is not recorded), no snapshot is taken while any
+  refusal is recorded, `ursula_status` reports the kind and the reason (a 402 also in its 0.7.1
+  fields), a refused attach gets `SQLITE_AUTH` for a 402 and `SQLITE_IOERR_AUTH` otherwise, and the
+  attach mode parses. A 204 to a commit while no earlier attempt of it can have reached the stream
+  is told apart from an acknowledgement, and at the sequence a refused commit left free it poisons,
+  while a 200 there, a 204 at a sequence no refused commit used, and a 204 after an attempt whose
+  outcome is unknown are acknowledged. No request follows a redirect: a `307` is sent again to the
+  same URL with the same method, token and sequence (an append's or a `PUT`'s outcome stays unknown
+  to the end of the budget, and a `HEAD`, a read, a snapshot `GET` or a create then fails with the
+  redirect's status, never as a missing stream or snapshot), and any other redirect, a `308`
+  included, fails the request at once with its `Location`.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -818,6 +864,16 @@ must say in its release notes to stop every owner of a stream before upgrading.
   MinIO locally and for fork PRs; the snapshot run's ~3.5 MB bodies go to the cold tier), plus a
   12 MiB snapshot body that exercises the multipart path, with a 64 KiB snapshot minimum so the
   benchmark's Pi workload snapshots and trims at its database size.
+- Leader redirects on 3 nodes (`test/redirects.e2e.ts`), through a gateway that checks tokens and
+  reaches the nodes under other names than their peer URLs, so it passes every leader redirect on
+  to the client. A loop moves every group's leadership to the next node through the admin API,
+  again and again with a 250 ms pause, from before an owner's attach through its commits and
+  snapshot read-backs, a second host's attach from the snapshot, and the owner's attach of its own
+  files again. The test checks that every group's leadership, the stream's included, moved while
+  the owner committed and while it waited for its snapshots. The gateway sends each request to a node picked at random, so read-only hosts
+  install the snapshot again until a snapshot `GET` met a redirect. Nothing is poisoned, every
+  commit goes through, every host reads the same rows, and the client saw redirects on commits
+  (counted apart from claims) and on snapshot `GET`s.
 - Pi Durable versions: `package.json` declares the range of `@earendil-works/pi-durable` versions
   the package supports, and the e2e suites above run the version in the lockfile. The single-node
   job then installs the oldest version in the range without saving it, and runs the typecheck, Pi

@@ -85,6 +85,7 @@ use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
+use ursula_raft::IncomingTransferError;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::OwnerRaftHandle;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
@@ -98,6 +99,7 @@ use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGrpcService;
+use ursula_raft::SelfElectionError;
 use ursula_raft::raft_internal_proto;
 use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendExternalRequest;
@@ -2587,42 +2589,53 @@ async fn confirm_raft_quorum(
 
 use ursula_proto::admin::SelfElectionRequest;
 
+/// Starts an election on this node's replica of the group, accepted only
+/// while the term is still the one in the body
+/// ([`ursula_raft::RaftGroupHandleRegistry::request_self_election`]). A
+/// replica that already leads the group or may not campaign, or whose term
+/// or vote changed, is refused with `409 Conflict`. A replica whose Raft
+/// core or apply loop has stopped answers `503 Service Unavailable` (a core
+/// that panicked is not seen: its metrics keep their last values). A group
+/// this node does not host, or one retired because its replay stopped at
+/// startup, answers `404 Not Found`.
 async fn request_raft_self_election(
     State(state): State<HttpState>,
     Path(group_id): Path<u64>,
     axum::Json(request): axum::Json<SelfElectionRequest>,
 ) -> Response {
-    let (group_id, raft) = match resolve_raft_group(&state, group_id) {
+    let (group_id, _raft) = match resolve_raft_group(&state, group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
-    let observed = raft.metrics().borrow_watched().clone();
-    if observed.current_term != request.current_term {
-        return (
-            StatusCode::CONFLICT,
-            "self-election term changed; observe again",
-        )
-            .into_response();
-    }
     let Some(registry) = state.raft_registry() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    // OpenRaft checks the persisted vote before accepting the transfer. A
-    // synthetic vote for this node is not the vote it actually observed.
-    let transfer = openraft::raft::TransferLeaderRequest::new(observed.vote, observed.id, None);
-    match registry.handle_transfer_leader(group_id, transfer).await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(error)) => (
-            StatusCode::CONFLICT,
-            format!("self-election refused: {error}"),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::CONFLICT,
-            format!("self-election refused: {error}"),
-        )
-            .into_response(),
-    }
+    let Err(error) = registry
+        .request_self_election(group_id, request.current_term)
+        .await
+    else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let status = match &error {
+        SelfElectionError::TermChanged { .. }
+        | SelfElectionError::Rejected { .. }
+        | SelfElectionError::Transfer(
+            IncomingTransferError::OwnCommittedVote { .. }
+            | IncomingTransferError::MayNotCampaign { .. },
+        ) => StatusCode::CONFLICT,
+        SelfElectionError::Transfer(IncomingTransferError::Group(group))
+            if matches!(
+                group.infra(),
+                Some(ursula_runtime::GroupInfraError::RaftGroupNotRegistered { .. })
+            ) =>
+        {
+            StatusCode::NOT_FOUND
+        }
+        SelfElectionError::Transfer(
+            IncomingTransferError::Group(_) | IncomingTransferError::Raft { .. },
+        ) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, format!("self-election refused: {error}")).into_response()
 }
 
 pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::TryFromIntError> {

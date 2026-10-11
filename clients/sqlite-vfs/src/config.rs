@@ -3,6 +3,9 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::log;
+use crate::log::Level;
+
 pub(crate) fn abort_after_ack() -> Option<u64> {
     static V: OnceLock<Option<u64>> = OnceLock::new();
     *V.get_or_init(|| {
@@ -21,6 +24,28 @@ pub(crate) fn retry_budget() -> Duration {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30_000),
         )
+    })
+}
+
+/// `URSULA_VFS_IDLE_MS`: how long a connection is kept after its last request, for the next one
+/// to reuse, in milliseconds (90 s by default, see `client::agent`). 0 never reuses one. A value
+/// that is not a number of milliseconds keeps the default, logged once (`setting_adjusted`).
+pub(crate) fn idle_age() -> Duration {
+    const DEFAULT_MS: u64 = 90_000;
+    static V: OnceLock<Duration> = OnceLock::new();
+    *V.get_or_init(|| {
+        let Ok(value) = std::env::var("URSULA_VFS_IDLE_MS") else {
+            return Duration::from_millis(DEFAULT_MS);
+        };
+        let ms = value.trim().parse().unwrap_or_else(|_not_a_number| {
+            log::emit(Level::Warn, "setting_adjusted", &[
+                ("setting", &"URSULA_VFS_IDLE_MS"),
+                ("value", &value),
+                ("used", &DEFAULT_MS),
+            ]);
+            DEFAULT_MS
+        });
+        Duration::from_millis(ms)
     })
 }
 

@@ -392,11 +392,11 @@ jobs:
       # Snapshot bodies above 1 MiB go to the cold tier (S3); cold-snapshot.e2e.ts publishes one above
       # the 8 MiB part size (a multipart upload). The benchmark's Pi turns snapshot and trim as they go
       # (a 64 KiB minimum, so the threshold is the database size).
-      - name: Pi conformance (3 modes), snapshots + retention, multipart snapshot, benchmark through the gateway
+      - name: Pi conformance (3 modes), snapshots + retention, multipart snapshot, benchmark, leader redirects through the gateway
         timeout-minutes: 30
         run: |
           cd clients/sqlite-ursula
-          E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" $NO_OIDC npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts test/cold-snapshot.e2e.ts test/bench.e2e.ts
+          E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" $NO_OIDC npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts test/cold-snapshot.e2e.ts test/bench.e2e.ts test/redirects.e2e.ts
 
       - name: Delete this job's S3 prefix
         if: always() && env.URSULA_S3_PREFIX != ''

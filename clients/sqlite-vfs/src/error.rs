@@ -235,6 +235,23 @@ pub(crate) enum Error {
     NotPublished { mx_frame: u32, frame: u32 },
     #[error("append after {offset} acknowledged with next offset {next}, not past it")]
     AckNotPast { offset: String, next: String },
+    /// The commit after one refused as never applied (`Db::refuse`), sent at the sequence the
+    /// refusal left free, was answered as a duplicate that none of its own attempts explains
+    /// (`client::Append::UnexplainedDuplicate`): the refused commit was applied after all, so the
+    /// stream holds it and the local files do not. `receipt` is its end in the stream.
+    #[error(
+        "a commit refused as never applied was applied after all: the next commit, at epoch \
+         {epoch} seq {seq} after {offset}, was answered as its duplicate (receipt {receipt}), so a \
+         layer in front of the stream refused a write that the stream applied; the stream holds the \
+         refused commit and the local file does not: attach the database again (the attach \
+         replays it)"
+    )]
+    RefusedCommitApplied {
+        epoch: u64,
+        seq: u64,
+        offset: String,
+        receipt: String,
+    },
     #[error("producer expired again right after a re-claim")]
     ProducerExpiredAgain,
     #[error("local WAL write: {0}")]
@@ -530,6 +547,21 @@ mod tests {
             pressure.to_string(),
             "claim http://h/b/s: 503 (not applied: RaftLogPressure): a layer in front of the \
              stream refused it, and nothing of it reached the stream"
+        );
+        // A refused commit applied after all poisons: neither a fence nor damage nor a refusal.
+        let applied = Error::RefusedCommitApplied {
+            epoch: 2,
+            seq: 5,
+            offset: "9".into(),
+            receipt: "12".into(),
+        };
+        assert!(!applied.is_fenced() && !applied.is_local_damage() && applied.refusal().is_none());
+        assert_eq!(
+            applied.to_string(),
+            "a commit refused as never applied was applied after all: the next commit, at epoch 2 \
+             seq 5 after 9, was answered as its duplicate (receipt 12), so a layer in front of the \
+             stream refused a write that the stream applied; the stream holds the refused commit \
+             and the local file does not: attach the database again (the attach replays it)"
         );
     }
 

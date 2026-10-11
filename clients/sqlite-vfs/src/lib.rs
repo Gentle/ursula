@@ -55,9 +55,12 @@
 //!   attempt of the append may have reached the stream (no answer, or a 5xx without a vouched
 //!   marker): its outcome is then unknown, and the commit poisons as on an exhausted budget (see
 //!   `client::append`). So does a 403 without `Producer-Epoch` or a vouched marker, which a
-//!   filtering proxy may send in place of the stream's own answer. The overlay belongs to the
-//!   write transaction: it is cleared whenever the WAL write lock is taken or released, so a
-//!   rolled-back transaction's spilled frames never shadow a later one's.
+//!   filtering proxy may send in place of the stream's own answer. A refused commit that was
+//!   applied after all (a layer in front of the stream broke the rule of design doc §2) is caught
+//!   at the next commit, which goes out with its sequence and is answered as its duplicate: that
+//!   commit poisons (`Db::append_commit`). The overlay belongs to the write transaction: it is
+//!   cleared whenever the WAL write lock is taken or released, so a rolled-back transaction's
+//!   spilled frames never shadow a later one's.
 //! * Durability is the stream's acknowledgement alone: the local files (db, -wal, -shm, sidecar)
 //!   are a cache, not fsynced on the commit path (`xSync` of an attached database is a no-op,
 //!   whatever `PRAGMA synchronous` says). The sidecar records the kernel's boot id, the stream's

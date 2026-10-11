@@ -351,8 +351,22 @@ fn send_retrying(
 }
 
 pub(crate) enum Append {
-    /// Applied (or a duplicate of an applied append); the stream offset after it when known.
+    /// Applied, or answered as a duplicate of an earlier attempt of this append (or, for a claim,
+    /// of any append at its epoch and sequence 0, verified separately); the stream offset after it
+    /// when known.
     Acked { next: Option<String>, attempts: u32 },
+    /// A commit's attempt answered 204, the server's answer to a duplicate, while no earlier
+    /// attempt of it can have reached the stream (see `append`): the stream held an append at this
+    /// epoch and sequence before that attempt reached it, which no attempt of this append put
+    /// there as far as their answers tell. This owner alone writes its producer at its epoch, so
+    /// that append is its own: an earlier commit at this sequence that was refused as never
+    /// applied ([`Append::Refused`]) but was applied after all, or this commit, applied by an
+    /// exchange whose answer said otherwise (an earlier attempt refused falsely, or an exchange
+    /// that a layer in front of the stream made and answered for itself, such as a gateway that
+    /// followed a leader redirect the leader sent after it proposed the commit). `next` is that
+    /// append's receipt. `Db::append_commit` tells them apart by whether a commit at this sequence
+    /// was refused.
+    UnexplainedDuplicate { next: Option<String>, attempts: u32 },
     /// 403 with `Producer-Epoch`: a newer epoch owns the stream.
     Fenced { current: Option<u64> },
     /// 412: the stream is no longer the incarnation the append was sent to (deleted and
@@ -382,17 +396,27 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// `Stream-Incarnation` precondition): retried with the same producer sequence until the outcome
 /// is known.
 ///
-/// A duplicate answer is taken as proof of *our* earlier attempt only for commits (seq >= 1), and
-/// only with its receipt (`Stream-Next-Offset`, checked by `commit`): they are sent after a
-/// verified claim (see `claim_once`), which makes this owner the only writer of its incarnation's
-/// producer at its epoch, so whatever holds (epoch, seq) there is ours. A claim's answer is
-/// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
+/// A duplicate answer is taken as proof of *our* earlier append only for commits (seq >= 1), and
+/// only with its receipt (`Stream-Next-Offset`, checked by `Db::append_commit`): they are sent
+/// after a verified claim (see `claim_once`), which makes this owner the only writer of its
+/// incarnation's producer at its epoch, so whatever holds (epoch, seq) there is ours: an earlier
+/// attempt of this append, or an earlier commit at this sequence that was refused as never applied
+/// (a refusal leaves the sequence to the next commit) but was applied after all. So a duplicate's
+/// answer (204) while no earlier attempt of this append can have reached the stream ends the
+/// append as [`Append::UnexplainedDuplicate`], which `Db::append_commit` takes for such a refused
+/// commit when one was refused at this sequence. After an attempt that may have reached the
+/// stream, a duplicate's answer is taken for that attempt's ([`Append::Acked`]), so a refused
+/// commit applied after all goes unnoticed when an attempt of the next commit got no answer, or an
+/// answer that proves nothing, before the duplicate's (design doc §2). A claim's answer is verified
+/// separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
 ///
 /// An attempt whose answer proves that it applied nothing (`applied_nothing`: a 401, 402 or 429, or
-/// any answer marked `x-ursula-not-applied` that a gateway vouched for with
+/// a refusal marked `x-ursula-not-applied` that a gateway vouched for with
 /// `x-ursula-not-applied-checked`) is taken to have applied nothing, which every layer in front of
 /// the stream must ensure (design doc §2): one that passed the append on and then answered so would
-/// have the next commit acknowledged as this one's duplicate, its pages never appended. A marker
+/// have the next commit, sent with the same sequence, answered as this one's duplicate. That poisons
+/// the next commit (see above) instead of acknowledging it without its pages, unless one of its
+/// attempts got no answer, or an answer that proves nothing, before the duplicate's. A marker
 /// without the vouch proves nothing: a gateway before 0.7.3 relays the marker of an answer it got
 /// by following a leader redirect, which a node can send after it proposed the append. A 403
 /// without `Producer-Epoch` counts only when proven: a filtering proxy can answer 403 in place of
@@ -470,6 +494,14 @@ pub(crate) fn append(
                         (Attempt::Status { status, body }, refusal)
                     }
                     None => match status {
+                        // A duplicate's answer that no attempt of this commit explains (see
+                        // above): the server answers a fresh producer append 200.
+                        204 if seq > 0 && !reached => {
+                            return Append::UnexplainedDuplicate {
+                                next: header_offset(&r, "stream-next-offset"),
+                                attempts,
+                            };
+                        }
                         200..=299 => {
                             return Append::Acked {
                                 next: header_offset(&r, "stream-next-offset"),
@@ -1489,6 +1521,65 @@ mod tests {
             Append::Failed(Error::AppendRejected { status: 413, .. })
         ));
         assert_eq!(server.join().unwrap().len(), 8);
+    }
+
+    // A commit's attempt answered 204, the server's answer to a duplicate, while no earlier attempt
+    // of it can have reached the stream is a duplicate that no attempt of it explains: a commit
+    // refused before it at the same sequence may have been applied after all (`Db::append_commit`
+    // decides). A refused attempt of the same append does not explain it either. A 200 is an
+    // acknowledgement, a 204 after an attempt that may have reached the stream is that attempt's
+    // duplicate, and a claim's 204 is verified separately.
+    #[test]
+    fn a_duplicate_that_no_attempt_explains_is_told_apart() {
+        let pressure = |last: &str| {
+            answer(&format!(
+                "503 Service Unavailable\r\n{}\r\n{last}",
+                vouched("RaftLogPressure")
+            ))
+        };
+        let duplicate = || answer("204 No Content\r\nstream-next-offset: 12");
+        let (url, server) = serve(vec![
+            // Refused to the end, then a duplicate's answer to the next commit at its sequence.
+            pressure(LAST),
+            duplicate(),
+            // Refused to the end, then a fresh append's answer.
+            pressure(LAST),
+            answer("200 OK\r\nstream-next-offset: 12"),
+            // A refused attempt, then a duplicate's answer, within one append.
+            pressure("retry-after: 0"),
+            duplicate(),
+            // No answer, then a duplicate's answer: the lost attempt's.
+            String::new(),
+            duplicate(),
+            // A claim's duplicate.
+            duplicate(),
+        ]);
+        let refused = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(
+            refused,
+            Append::Refused(WriteRefusal::NotApplied { status: 503, .. })
+        ));
+        let unexplained = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(
+            unexplained,
+            Append::UnexplainedDuplicate { next: Some(ref n), attempts: 1 } if n == "12"
+        ));
+        assert!(matches!(
+            append(&url, "i1", "p", b"x", 1, 5),
+            Append::Refused(_)
+        ));
+        let fresh = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(fresh, Append::Acked { next: Some(ref n), attempts: 1 } if n == "12"));
+        let within = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(within, Append::UnexplainedDuplicate {
+            attempts: 2,
+            ..
+        }));
+        let retried = append(&url, "i1", "p", b"x", 1, 5);
+        assert!(matches!(retried, Append::Acked { next: Some(ref n), attempts: 2 } if n == "12"));
+        let claim = append(&url, "i1", "p", b"x", 1, 0);
+        assert!(matches!(claim, Append::Acked { attempts: 1, .. }));
+        assert_eq!(server.join().unwrap().len(), 9);
     }
 
     // A marker counts only with a gateway's vouch (`applied_nothing`), and the vouch alone proves

@@ -264,10 +264,24 @@ export class Gate {
 		await this.control({ dropNextPost: { refuse: body, limit, ...refusal } });
 	}
 
-	/** Requests refused, forwarded and forwarded with their answer cut, so far. */
-	async counts(): Promise<{ refused: number; forwarded: number; dropped: number }> {
+	/**
+	 * Forwards the next POST and answers it with `body` (and `refusal`'s status and headers, see `refuse`)
+	 * in place of the node's answer, then refuses the next `limit` writes the same way. It breaks the rule
+	 * for refusals: the client is told that a write the stream applied was not applied.
+	 */
+	async forwardNextPostThenRefuse(body: string, limit: number, refusal: Refusal = {}): Promise<void> {
+		await this.control({ forwardNextPost: { refuse: body, limit, ...refusal } });
+	}
+
+	/** Forwards every request again, and drops an armed `dropNextPostThenRefuse` or `forwardNextPostThenRefuse`. */
+	async reset(): Promise<void> {
+		await this.control({ refuse: null, dropNextPost: null, forwardNextPost: null });
+	}
+
+	/** Requests refused, forwarded, forwarded with their answer cut, and forwarded with their answer replaced by a refusal, so far. */
+	async counts(): Promise<{ refused: number; forwarded: number; dropped: number; replaced: number }> {
 		const r = await fetch(`${this.url}/__gate`);
-		return (await r.json()) as { refused: number; forwarded: number; dropped: number };
+		return (await r.json()) as { refused: number; forwarded: number; dropped: number; replaced: number };
 	}
 
 	private async control(body: object): Promise<void> {

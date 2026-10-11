@@ -5,7 +5,8 @@
 // such a write was applied, so it fails alone, as a refused 402 does: the commit is rolled back but
 // the file is not poisoned, reads go on, and the next commit goes out as usual and succeeds once the
 // refusals stop. An attempt whose outcome is unknown among the refusals still poisons: the commit may
-// be in the stream. So does a marker without the vouch. The refusing layer is `gate.mjs`.
+// be in the stream. So does a marker without the vouch, and so does the commit after a refusal for a
+// commit the stream applied. The refusing layer is `gate.mjs`.
 import { writeFileSync } from "node:fs";
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
 import { attach, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
@@ -37,7 +38,7 @@ beforeAll(async () => {
 });
 // A test that fails midway leaves the gate refusing: the next test starts with it forwarding.
 afterEach(async () => {
-	await gate.refuse(null);
+	await gate.reset();
 });
 afterAll(async () => {
 	await gate.close();
@@ -145,6 +146,40 @@ it("an append whose answer was lost and whose retries are refused as applying no
 	const copy = freshFile();
 	attach(copy, ursulaUrl() + path);
 	expect(xs(copy)).toEqual(["once"]);
+});
+
+// A layer that breaks the rule for refusals: it passes a commit on, the stream applies it, and the layer
+// answers with a vouched refusal. The commit fails alone, as the refusal says it may. The next commit
+// goes out with the same producer sequence and is answered as the refused commit's duplicate: it poisons
+// instead of being acknowledged without its pages, and a replica built from the stream holds the refused
+// transaction, not the next one.
+it("a refusal for a commit the stream applied is caught at the next commit, which poisons", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const [armed, accepting] = [`${file}.armed`, `${file}.accepting`];
+	const steps = ["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('f1')", `@wait:${armed}`, "INSERT INTO t VALUES ('f2')", "@status", `@wait:${accepting}`, "INSERT INTO t VALUES ('f3')"];
+	const child = runChild(file, gate.url + path, steps, { CHILD_EXIT: "1", ...SHORT_BUDGET });
+	await child.waitFor((l) => l.step === 2 && l.phase === "start");
+	const before = await gate.counts();
+	await gate.forwardNextPostThenRefuse(PRESSURE_BODY, 100, PRESSURE);
+	writeFileSync(armed, "");
+	await child.waitFor((l) => l.step === 5 && l.phase === "start");
+	await gate.reset();
+	writeFileSync(accepting, "");
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code, child.stderr()).toBe(0);
+	const after = await gate.counts();
+	expect(after.replaced - before.replaced).toBe(1);
+	expect(step(child, 3)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
+	expect(step(child, 4)?.status).toMatchObject({ poisoned: false, writes_refused: true, refused_kind: "not_applied", refused_reason: "RaftLogPressure" });
+	expect(step(child, 6)).toMatchObject({ ok: false, errcode: POISONED });
+	expect(done).toMatchObject({ poisoned: true, fenced: false, writes_refused: false, refused_kind: null });
+	expect(done.reason).toMatch(/^a commit refused as never applied was applied after all: the next commit, at epoch \d+ seq \d+ after \S+, was answered as its duplicate \(receipt \S+\)/);
+	expect(child.stderr()).toMatch(/event=poisoned file=\S+ stream=\S+ fenced=false reason="a commit refused as never applied was applied after all/);
+	// The stream holds the refused transaction, and not the next one.
+	const copy = freshFile();
+	attach(copy, ursulaUrl() + path);
+	expect(xs(copy)).toEqual(["f1", "f2"]);
 });
 
 // The marker counts only with a gateway's vouch: a node sends it alone, and a gateway before 0.7.3

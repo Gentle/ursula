@@ -260,7 +260,9 @@ impl Db {
     /// expired producer back first, see `reclaim`) and settles the outcome. Acknowledged: the owner
     /// moves to that sequence and the stream offset after the frame, and the append's attempts are
     /// returned. Otherwise the database is poisoned, or the commit refused alone when nothing of it
-    /// reached the stream (`refuse`), and the code the write fails with is returned.
+    /// reached the stream (`refuse`), and the code the write fails with is returned. A duplicate's
+    /// answer that none of the commit's attempts explains, at the sequence a refused commit left
+    /// free (`refused_at`), poisons: the refused commit was applied after all.
     fn append_commit(&mut self, body: &[u8]) -> Result<u32, c_int> {
         let mut outcome = append(
             &self.url,
@@ -289,11 +291,37 @@ impl Db {
         }
         let seq = self.seq.saturating_add(1);
         let (next, attempts) = match outcome {
+            // A duplicate's answer that no attempt of this commit explains, at the sequence a
+            // refused commit left free: the stream may hold that commit, which a layer in front of
+            // it refused after the stream applied it (design doc §2). Acknowledged, the next
+            // commits would build on a local file without it while the stream holds it, with no
+            // error. This commit may be what the stream holds instead (a gateway that followed a
+            // redirect sent after the leader proposed it), so this can poison an owner whose
+            // commit is in the stream, which costs an attach, never data.
+            Append::UnexplainedDuplicate {
+                next: Some(receipt),
+                ..
+            } if self.refused_at == Some((self.epoch, seq)) => {
+                return Err(self.poison(Error::RefusedCommitApplied {
+                    epoch: self.epoch,
+                    seq,
+                    offset: self.offset.clone(),
+                    receipt,
+                }));
+            }
+            // Elsewhere no commit at this sequence was refused, so an unexplained duplicate is this
+            // commit, applied by an exchange whose answer said otherwise (see
+            // `Append::UnexplainedDuplicate`): acknowledged like any other.
             Append::Acked {
                 next: Some(n),
                 attempts,
+            }
+            | Append::UnexplainedDuplicate {
+                next: Some(n),
+                attempts,
             } if n > self.offset => (n, attempts),
-            Append::Acked { next: Some(n), .. } => {
+            Append::Acked { next: Some(n), .. }
+            | Append::UnexplainedDuplicate { next: Some(n), .. } => {
                 return Err(self.poison(Error::AckNotPast {
                     offset: self.offset.clone(),
                     next: n,
@@ -304,7 +332,7 @@ impl Db {
             // producer at its epoch (verified claim) with one append in flight, the newest, and the
             // server never evicts a producer's newest receipt. So another writer appended at this
             // epoch past `seq`.
-            Append::Acked { next: None, .. } => {
+            Append::Acked { next: None, .. } | Append::UnexplainedDuplicate { next: None, .. } => {
                 return Err(self.poison(Error::Fenced(Fence::DuplicateWithoutReceipt {
                     offset: self.offset.clone(),
                     producer: self.producer.clone(),
@@ -1279,6 +1307,60 @@ mod tests {
             Some(Error::AppendUnknown { attempts: 3, .. })
         ));
         assert_eq!(server.join().unwrap().len(), 8);
+    }
+
+    // A layer that refused a commit after the stream applied it breaks the rule of design doc §2:
+    // the next commit, sent with the same sequence, is answered as the refused commit's duplicate.
+    // Acknowledged, the stream would hold the refused transaction and the local file the next one,
+    // with no error: it poisons instead. A fresh append's 200 after the refusal is acknowledged, and
+    // so is a duplicate's answer at a sequence no refused commit used (this commit, applied by an
+    // exchange that a gateway made and answered for itself). After an attempt whose outcome is
+    // unknown a duplicate's answer is taken for that attempt's, which hides a refused commit applied
+    // after all (the gap design doc §2 names).
+    #[test]
+    fn the_commit_after_a_refused_one_that_was_applied_poisons() {
+        let duplicate = || answer("204 No Content\r\nstream-next-offset: 00000000000000000012");
+        let (url, server) = serve(vec![
+            pressure("RaftLogPressure", LAST),
+            duplicate(),
+            pressure("RaftLogPressure", LAST),
+            answer("200 OK\r\nstream-next-offset: 00000000000000000012"),
+            duplicate(),
+            pressure("RaftLogPressure", LAST),
+            String::new(),
+            duplicate(),
+        ]);
+        let mut d = owner(url.clone());
+        assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
+        assert_eq!(d.refused_at, Some((2, 5)));
+        assert_eq!(d.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_WRITE));
+        assert!(matches!(
+            d.poisoned.as_ref().map(|p| &p.first),
+            Some(Error::RefusedCommitApplied { epoch: 2, seq: 5, offset, receipt })
+                if offset == "00000000000000000009" && receipt == "00000000000000000012"
+        ));
+        assert!(!d.fenced() && !d.damaged() && d.refused.is_none());
+        assert_eq!(at(&d), (2, 4, "00000000000000000009"));
+        let mut accepted = owner(url.clone());
+        assert_eq!(
+            accepted.append_commit(b"frame"),
+            Err(ffi::SQLITE_IOERR_AUTH)
+        );
+        assert_eq!(accepted.append_commit(b"frame"), Ok(1));
+        assert_eq!(at(&accepted), (2, 5, "00000000000000000012"));
+        assert!(accepted.refused.is_none() && accepted.refused_at.is_none());
+        let mut unrefused = owner(url.clone());
+        assert_eq!(unrefused.append_commit(b"frame"), Ok(1));
+        assert_eq!(at(&unrefused), (2, 5, "00000000000000000012"));
+        let mut lost = owner(url);
+        assert_eq!(lost.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
+        assert_eq!(lost.append_commit(b"frame"), Ok(2));
+        assert!(lost.poisoned.is_none());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 8);
+        for request in &requests {
+            assert_eq!(request_header(request, "producer-seq"), Some("5"));
+        }
     }
 
     // The server expired the owner's producer: the owner takes the stream back before the commit

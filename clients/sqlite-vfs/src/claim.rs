@@ -74,8 +74,12 @@ pub(crate) fn claim_once(
         }
         Append::Fenced { current } => return Ok(Claimed::Fenced(current)),
         Append::Recreated => return Ok(Claimed::Recreated),
-        // A claim has sequence 0 and no `Stream-Seq`: the server answered something else.
-        Append::ProducerExpired | Append::SeqConflict { .. } => {
+        // Answers only a commit gets: a claim has sequence 0 and no `Stream-Seq`, and `append`
+        // tells an unexplained duplicate apart for commits alone (a claim's 2xx is verified
+        // below), so the server answered something else.
+        Append::ProducerExpired
+        | Append::SeqConflict { .. }
+        | Append::UnexplainedDuplicate { .. } => {
             return Err(Error::ClaimAnswer {
                 url: url.to_owned(),
             });

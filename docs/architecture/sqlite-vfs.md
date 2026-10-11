@@ -119,9 +119,27 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   redirect, and relays such an answer to a later exchange, since an earlier exchange may have
   applied the request. Such a layer may relay it only if every exchange was refused that way, so
   turn off retries and redirect following for writes in any proxy or service mesh in front of
-  Ursula. When the rule breaks, the next commit is acknowledged as a duplicate of the refused
-  transaction, its pages never appended, and the stream holds the refused transaction while the
-  local file holds the next one, with no error.
+  Ursula. When the rule breaks, the stream holds the refused transaction, which the local file
+  lacks, and the next commit goes out with the producer sequence the refused one used.
+- **A false refusal is caught at the next commit.** The server answers a fresh producer append 200
+  and a duplicate 204 with the receipt of the append it duplicates. The next commit after a
+  refused one goes out with the same epoch and sequence, so when the refused commit was applied
+  after all, the server answers it as that commit's duplicate. A 204 to an attempt of a commit
+  while no earlier attempt of it can have reached the stream is a duplicate that none of its
+  attempts explains, and at the sequence a refused commit left free the VFS takes it for that
+  commit. It poisons the database (`reason`: a commit refused as never applied was applied after
+  all) instead of acknowledging a commit whose pages would never reach the stream. The attach that
+  follows replays the refused transaction, so the database then holds it although its commit
+  failed with `SQLITE_IOERR_AUTH`. With this check a false refusal poisons at the next commit
+  instead of diverging, so the vouch makes false refusals rarer but is no longer the only barrier
+  against divergence. Two gaps remain. A 204 after an attempt of the next commit that got no
+  answer, or an answer that proves nothing, is taken for that attempt's own duplicate, as every
+  retry's is, so a false refusal followed by such an attempt still diverges with no error. And an
+  unexplained 204 can be the commit's own: a gateway follows a leader redirect that a server can
+  send after it proposed the write, and the new leader answers the gateway's second exchange as
+  the duplicate of the first. At a sequence no refused commit used, that is the only explanation,
+  so the commit is acknowledged. At the sequence a refused commit left free, that case poisons too,
+  which costs an attach but loses nothing.
 - A 403 without `Producer-Epoch` counts only when it carries both headers. A filtering proxy, such
   as a web application firewall that inspects responses, can answer 403 in place of the stream's
   own answer after the stream applied the write. So any other 403 fails the write and poisons, as
@@ -402,7 +420,8 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 - Nothing the stream did not acknowledge becomes visible: no frame of a transaction reaches the
   local WAL before its append is acknowledged, and a fenced, refused or failed commit leaves no trace
   locally or remotely (the server deduplicates retries, and a refused commit relies on §2's
-  requirement on layers in front of the stream). An append the server applied but whose answer the
+  requirement on layers in front of the stream: when a layer breaks it, the next commit poisons,
+  except in the gaps §2 names). An append the server applied but whose answer the
   client never saw is in the stream, and appears after the next attach.
 - Fencing: after a claim at epoch `e` is verified, appends below `e` fail. Snapshots carry the
   highest epoch, so this survives retention trimming the claims.
@@ -701,7 +720,10 @@ must say in its release notes to stop every owner of a stream before upgrading.
   poison clears the refusal (and a refusal after a poison is not recorded), no snapshot is taken
   while any refusal is recorded, `ursula_status` reports the kind and the reason (a 402 also in its
   0.7.1 fields), a refused attach gets `SQLITE_AUTH` for a 402 and `SQLITE_IOERR_AUTH` otherwise,
-  and the attach mode parses.
+  and the attach mode parses. A 204 to a commit while no earlier attempt of it can have reached the
+  stream is told apart from an acknowledgement, and at the sequence a refused commit left free it
+  poisons, while a 200 there, a 204 at a sequence no refused commit used, and a 204 after an
+  attempt whose outcome is unknown are acknowledged.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -749,7 +771,10 @@ must say in its release notes to stop every owner of a stream before upgrading.
   `SQLITE_IOERR_AUTH`. Reads go on, `ursula_status` names the kind and the reason, the owner keeps
   its epoch and offset, the next commit succeeds without an attach, and the stream holds the
   accepted commits alone. An append whose answer was lost and whose retries are refused as applying
-  nothing poisons, and the stream holds it once. A commit refused with the marker alone poisons,
+  nothing poisons, and the stream holds it once. A layer that forwards a commit and answers it with
+  a vouched refusal makes it fail alone, the next commit poisons because the refused commit was
+  applied after all, and a replica built from the stream holds the refused transaction. A commit
+  refused with the marker alone poisons,
   and an attach whose claim a 403 marked alone denies fails with `SQLITE_ERROR`. An authorizer's
   403 marked and vouched for refuses a commit at once, and an unmarked one poisons. An attach the
   vouched 403 refuses throws `UrsulaWriteRefusedError`, one the unmarked 403 refuses fails with

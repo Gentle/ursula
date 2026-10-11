@@ -89,6 +89,11 @@ pub(crate) struct Db {
     /// `poisoned`: a poisoned database needs a re-attach whatever the refusing layer does
     /// (`set_poisoned`).
     pub(crate) refused: Option<WriteRefusal>,
+    /// The epoch and producer sequence of the latest commit refused before it reached the stream
+    /// (`refuse`), until a commit is acknowledged. The next commit goes out with them, so a
+    /// duplicate's answer to it that none of its own attempts explains is the refused commit's
+    /// receipt: it was applied after all (`append_commit`).
+    pub(crate) refused_at: Option<(u64, u64)>,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
     /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame
     /// offset + 24).
@@ -259,10 +264,12 @@ impl Db {
     /// The write transaction's commit was refused before it reached the stream, and so was every
     /// attempt of it (`Append::Refused`): the write fails with SQLITE_IOERR_AUTH and SQLite rolls
     /// the transaction back, as on a poison, but the database is not poisoned. Its epoch, producer
-    /// sequence and offset still describe the stream, so the next commit is sent as usual, and is
-    /// acknowledged once the refusals stop: no attach is needed.
+    /// sequence and offset still describe the stream, so the next commit is sent as usual, with the
+    /// sequence the refused one left free (`refused_at`), and is acknowledged once the refusals
+    /// stop: no attach is needed.
     pub(crate) fn refuse(&mut self, refusal: WriteRefusal) -> c_int {
         self.writes_refused(refusal, "commit");
+        self.refused_at = Some((self.epoch, self.seq.saturating_add(1)));
         self.overlay.clear();
         self.committed = false;
         ffi::SQLITE_IOERR_AUTH
@@ -303,8 +310,10 @@ impl Db {
         self.refused = Some(refusal);
     }
 
-    /// A commit was acknowledged: whatever refused writes before accepts them again.
+    /// A commit was acknowledged: whatever refused writes before accepts them again, and the
+    /// sequence a refused commit left free is taken.
     pub(crate) fn writes_accepted(&mut self) {
+        self.refused_at = None;
         if self.refused.take().is_some() {
             log::emit(Level::Info, "writes_resumed", &[
                 ("file", &self.path),
@@ -430,6 +439,7 @@ impl Db {
             log: 0,
             poisoned: None,
             refused: None,
+            refused_at: None,
             overlay: BTreeMap::new(),
             wal_written: BTreeMap::new(),
             committed: false,
@@ -495,10 +505,12 @@ mod tests {
             (d.epoch, d.seq, d.offset.as_str()),
             (2, 4, "00000000000000000009")
         );
+        // The next commit goes out at the epoch and sequence the refused one left free.
+        assert_eq!(d.refused_at, Some((2, 5)));
         d.refuse(payment(""));
         assert_eq!(d.refused, Some(payment("")));
         d.writes_accepted();
-        assert!(d.refused.is_none());
+        assert!(d.refused.is_none() && d.refused_at.is_none());
         // Any other refusal that applied nothing: the same, with its own reason.
         d.overlay.insert(0, vec![1u8; 32]);
         assert_eq!(d.refuse(pressure.clone()), ffi::SQLITE_IOERR_AUTH);

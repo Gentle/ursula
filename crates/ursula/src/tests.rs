@@ -6416,27 +6416,28 @@ mod cluster_egress {
 
     use crate::bootstrap::ClusterEgressProbeScope;
     use crate::bootstrap::PeerParticipation;
-    use crate::bootstrap::ShedCandidate;
+    use crate::bootstrap::ShedDrain;
     use crate::bootstrap::ShedHandoff;
     use crate::bootstrap::cluster_egress_probe_groups;
-    use crate::bootstrap::plan_shed_handoffs;
 
-    /// The egress gate's plan: every group `node_id` leads, to any voter that
-    /// may campaign and that `can_take_over` accepts.
+    /// The egress gate's first plan: every group `node_id` leads, with no
+    /// cap, to any voter that may campaign and that `can_take_over` accepts.
     fn plan_egress_shed(
         snaps: &[RaftGroupMetricsSnapshot],
         node_id: u64,
         can_take_over: impl Fn(RaftGroupId, u64) -> bool,
     ) -> crate::bootstrap::ShedPlan {
-        plan_shed_handoffs(
-            snaps,
-            node_id,
-            ShedCandidate::every_group_led_by(snaps, node_id),
-            &[],
-            usize::MAX,
-            &std::collections::HashSet::from([1, 2, 3, 4]),
-            can_take_over,
-        )
+        ShedDrain::of_groups_led_by(snaps, node_id)
+            .tick(
+                snaps,
+                node_id,
+                tokio::time::Instant::now(),
+                usize::MAX,
+                &[],
+                &std::collections::HashSet::from([1, 2, 3, 4]),
+                can_take_over,
+            )
+            .plan
     }
 
     fn snap(group_id: u32, voters: Vec<u64>) -> RaftGroupMetricsSnapshot {
@@ -6644,6 +6645,7 @@ mod leadership_shed {
     use crate::bootstrap::LeadershipShed;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ShedHandoff;
+    use crate::bootstrap::ShedPace;
     use crate::bootstrap::StoreGateInputs;
 
     const GROUPS: u32 = 12;
@@ -6942,8 +6944,12 @@ mod leadership_shed {
         let cluster = Cluster::led_by_node_1().await;
         let node_1 = cluster.node_1();
         let participation = cluster.participation();
-        let mut shed =
-            LeadershipShed::new(&node_1.registry, LeadershipShedReason::SnapshotDriverS3, 1);
+        let mut shed = LeadershipShed::new(
+            &node_1.registry,
+            LeadershipShedReason::SnapshotDriverS3,
+            1,
+            ShedPace::Gradual,
+        );
         shed.begin();
         let mut submitted_per_step = Vec::new();
         let mut targets = BTreeMap::<u64, usize>::new();
@@ -7004,8 +7010,12 @@ mod leadership_shed {
                 .registry
                 .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
         }
-        let mut shed =
-            LeadershipShed::new(&node_1.registry, LeadershipShedReason::SnapshotDriverS3, 1);
+        let mut shed = LeadershipShed::new(
+            &node_1.registry,
+            LeadershipShedReason::SnapshotDriverS3,
+            1,
+            ShedPace::Gradual,
+        );
         shed.begin();
 
         // With no peer that may campaign, every leadership stays pending.
@@ -7099,45 +7109,61 @@ mod leadership_shed {
         cluster.shutdown().await;
     }
 
-    /// An address that refuses connections.
-    async fn refusing_url() -> String {
+    /// An address that accepts connections and never answers, as long as
+    /// the returned listener lives.
+    async fn silent_url() -> (String, tokio::net::TcpListener) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
         let address = listener.local_addr().expect("local addr");
-        drop(listener);
-        format!("http://{address}")
+        (format!("http://{address}"), listener)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_egress_gate_hands_every_leadership_off_on_its_shed_tick() {
         let cluster = Cluster::led_by_node_1().await;
         let node_1 = cluster.node_1();
-        // Node 1's egress probes reach no peer, but the peers still answer
-        // their leadership-shed state and Raft traffic.
-        let probe_peers = vec![
-            cluster.peers[0].clone(),
-            (2, refusing_url().await),
-            (3, refusing_url().await),
-        ];
+        // Node 1's egress fails: neither its probes nor its leadership-shed
+        // requests to nodes 2 and 3 get an answer, as over an impaired path,
+        // while Raft still reaches both.
+        let (url_2, _silent_2) = silent_url().await;
+        let (url_3, _silent_3) = silent_url().await;
+        let peers = vec![cluster.peers[0].clone(), (2, url_2), (3, url_3)];
+        let participation = PeerParticipation::new(
+            1,
+            &peers,
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .expect("peer client"),
+        );
+        // One bad tick sheds, and the next tick comes 5 s later.
         crate::bootstrap::spawn_egress_gate(
             &node_1.registry,
-            &cluster.participation(),
-            &probe_peers,
+            &participation,
+            &peers,
             BTreeMap::new(),
-            &ursula_config::ClusterProbeConfig::default(),
+            &ursula_config::ClusterProbeConfig {
+                interval: ursula_config::HumanDuration::sec(5),
+                unhealthy_ticks: 1,
+                ..ursula_config::ClusterProbeConfig::default()
+            },
         );
-        // The gate hands off only on the tick it sheds, so a cap there would
-        // leave the rest of the twelve leaderships on node 1 for good.
+        let deadline = deadline(Duration::from_secs(30));
+        while !node_1
+            .registry
+            .leadership_shed_state()
+            .contains(LeadershipShedReason::ClusterEgress.into())
+        {
+            assert!(Instant::now() < deadline, "the egress gate does not shed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Every leadership leaves before the next tick, to peers that did
+        // not answer whether they may campaign. A gate that handed off a few
+        // per tick would keep some on node 1 for another 5 s.
         cluster
-            .wait_until_node_1_leads_nothing(Duration::from_secs(30))
+            .wait_until_node_1_leads_nothing(Duration::from_secs(4))
             .await;
-        assert!(
-            node_1
-                .registry
-                .leadership_shed_state()
-                .contains(LeadershipShedReason::ClusterEgress.into())
-        );
         let (to_2, to_3) = (cluster.led_by(2), cluster.led_by(3));
         assert!(to_2 >= 4 && to_3 >= 4, "node 2 leads {to_2}, node 3 {to_3}");
         cluster.shutdown().await;

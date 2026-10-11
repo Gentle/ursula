@@ -8,6 +8,7 @@ use crate::bootstrap::health_gate::CounterGrowth;
 use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
 use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::health_gate::TickHealth;
 use crate::bootstrap::participation::PeerParticipation;
 
@@ -142,7 +143,12 @@ pub fn spawn_cold_health_gate(
             hot_low_bytes,
             errors_per_tick_high,
         );
-        let mut shed = LeadershipShed::new(&registry, LeadershipShedReason::ColdHealth, node_id);
+        let mut shed = LeadershipShed::new(
+            &registry,
+            LeadershipShedReason::ColdHealth,
+            node_id,
+            ShedPace::Gradual,
+        );
         loop {
             tokio::time::sleep(interval).await;
             let snap = metrics.snapshot();

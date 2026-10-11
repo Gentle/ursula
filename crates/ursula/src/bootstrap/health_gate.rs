@@ -1,8 +1,8 @@
 //! Shared core of the leadership health gates: the snapshot-store gate, the
 //! cold-health gate and the cluster-egress gate. It holds the shed/heal
 //! hysteresis, the planner that picks the target of each handoff, and the
-//! drain that hands a shedding node's leaderships to its peers a few per
-//! tick.
+//! drain that hands a shedding node's leaderships to its peers, a few per
+//! tick or, for the egress gate, all at once.
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -20,11 +20,31 @@ use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::util::leader_counts;
 
-/// Most handoffs one gate submits per tick. A node that sheds moves its
-/// leaderships over several ticks, so its peers take them over a few at a
-/// time rather than all at once (#508). The cap is per gate: two gates that
-/// shed at once drain independently.
+/// Most handoffs one gate submits per tick at [`ShedPace::Gradual`]. A node
+/// that sheds moves its leaderships over several ticks, so its peers take
+/// them over a few at a time rather than all at once (#508). The cap is per
+/// gate: two gates that shed at once drain independently.
 const SHED_HANDOFFS_PER_TICK: usize = 4;
+
+/// How many handoffs a shed submits per step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShedPace {
+    /// At most [`SHED_HANDOFFS_PER_TICK`] new handoffs per step.
+    Gradual,
+    /// Every pending leadership a peer can take over, at every step. For a
+    /// node that cannot reach a quorum: it cannot replicate, so its
+    /// leaderships stall where they are.
+    AllAtOnce,
+}
+
+impl ShedPace {
+    fn handoffs_per_step(self) -> usize {
+        match self {
+            Self::Gradual => SHED_HANDOFFS_PER_TICK,
+            Self::AllAtOnce => usize::MAX,
+        }
+    }
+}
 
 /// How often a pending leadership that no peer can take over is reported
 /// again.
@@ -166,6 +186,7 @@ pub(crate) struct ShedCandidate {
 
 impl ShedCandidate {
     /// Every group `node_id` leads in `snaps`, by group id.
+    #[cfg(test)]
     pub(crate) fn every_group_led_by(
         snaps: &[RaftGroupMetricsSnapshot],
         node_id: u64,
@@ -492,6 +513,7 @@ pub(crate) struct LeadershipShed {
     registry: RaftGroupHandleRegistry,
     reason: LeadershipShedReason,
     node_id: u64,
+    pace: ShedPace,
     drain: ShedDrain,
     /// When each stranded group was last reported.
     stranded_reported: BTreeMap<u32, Instant>,
@@ -502,11 +524,13 @@ impl LeadershipShed {
         registry: &RaftGroupHandleRegistry,
         reason: LeadershipShedReason,
         node_id: u64,
+        pace: ShedPace,
     ) -> Self {
         Self {
             registry: registry.clone(),
             reason,
             node_id,
+            pace,
             drain: ShedDrain::default(),
             stranded_reported: BTreeMap::new(),
         }
@@ -538,8 +562,8 @@ impl LeadershipShed {
         !self.drain.is_empty()
     }
 
-    /// Hands off this tick's share of the pending leaderships: at most
-    /// [`SHED_HANDOFFS_PER_TICK`] new submissions, the hottest group first
+    /// Hands off this tick's share of the pending leaderships: as many new
+    /// submissions as the shed's [`ShedPace`] allows, the hottest group first
     /// (`heat` holds the node's hot bytes by group id), each to a voter in
     /// `may_campaign` that the registry's handoff check accepts. A submitted
     /// handoff stays pending until another node leads the group, and is
@@ -553,7 +577,7 @@ impl LeadershipShed {
             &snaps,
             self.node_id,
             now,
-            SHED_HANDOFFS_PER_TICK,
+            self.pace.handoffs_per_step(),
             heat,
             may_campaign,
             |group, target| registry.check_handoff(group, target).is_ok(),

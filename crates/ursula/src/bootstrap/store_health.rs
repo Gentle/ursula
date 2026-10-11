@@ -19,6 +19,7 @@ use crate::bootstrap::health_gate::CounterGrowth;
 use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
 use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::health_gate::TickHealth;
 use crate::bootstrap::participation::PeerParticipation;
 
@@ -302,8 +303,12 @@ pub(crate) fn spawn_store_health_gate(
             config.flush_window_ticks,
         );
         // The shed ends when the task does, however it stops.
-        let mut shed =
-            LeadershipShed::new(&registry, LeadershipShedReason::SnapshotDriverS3, node_id);
+        let mut shed = LeadershipShed::new(
+            &registry,
+            LeadershipShedReason::SnapshotDriverS3,
+            node_id,
+            ShedPace::Gradual,
+        );
         loop {
             let tick_started = Instant::now();
             let probe_answered =

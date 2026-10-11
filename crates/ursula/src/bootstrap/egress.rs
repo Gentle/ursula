@@ -9,9 +9,9 @@ use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
-use crate::bootstrap::health_gate::ShedCandidate;
+use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::health_gate::TickHealth;
-use crate::bootstrap::health_gate::plan_shed_handoffs;
 use crate::bootstrap::participation::PeerParticipation;
 
 const DEFAULT_CLUSTER_PROBE_INTERVAL_MS: usize = 500;
@@ -104,9 +104,12 @@ pub(crate) fn cluster_egress_probe_groups(
         .collect()
 }
 
-/// Config-driven cluster egress gate. It probes `probe_peers` and, when it
-/// sheds, hands every leadership off at once to the peers in `participation`
-/// that may campaign.
+/// Config-driven cluster egress gate. It probes `probe_peers` and, while it
+/// sheds, hands every leadership it held when it shed to its peers at once,
+/// and plans again on every tick for the ones still pending. The peers'
+/// answers to `participation` travel the path the gate judges impaired, so
+/// it passes over only a peer that answered that it may not campaign, and
+/// leaves a peer that did not answer to the registry's handoff check.
 pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
     participation: &PeerParticipation,
@@ -151,6 +154,15 @@ pub fn spawn_egress_gate(
         };
         let payload = vec![0u8; probe_bytes];
         let mut hysteresis = HealthHysteresis::new(unhealthy_ticks, heal_ticks);
+        // A node that cannot reach a quorum cannot replicate, so its
+        // leaderships stall where they are: hand them all off at once. The
+        // shed ends when the task does, however it stops.
+        let mut shed = LeadershipShed::new(
+            &registry,
+            LeadershipShedReason::ClusterEgress,
+            node_id,
+            ShedPace::AllAtOnce,
+        );
         loop {
             tokio::time::sleep(interval).await;
             let snaps = registry.metrics_snapshot();
@@ -187,50 +199,20 @@ pub fn spawn_egress_gate(
             };
             match hysteresis.observe(tick) {
                 HealthTransition::Shed => {
-                    registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
-                    // A node that cannot reach a quorum cannot replicate, so its
-                    // leaderships stall where they are: hand them all off now.
-                    let may_campaign = participation.campaign_eligible_nodes(&registry).await;
-                    let plan = plan_shed_handoffs(
-                        &snaps,
-                        node_id,
-                        ShedCandidate::every_group_led_by(&snaps, node_id),
-                        &[],
-                        usize::MAX,
-                        &may_campaign,
-                        |group, target| registry.check_handoff(group, target).is_ok(),
-                    );
-                    if !plan.stranded.is_empty() {
-                        tracing::warn!(
-                            node_id,
-                            groups = ?plan.stranded,
-                            ?may_campaign,
-                            "cluster-egress: no peer that may campaign can take over these \
-                             leaderships"
-                        );
-                    }
-                    for handoff in plan.handoffs {
-                        if let Err(err) = registry
-                            .transfer_leader(RaftGroupId(handoff.group_id), handoff.target)
-                            .await
-                        {
-                            tracing::error!(
-                                "cluster-egress: transfer_leader group {} -> {} failed while yielding: {err}",
-                                handoff.group_id,
-                                handoff.target,
-                            );
-                        }
-                    }
-                    if let Some((scope, healthy_peers, peer_count, needed_peers)) = degraded_probe {
+                    if let Some((scope, healthy_peers, peer_count, needed_peers)) = &degraded_probe
+                    {
                         tracing::warn!(
                             "cluster-egress: node {node_id} {scope:?} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}); yielding leadership",
                         );
                     }
+                    shed.begin();
                 }
-                HealthTransition::Heal => {
-                    registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);
-                }
+                HealthTransition::Heal => shed.end(),
                 HealthTransition::Hold => {}
+            }
+            if shed.is_draining() {
+                let stances = participation.campaign_stances(&registry).await;
+                shed.step(&stances.not_known_to_refuse(), &[]).await;
             }
         }
     });

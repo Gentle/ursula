@@ -355,6 +355,10 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 | `RaftLogPressure` | The server's Raft log is over its hard limit under sustained write load. Writes resume once snapshots catch up |
 | `WalDiskPressure` | The server's WAL filesystem is below `raft.wal.min_available_size`. Free space or expand the volume |
 | `IngressBodyBytesLimitReached` | The server holds as many request bytes in flight as it admits |
+| `RaftUncommittedBackpressure` | The stream's Raft group holds more proposed but unapplied write bytes than `raft.max_uncommitted_size_per_group` allows |
+| `ColdBackpressure` | The stream's Raft group holds more hot bytes than `storage.cold.max_hot_size_per_group` allows, because cold flush is behind or the cold backend is slow |
+| `NotLeader` | The server does not lead the stream's Raft group and knows no leader yet, for example during an election. Writes resume once the group has a leader |
+| `GroupNotHosted` | The server does not host the stream's Raft group and knows no server that does |
 | `RequestBodyTooLarge` | The commit is over the server's or the gateway's request limit. Commit smaller transactions |
 | `RequestBodyUnreadable` | The gateway could not read the request body, so it sent nothing on |
 | `NotFound` | The gateway's access policy does not serve the stream to these credentials: no token, or one the policy does not allow. The cause is the credentials or the policy, not load |

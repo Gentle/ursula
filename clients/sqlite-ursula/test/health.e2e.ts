@@ -35,6 +35,24 @@ it("status reports an owner's health, and instrument() reports it as metrics", (
 	expect(callbacks.size).toBe(0);
 });
 
+// Without `intervalMs`, instrument() drains every second: a commit reaches the histograms without a
+// stop.
+it("instrument() drains every second by default", async () => {
+	const file = freshFile();
+	attach(file, ursulaUrl() + streamPath());
+	const { meter, records } = recordingMeter();
+	const stop = instrument(file, meter);
+	try {
+		const db = openPlain(file);
+		db.exec("CREATE TABLE t(x INTEGER)");
+		db.close();
+		for (let i = 0; i < 30 && records.get("sqlite_ursula.commit.duration") === undefined; i++) await new Promise((r) => setTimeout(r, 100));
+		expect(records.get("sqlite_ursula.commit.duration")).toHaveLength(1);
+	} finally {
+		stop();
+	}
+});
+
 // The extension keeps the newest 8,192 commits between two drains. Commits dropped past that still
 // reach the counters: their frame bytes in one add, and their number in `commit.unmeasured`, while
 // the histograms get the 8,192 kept.

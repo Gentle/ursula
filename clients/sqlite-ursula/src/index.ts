@@ -296,8 +296,10 @@ export interface MeterLike {
  *   `snapshot.bytes` or `writes_refused`, so they are not measured.
  *
  * Every measurement carries `sqlite.file` and `attributes`. The per-commit numbers come from
- * {@link drainStats} every `intervalMs` (10 s by default), so do not call `drainStats` on the same
- * file elsewhere while it runs.
+ * {@link drainStats} every `intervalMs` (1 s by default), so do not call `drainStats` on the same
+ * file elsewhere while it runs. The extension keeps the newest 8,192 commits between two drains, so
+ * at the default interval the histograms see every commit up to about 8,000 commits a second. A file
+ * that commits faster needs a shorter `intervalMs`.
  */
 export function instrument(file: string, meter: MeterLike, options: { intervalMs?: number; attributes?: MetricAttributes } = {}): () => void {
 	const attributes: MetricAttributes = { "sqlite.file": file, ...options.attributes };
@@ -354,7 +356,7 @@ export function instrument(file: string, meter: MeterLike, options: { intervalMs
 		gauge.addCallback(callback);
 		return () => gauge.removeCallback(callback);
 	});
-	const timer = setInterval(drain, options.intervalMs ?? 10_000);
+	const timer = setInterval(drain, options.intervalMs ?? 1_000);
 	timer.unref();
 	return () => {
 		clearInterval(timer);

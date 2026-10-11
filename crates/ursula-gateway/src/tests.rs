@@ -1470,6 +1470,72 @@ async fn a_first_hop_connect_failure_is_marked_and_a_leader_hop_one_is_not() {
     }
 }
 
+/// Accepts one connection, reads one whole request from it, the head and the
+/// `Content-Length` body, and closes it without answering, as a node that
+/// went away after it received a write does. The bytes it read are sent on
+/// the returned channel.
+async fn hanging_up_upstream() -> (TestUpstream, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (read, request) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut connection, _peer) = listener.accept().await.expect("accept");
+        let mut bytes = Vec::new();
+        while !is_whole_request(&bytes) {
+            let mut chunk = [0_u8; 1024];
+            let len = tokio::io::AsyncReadExt::read(&mut connection, &mut chunk)
+                .await
+                .expect("read the request");
+            assert_ne!(len, 0, "the gateway closed before it sent the request");
+            bytes.extend_from_slice(&chunk[..len]);
+        }
+        drop(connection);
+        read.send(bytes).expect("the test awaits the request");
+    });
+    (TestUpstream { url, task }, request)
+}
+
+/// Whether `bytes` hold a whole request: its head and as many body bytes as
+/// its `Content-Length` names.
+fn is_whole_request(bytes: &[u8]) -> bool {
+    let Some(head_len) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = std::str::from_utf8(&bytes[..head_len]).expect("an ASCII request head");
+    let body_len = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().expect("a Content-Length"))
+        })
+        .unwrap_or(0);
+    bytes.len() >= head_len.saturating_add(4).saturating_add(body_len)
+}
+
+/// A first-hop failure after the request was handed to a connection stays
+/// unmarked: the node may have received the request and proposed it. Here
+/// the upstream reads the whole request, body included, and closes the
+/// connection without answering.
+#[tokio::test]
+async fn a_first_hop_failure_after_the_request_was_sent_is_not_marked() {
+    let (node, request) = hanging_up_upstream().await;
+
+    let response = gateway_for_url(node.url.clone())
+        .handle(post_path("/bucket/stream"))
+        .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(not_applied(&response), None);
+    assert_eq!(vouch(&response), Some("1"));
+    let request = request.await.expect("the upstream read a request");
+    let request = String::from_utf8(request).expect("an ASCII request");
+    assert!(request.starts_with("POST /bucket/stream "), "{request}");
+    assert!(request.ends_with("\r\n\r\nabc"), "{request}");
+}
+
 /// Every response the gateway returns carries its vouch once: a forwarded
 /// answer, its own refusals and errors, a CORS preflight and its metrics.
 #[tokio::test]

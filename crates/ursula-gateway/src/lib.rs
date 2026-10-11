@@ -611,9 +611,12 @@ impl Gateway {
         })?
         .map_err(|source| {
             let upstream = upstream.to_owned();
-            // `is_connect` holds only when no connection to the upstream was
-            // made (DNS, TCP or TLS setup, or the connect timeout), so this
-            // attempt wrote nothing of the request. Inside one `send`, hyper
+            // `is_connect` holds only for a failure before the request was
+            // handed to a connection: in the connector (DNS, TCP or TLS
+            // setup, or the connect timeout) or in the pool checkout. So this
+            // attempt wrote nothing of the request. Any later failure, such
+            // as an upstream that read the request and closed the connection
+            // without answering, stays unmarked. Inside one `send`, hyper
             // retries only a request that a pooled connection gave back
             // unwritten, and reqwest only one that an HTTP/2 peer refused
             // unprocessed (`REFUSED_STREAM`, or a graceful `GOAWAY`).

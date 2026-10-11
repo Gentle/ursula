@@ -154,10 +154,10 @@ another gateway between the gateway and the nodes must not resend requests,
 or the gateway vouches for a marker from a later delivery. For example, a
 node can propose a write and then answer `503` without a marker. If a
 sidecar resends the request on that `503`, as Istio's default retry policy
-does, and a node refuses the copy at admission with a marked `503`, the
-gateway sees only that refusal and vouches for it. A gateway older than
-0.7.3 used as an upstream causes the same problem, because it passes a
-leader's marker on after any redirect it follows.
+did before 1.24, and a node refuses the copy at admission with a marked
+`503`, the gateway sees only that refusal and vouches for it. A gateway
+older than 0.7.3 used as an upstream causes the same problem, because it
+passes a leader's marker on after any redirect it follows.
 
 ## SSE Behavior
 

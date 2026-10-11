@@ -153,10 +153,12 @@ applied although the first attempt committed (see
 [redirects and retries](https://ursula.tonbo.io/docs/api/overview#redirects-and-retries)).
 
 In a service mesh, also turn off retries for the stream routes, both to the
-gateway Service and from the gateway to the server pods. Istio's default
-policy, for example, resends a request up to twice when it gets a `503`.
-Nothing between the gateway and the nodes may resend a request, so set
-`gateway.upstreams` only to URLs that reach the nodes themselves.
+gateway Service and from the gateway to the server pods. Istio before 1.24,
+for example, resends a request up to twice by default when it gets a `503`,
+and any version does so on a route whose `retryOn` includes `503`, `5xx`,
+`gateway-error` or `reset`. Nothing between the gateway and the nodes may
+resend a request, so set `gateway.upstreams` only to URLs that reach the
+nodes themselves.
 
 The internal server Service and headless peer Service expose the same
 `server.ports.client` process port. Ursula's current static peer URL is used

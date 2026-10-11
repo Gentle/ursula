@@ -23,6 +23,7 @@ use crate::config::max_frame_bytes;
 use crate::config::retry_budget;
 use crate::error::Attempt;
 use crate::error::Error;
+use crate::error::FrameLimit;
 use crate::error::Gone;
 use crate::error::WriteRefusal;
 use crate::log;
@@ -518,6 +519,10 @@ pub(crate) enum Append {
     /// Refused before it reached the stream, and so was every earlier attempt of it (see
     /// `append`): nothing was appended, and the producer sequence is still free.
     Refused(WriteRefusal),
+    /// Refused by the extension itself and never sent: the frame is over the frame limit
+    /// (`max_frame_bytes`). No exchange took place, so unlike [`Append::Refused`] it says nothing
+    /// about the layers in front of the stream, and no exchange can have applied it.
+    Unsent(WriteRefusal),
     /// A definite rejection, or no answer within the retry budget.
     Failed(Error),
 }
@@ -571,10 +576,11 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// (`redirect_retried`); any other redirect (a 308 among them) fails the append
 /// ([`Error::Redirected`]).
 ///
-/// A frame over `max_frame_bytes()` is never sent: it ends as [`WriteRefusal::TooLarge`] at once,
-/// and so does a 413 that proves it applied nothing (`applied_nothing`: marked and vouched for)
-/// while no attempt can have reached the stream (any other is a rejection, like any other 4xx that
-/// proves nothing). The same frame can never pass, so neither is retried.
+/// A frame over `max_frame_bytes()` is never sent: it ends as [`Append::Unsent`] at once, with
+/// [`WriteRefusal::TooLarge`]. A 413 that proves it applied nothing (`applied_nothing`: marked and
+/// vouched for) ends as [`Append::Refused`] with the same kind, while no attempt can have reached
+/// the stream (any other is a rejection, like any other 4xx that proves nothing). The same frame
+/// can never pass, so neither is retried.
 pub(crate) fn append(
     url: &str,
     incarnation: &str,
@@ -588,7 +594,7 @@ pub(crate) fn append(
     // unmarked, or with the connection closed before the body was read, which is no answer.
     let limit = max_frame_bytes();
     if body.len() > limit {
-        return Append::Refused(WriteRefusal::frame_over_limit(body.len(), limit));
+        return Append::Unsent(WriteRefusal::frame_over_limit(body.len(), limit));
     }
     let started = Instant::now();
     let deadline = retry_deadline();
@@ -698,8 +704,9 @@ pub(crate) fn append(
                         413 if !reached && proof.is_some() => {
                             return Append::Refused(WriteRefusal::TooLarge {
                                 bytes: body.len(),
-                                limit: None,
-                                reason: proof.map(Proof::token).unwrap_or_default(),
+                                over: FrameLimit::InFront {
+                                    token: proof.map(Proof::token).unwrap_or_default(),
+                                },
                             });
                         }
                         // A definite rejection (429 is retried, below), final: the append fails
@@ -1195,6 +1202,7 @@ mod tests {
     use crate::auth::set_token;
     use crate::error::Attempt;
     use crate::error::Error;
+    use crate::error::FrameLimit;
     use crate::error::WriteRefusal;
 
     /// Held by each test that sets the process-wide token (`set_token`): tests run in parallel.
@@ -1573,7 +1581,7 @@ mod tests {
         let too_large = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
             &too_large,
-            Append::Refused(WriteRefusal::TooLarge { bytes: 1, limit: None, reason }) if reason == "RequestBodyTooLarge"
+            Append::Refused(WriteRefusal::TooLarge { bytes: 1, over: FrameLimit::InFront { token } }) if token == "RequestBodyTooLarge"
         ));
         let rejected = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
@@ -1703,7 +1711,7 @@ mod tests {
         let refused = append(&url, "i1", "p", &over, 1, 1);
         assert!(matches!(
             refused,
-            Append::Refused(WriteRefusal::TooLarge { bytes, limit: Some(limit), .. })
+            Append::Unsent(WriteRefusal::TooLarge { bytes, over: FrameLimit::Extension { limit } })
                 if bytes == DEFAULT_MAX_FRAME_BYTES + 1 && limit == DEFAULT_MAX_FRAME_BYTES
         ));
         listener.set_nonblocking(true).unwrap();

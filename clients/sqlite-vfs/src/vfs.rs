@@ -384,6 +384,8 @@ impl Db {
             Append::ProducerExpired => return Err(self.poison(Error::ProducerExpiredAgain)),
             // Nothing of the transaction reached the stream: it fails alone (see `Db::refuse`).
             Append::Refused(refusal) => return Err(self.refuse(refusal)),
+            // Never sent: it fails alone too, but no layer refused it (see `Db::refuse_unsent`).
+            Append::Unsent(refusal) => return Err(self.refuse_unsent(refusal)),
             Append::Failed(e) => return Err(self.poison(e)),
         };
         self.writes_accepted();
@@ -811,6 +813,16 @@ unsafe fn final_pages(
     Ok(pages)
 }
 
+/// What a commit whose frame could not be encoded does. One too large for a frame at all is never
+/// sent, so it fails alone, as one over the frame limit does (`client::append`). Any other failure
+/// poisons the database.
+fn unencodable(e: FrameError) -> Result<WriteRefusal, Error> {
+    match e {
+        FrameError::TooLarge(bytes) => Ok(WriteRefusal::frame_over_limit(bytes, max_frame_bytes())),
+        other => Err(Error::EncodeFrame(other)),
+    }
+}
+
 /// The commit point: appends the transaction to the stream and, once acknowledged, writes it to
 /// the local WAL.
 ///
@@ -846,12 +858,12 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     }
     let (body, raw) = match frame::encode_commit(size, &pages) {
         Ok(encoded) => encoded,
-        // More than a frame can hold at all: never sent, so the commit fails alone, as one over the
-        // frame limit does (`client::append`).
-        Err(FrameError::TooLarge(bytes)) => {
-            return db.refuse(WriteRefusal::frame_over_limit(bytes, max_frame_bytes()));
+        Err(e) => {
+            return match unencodable(e) {
+                Ok(refusal) => db.refuse_unsent(refusal),
+                Err(e) => db.poison(e),
+            };
         }
-        Err(e) => return db.poison(Error::EncodeFrame(e)),
     };
     let t = Instant::now();
     let attempts = match db.append_commit(&body) {
@@ -1319,6 +1331,7 @@ mod tests {
     use super::METHODS;
     use super::c_open;
     use super::lost_page;
+    use super::unencodable;
     use crate::client::mock::LAST;
     use crate::client::mock::VOUCH;
     use crate::client::mock::answer;
@@ -1327,12 +1340,15 @@ mod tests {
     use crate::client::mock::request_header;
     use crate::client::mock::serve;
     use crate::client::mock::vouched;
+    use crate::config::max_frame_bytes;
     use crate::config::set_panic_in_for_tests;
     use crate::db::Db;
     use crate::db::lock;
     use crate::db::registry;
     use crate::error::Error;
+    use crate::error::FrameLimit;
     use crate::error::WriteRefusal;
+    use crate::frame::FrameError;
     use crate::frame::PAGE;
     use crate::wal::FIRST_PAGE;
     use crate::wal::FRAME;
@@ -1424,8 +1440,9 @@ mod tests {
             d.refused,
             Some(WriteRefusal::TooLarge {
                 bytes: 5,
-                limit: None,
-                reason: "RequestBodyTooLarge".into()
+                over: FrameLimit::InFront {
+                    token: "RequestBodyTooLarge".into()
+                }
             })
         );
         assert!(d.poisoned.is_none());
@@ -1509,6 +1526,58 @@ mod tests {
             Some(Error::AppendUnknown { attempts: 3, .. })
         ));
         assert_eq!(server.join().unwrap().len(), 8);
+    }
+
+    // A commit frame too large to encode at all is refused unsent, as one over the frame limit is.
+    // Any other failure to encode one poisons.
+    #[test]
+    fn an_unencodable_frame_too_large_is_refused_and_any_other_poisons() {
+        assert!(matches!(
+            unencodable(FrameError::TooLarge(5 << 30)),
+            Ok(refusal) if refusal == WriteRefusal::frame_over_limit(5 << 30, max_frame_bytes())
+        ));
+        assert!(matches!(
+            unencodable(FrameError::UnknownRecord),
+            Err(Error::EncodeFrame(FrameError::UnknownRecord))
+        ));
+    }
+
+    // A transaction the extension refused itself was never sent, so the stream cannot hold it: a
+    // duplicate's answer to the next commit is that commit's own, applied by an exchange whose
+    // answer said otherwise, and is acknowledged. A commit that a layer refused before it still
+    // poisons the commit after them, which goes out with the sequence the refused one left free.
+    #[test]
+    fn a_transaction_refused_unsent_leaves_the_duplicate_check_as_it_was() {
+        let duplicate = || answer("204 No Content\r\nstream-next-offset: 00000000000000000012");
+        let (url, server) = serve(vec![
+            duplicate(),
+            pressure("RaftLogPressure", LAST),
+            duplicate(),
+        ]);
+        let over = vec![0_u8; max_frame_bytes() + 1];
+
+        let mut alone = owner(url.clone());
+        assert_eq!(alone.append_commit(&over), Err(ffi::SQLITE_IOERR_AUTH));
+        assert!(matches!(alone.refused, Some(WriteRefusal::TooLarge { .. })));
+        assert!(alone.refused_at.is_none() && alone.poisoned.is_none());
+        assert_eq!(alone.append_commit(b"frame"), Ok(1));
+        assert_eq!(at(&alone), (2, 5, "00000000000000000012"));
+        assert!(alone.refused.is_none());
+
+        let mut after = owner(url);
+        assert_eq!(after.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_AUTH));
+        assert_eq!(after.append_commit(&over), Err(ffi::SQLITE_IOERR_AUTH));
+        assert_eq!(after.refused_at, Some((2, 5)));
+        assert_eq!(after.append_commit(b"frame"), Err(ffi::SQLITE_IOERR_WRITE));
+        assert!(matches!(
+            after.poisoned.as_ref().map(|p| &p.first),
+            Some(Error::RefusedCommitApplied {
+                epoch: 2,
+                seq: 5,
+                ..
+            })
+        ));
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     // A layer that refused a commit after the stream applied it breaks the rule of design doc §2:

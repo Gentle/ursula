@@ -113,7 +113,7 @@ export interface AttachStatus {
 	readonly reason: string | null;
 	/** Attached with `{ readOnly: true }`: nothing is ever appended, and every write fails with SQLITE_READONLY. */
 	readonly read_only: boolean;
-	/** A layer in front of the stream refused the latest write with `402 Payment Required` (a commit failed with {@link UrsulaPaymentRequiredError}, or a snapshot waits). It does not poison the file, and the next acknowledged commit clears it. Always `false` while `poisoned`, since a poisoned file needs a re-attach whatever the layer does. */
+	/** A layer in front of the stream refused the latest write it answered with `402 Payment Required` (a commit failed with {@link UrsulaPaymentRequiredError}, or a snapshot waits). It does not poison the file, and the next acknowledged commit clears it. A transaction refused as `too_large`, which the extension never sent, leaves it as it was: the layer still refuses writes. Always `false` while `poisoned`, since a poisoned file needs a re-attach whatever the layer does. */
 	readonly payment_required: boolean;
 	/** The layer's explanation: the `402` response's body (its first 256 bytes, then `...` when it is longer), or the token of `x-ursula-not-applied` when the body is empty (`null` when it sent neither, or without a refusal). */
 	readonly payment_reason: string | null;
@@ -121,7 +121,7 @@ export interface AttachStatus {
 	readonly writes_refused?: boolean;
 	/** What refused the latest write (see {@link WriteRefusedKind}); `null` without a refusal. Absent with an extension before 0.7.3. */
 	readonly refused_kind?: WriteRefusedKind | null;
-	/** Why: the refusing layer's response body (its first 256 bytes, then `...` when it is longer), or the token of `x-ursula-not-applied` (such as `RaftLogPressure`) when the body is empty, and always for `not_applied`; `null` when it sent neither, or without a refusal. Absent with an extension before 0.7.3. */
+	/** Why: the refusing layer's response body (its first 256 bytes, then `...` when it is longer), or the token of `x-ursula-not-applied` (such as `RaftLogPressure`) when the body is empty, and always for `not_applied`. For `too_large`, the frame's size and the limit (such as `41943104 bytes over the 33554432-byte frame limit`), or the token of a `413` from a limit in front. `null` when the layer sent neither, or without a refusal. Absent with an extension before 0.7.3. */
 	readonly refused_reason?: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
 	readonly snapshot: StreamOffset;
@@ -272,7 +272,7 @@ export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden"
 export class UrsulaWriteRefusedError extends Error {
 	/** What refused it, for a refused commit. `null` for an attach refused other than with a `402`, whose message names it. */
 	readonly kind: WriteRefusedKind | null;
-	/** Why (`refused_reason`), for a refused commit: `null` when the layer sent no explanation, and for a refused attach, whose message carries it. */
+	/** Why (`refused_reason`), for a refused commit: the layer's explanation, or for `too_large` the frame's size and the limit. `null` when the layer sent no explanation, and for a refused attach, whose message carries it. */
 	readonly reason: string | null;
 	constructor(message: string, kind: WriteRefusedKind | null, reason: string | null, cause: unknown) {
 		super(message, { cause });
@@ -330,11 +330,13 @@ export async function openUrsulaPiStorage(file: string, streamUrl: string, optio
 			// new attach whatever the error, a refusal's code included.
 			if (s.poisoned) throw new UrsulaReplicationError(`commit not replicated: ${s.reason ?? "unknown"}`, s.fenced, cause);
 			if (errcode(cause) === SQLITE_IOERR_AUTH) {
-				if (s.payment_required) {
+				// `refused_kind` names this commit's refusal: a transaction refused as `too_large`
+				// while a layer still refuses with 402 is not the 402's. An extension before 0.7.3
+				// reports no kind, and refuses with 402 alone.
+				if ((s.refused_kind ?? (s.payment_required ? "payment_required" : null)) === "payment_required") {
 					const why = s.payment_reason === null ? "" : `: ${s.payment_reason}`;
 					throw new UrsulaPaymentRequiredError(`commit refused with 402 Payment Required in front of the stream${why}`, s.payment_reason, cause);
 				}
-				// An extension before 0.7.3 reports none of these: it refuses with 402 alone.
 				const kind = s.refused_kind ?? null;
 				const reason = s.refused_reason ?? null;
 				const why = `${kind === null ? "" : `: ${kind}`}${reason === null ? "" : ` (${reason})`}`;

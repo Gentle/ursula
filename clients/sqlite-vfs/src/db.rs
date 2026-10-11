@@ -75,11 +75,18 @@ pub(crate) struct Db {
     pub(crate) log: u64,
     /// Why the database is poisoned (re-attach to recover), see `set_poisoned`.
     pub(crate) poisoned: Option<Poisoned>,
-    /// Why the latest write was refused before it reached the stream, which applied nothing of it
-    /// (see `writes_refused`): cleared by the next acknowledged commit. Never set while
+    /// Why the latest write was refused before it reached the stream, which applied nothing of it:
+    /// by a layer in front of the stream (`writes_refused`), or by the extension itself, which
+    /// never sent it (`refuse_unsent`). `ursula_status` reports it (`writes_refused`,
+    /// `refused_kind`, `refused_reason`). Cleared by the next acknowledged commit. Never set while
     /// `poisoned`: a poisoned database needs a re-attach whatever the refusing layer does
     /// (`set_poisoned`).
     pub(crate) refused: Option<WriteRefusal>,
+    /// The latest refusal that a layer in front of the stream answered, set and cleared with
+    /// `refused`, except that a write the extension refused itself leaves it: what that layer does
+    /// now. `payment_required` follows it, and so does whether a snapshot may be taken
+    /// (`snapshot_wanted`).
+    pub(crate) layer_refused: Option<WriteRefusal>,
     /// The epoch and producer sequence of the latest commit refused before it reached the stream
     /// (`refuse`), until a commit is acknowledged. The next commit goes out with them, so a
     /// duplicate's answer to it that none of its own attempts explains may be the refused
@@ -164,15 +171,16 @@ impl Db {
 
     /// A snapshot is due and may be taken now: never while the database is poisoned, nor while
     /// writes are refused before they reach the stream by a layer that refuses other writes too
-    /// (`refused`, `WriteRefusal::refuses_other_writes`): its publish would be refused too. The
-    /// next acknowledged commit clears the refusal and requests one if it is still due. A commit
-    /// frame too large to send holds no snapshot back: an owner that stops committing after one
-    /// still publishes, and retention still moves.
+    /// (`layer_refused`, `WriteRefusal::refuses_other_writes`): its publish would be refused too.
+    /// The next acknowledged commit clears the refusal and requests one if it is still due. A
+    /// commit frame too large to send holds no snapshot back: an owner that stops committing after
+    /// one still publishes, and retention still moves. Nor does it lift the hold of a layer that
+    /// refused before it.
     pub(crate) fn snapshot_wanted(&self) -> bool {
         self.snapshot_due()
             && self.poisoned.is_none()
             && self
-                .refused
+                .layer_refused
                 .as_ref()
                 .is_none_or(|refusal| !refusal.refuses_other_writes())
     }
@@ -248,6 +256,7 @@ impl Db {
             }
         }
         self.refused = None;
+        self.layer_refused = None;
     }
 
     /// The write transaction's commit was refused before it reached the stream, and so was every
@@ -259,50 +268,78 @@ impl Db {
     pub(crate) fn refuse(&mut self, refusal: WriteRefusal) -> c_int {
         self.writes_refused(refusal, "commit");
         self.refused_at = Some((self.epoch, self.seq.saturating_add(1)));
+        self.commit_failed_alone()
+    }
+
+    /// The write transaction's commit was refused by the extension itself and never sent
+    /// (`Append::Unsent`: its frame is over the frame limit). It fails alone as a refused commit
+    /// does, but no exchange took place. So a layer's refusal recorded before it stays
+    /// (`layer_refused`), and so does the sequence check (`refused_at`), which it neither sets nor
+    /// clears: the stream cannot hold a frame that was never sent.
+    pub(crate) fn refuse_unsent(&mut self, refusal: WriteRefusal) -> c_int {
+        if self.poisoned.is_none() {
+            self.log_refusal(&refusal, "commit");
+            self.refused = Some(refusal);
+        }
+        self.commit_failed_alone()
+    }
+
+    /// Drops the write transaction's overlay: the write that fails with the code returned,
+    /// SQLITE_IOERR_AUTH, rolls the transaction back without poisoning the database.
+    fn commit_failed_alone(&mut self) -> c_int {
         self.overlay.clear();
         self.committed = false;
         ffi::SQLITE_IOERR_AUTH
     }
 
-    /// Records a write refused before it reached the stream (`during`: which, for the log), logged
-    /// when no refusal of its kind is recorded yet: a 402 as `payment_required` with the layer's
-    /// explanation (as since 0.7.1), any other as `writes_refused` with its kind. A poisoned
+    /// Records a write that a layer in front of the stream refused before it reached the stream
+    /// (`during`: which, for the log), as the latest refusal and as the layer's. A poisoned
     /// database records none (a snapshot publish under way can be refused after the poison): see
     /// `set_poisoned`.
     pub(crate) fn writes_refused(&mut self, refusal: WriteRefusal, during: &str) {
         if self.poisoned.is_some() {
             return;
         }
+        self.log_refusal(&refusal, during);
+        self.layer_refused = Some(refusal.clone());
+        self.refused = Some(refusal);
+    }
+
+    /// Logs a refusal (`during`: of which write) when no refusal of its kind is recorded yet: a
+    /// 402 as `payment_required` with the layer's explanation (as since 0.7.1), any other as
+    /// `writes_refused` with its kind.
+    fn log_refusal(&self, refusal: &WriteRefusal, during: &str) {
         if self
             .refused
             .as_ref()
-            .is_none_or(|last| last.kind() != refusal.kind())
+            .is_some_and(|last| last.kind() == refusal.kind())
         {
-            match &refusal {
-                WriteRefusal::PaymentRequired { body } => {
-                    log::emit(Level::Warn, "payment_required", &[
-                        ("file", &self.path),
-                        ("stream", &self.url),
-                        ("during", &during),
-                        ("reason", body),
-                    ]);
-                }
-                other => log::emit(Level::Warn, "writes_refused", &[
+            return;
+        }
+        match refusal {
+            WriteRefusal::PaymentRequired { body } => {
+                log::emit(Level::Warn, "payment_required", &[
                     ("file", &self.path),
                     ("stream", &self.url),
                     ("during", &during),
-                    ("kind", &other.kind()),
-                    ("reason", other),
-                ]),
+                    ("reason", body),
+                ]);
             }
+            other => log::emit(Level::Warn, "writes_refused", &[
+                ("file", &self.path),
+                ("stream", &self.url),
+                ("during", &during),
+                ("kind", &other.kind()),
+                ("reason", other),
+            ]),
         }
-        self.refused = Some(refusal);
     }
 
     /// A commit was acknowledged: whatever refused writes before accepts them again, and the
     /// sequence a refused commit left free is taken.
     pub(crate) fn writes_accepted(&mut self) {
         self.refused_at = None;
+        self.layer_refused = None;
         if self.refused.take().is_some() {
             log::emit(Level::Info, "writes_resumed", &[
                 ("file", &self.path),
@@ -428,6 +465,7 @@ impl Db {
             log: 0,
             poisoned: None,
             refused: None,
+            layer_refused: None,
             refused_at: None,
             overlay: BTreeMap::new(),
             wal_written: BTreeMap::new(),
@@ -465,6 +503,7 @@ mod tests {
     use super::Mode;
     use crate::error::Error;
     use crate::error::Fence;
+    use crate::error::FrameLimit;
     use crate::error::WriteRefusal;
 
     // A commit refused before it reached the stream (a 402, or any refusal that applied nothing)
@@ -520,7 +559,8 @@ mod tests {
 
     // A due snapshot waits while writes are refused by a layer that refuses other writes too (its
     // publish would be refused too), and while the database is poisoned. An acknowledged commit lets
-    // it go again. A commit frame too large to send holds it back for no reason, so it does not.
+    // it go again. A commit frame too large to send holds it back for no reason, so it does not, nor
+    // does a 413 in front.
     #[test]
     fn no_snapshot_while_writes_are_refused() {
         let mut d = Db::for_tests();
@@ -551,10 +591,49 @@ mod tests {
             d.writes_accepted();
             assert!(d.snapshot_wanted(), "{kind}");
         }
-        d.refuse(WriteRefusal::frame_over_limit(40 << 20, 32 << 20));
+        d.refuse_unsent(WriteRefusal::frame_over_limit(40 << 20, 32 << 20));
         assert!(d.refused.is_some() && d.snapshot_wanted(), "too_large");
+        d.refuse(WriteRefusal::TooLarge {
+            bytes: 40 << 20,
+            over: FrameLimit::InFront {
+                token: "RequestBodyTooLarge".into(),
+            },
+        });
+        assert!(d.layer_refused.is_some() && d.snapshot_wanted(), "413");
         d.poison(Error::ProducerExpiredAgain);
         assert!(!d.snapshot_wanted());
+    }
+
+    // A transaction the extension refuses itself, never sent, leaves what a layer refused before
+    // it: the layer still refuses writes, so `payment_required` stays and snapshots still wait.
+    // The latest refusal, the one `ursula_status` reports, is the transaction's. It neither sets
+    // nor clears the sequence check a refused commit needs (`refused_at`): the stream cannot hold
+    // a frame that was never sent. An acknowledged commit clears both refusals.
+    #[test]
+    fn a_transaction_refused_unsent_leaves_what_the_layer_refused() {
+        let mut d = Db::for_tests();
+        d.log = u64::MAX;
+        let payment = WriteRefusal::PaymentRequired {
+            body: "quota exhausted".into(),
+        };
+        let too_large = WriteRefusal::frame_over_limit(40 << 20, 32 << 20);
+
+        d.refuse(payment.clone());
+        let at = d.refused_at;
+        assert!(at.is_some());
+        assert_eq!(d.refuse_unsent(too_large.clone()), ffi::SQLITE_IOERR_AUTH);
+        assert_eq!(d.refused, Some(too_large.clone()));
+        assert_eq!(d.layer_refused, Some(payment));
+        assert_eq!(d.refused_at, at);
+        assert!(!d.snapshot_wanted());
+        d.writes_accepted();
+        assert!(d.refused.is_none() && d.layer_refused.is_none() && d.refused_at.is_none());
+
+        // Alone, it records no layer refusal and no sequence check.
+        d.refuse_unsent(too_large.clone());
+        assert_eq!(d.refused, Some(too_large));
+        assert!(d.layer_refused.is_none() && d.refused_at.is_none());
+        assert!(d.snapshot_wanted());
     }
 
     #[test]

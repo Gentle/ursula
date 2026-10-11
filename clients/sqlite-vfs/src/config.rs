@@ -95,26 +95,39 @@ pub(crate) fn max_frame_bytes() -> usize {
         let Ok(value) = std::env::var("URSULA_VFS_MAX_FRAME_BYTES") else {
             return DEFAULT_MAX_FRAME_BYTES;
         };
-        let used = frame_limit_from(&value);
-        if value.trim().parse() != Ok(used) {
-            log::emit(Level::Warn, "setting_adjusted", &[
-                ("setting", &"URSULA_VFS_MAX_FRAME_BYTES"),
-                ("value", &value),
-                ("used", &used),
-            ]);
+        match frame_limit_from(&value) {
+            Setting::Taken(limit) => limit,
+            Setting::Adjusted(used) => {
+                log::emit(Level::Warn, "setting_adjusted", &[
+                    ("setting", &"URSULA_VFS_MAX_FRAME_BYTES"),
+                    ("value", &value),
+                    ("used", &used),
+                ]);
+                used
+            }
         }
-        used
     })
 }
 
+/// What a setting's value sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Setting<T> {
+    /// The value, as given.
+    Taken(T),
+    /// Something else, because the value is out of range or not a number: logged once as
+    /// `setting_adjusted`.
+    Adjusted(T),
+}
+
 /// The frame limit `URSULA_VFS_MAX_FRAME_BYTES=value` sets (see [`max_frame_bytes`]).
-fn frame_limit_from(value: &str) -> usize {
-    value
-        .trim()
-        .parse::<usize>()
-        .map_or(DEFAULT_MAX_FRAME_BYTES, |bytes| {
-            bytes.clamp(MIN_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES)
-        })
+fn frame_limit_from(value: &str) -> Setting<usize> {
+    match value.trim().parse::<usize>() {
+        Ok(bytes) if (MIN_FRAME_BYTES..=DEFAULT_MAX_FRAME_BYTES).contains(&bytes) => {
+            Setting::Taken(bytes)
+        }
+        Ok(bytes) => Setting::Adjusted(bytes.clamp(MIN_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES)),
+        Err(_not_a_number) => Setting::Adjusted(DEFAULT_MAX_FRAME_BYTES),
+    }
 }
 
 pub(crate) fn snapshot_min_bytes() -> u64 {
@@ -176,18 +189,27 @@ fn non_empty(name: &str) -> Option<String> {
 mod tests {
     use super::DEFAULT_MAX_FRAME_BYTES;
     use super::MIN_FRAME_BYTES;
+    use super::Setting;
     use super::frame_limit_from;
 
-    // The frame limit is a number of bytes between 64 KiB and 32 MiB: below, an owner's claim could
-    // be refused; above, a frame the server cannot take would be sent. Anything else keeps 32 MiB.
+    // The frame limit is a number of bytes from 64 KiB to 32 MiB, both included: below, an owner's
+    // claim could be refused, and above, a frame the server cannot take would be sent. A value
+    // outside is taken to the nearer bound, and one that is not a number keeps 32 MiB, both
+    // adjusted (logged as `setting_adjusted`).
     #[test]
     fn the_frame_limit_stays_between_64_kib_and_32_mib() {
-        assert_eq!(frame_limit_from("1048576"), 1 << 20);
-        assert_eq!(frame_limit_from(" 524288 "), 512 << 10);
-        assert_eq!(frame_limit_from("0"), MIN_FRAME_BYTES);
-        assert_eq!(frame_limit_from("40"), MIN_FRAME_BYTES);
-        assert_eq!(frame_limit_from("67108864"), DEFAULT_MAX_FRAME_BYTES);
-        assert_eq!(frame_limit_from("16MiB"), DEFAULT_MAX_FRAME_BYTES);
-        assert_eq!(frame_limit_from(""), DEFAULT_MAX_FRAME_BYTES);
+        assert_eq!(
+            (MIN_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES),
+            (65_536, 33_554_432)
+        );
+        assert_eq!(frame_limit_from("1048576"), Setting::Taken(1_048_576));
+        assert_eq!(frame_limit_from(" 524288 "), Setting::Taken(524_288));
+        assert_eq!(frame_limit_from("65536"), Setting::Taken(65_536));
+        assert_eq!(frame_limit_from("33554432"), Setting::Taken(33_554_432));
+        assert_eq!(frame_limit_from("65535"), Setting::Adjusted(65_536));
+        assert_eq!(frame_limit_from("33554433"), Setting::Adjusted(33_554_432));
+        assert_eq!(frame_limit_from("0"), Setting::Adjusted(65_536));
+        assert_eq!(frame_limit_from("16MiB"), Setting::Adjusted(33_554_432));
+        assert_eq!(frame_limit_from(""), Setting::Adjusted(33_554_432));
     }
 }

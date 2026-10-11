@@ -282,9 +282,10 @@ export class Gate {
 	/**
 	 * Answers writes `status` (`402` by default) with `headers` and `body` from now on, without
 	 * forwarding them: `limit` of them at most, and only those with one of `methods` (POST and PUT by
-	 * default). `null` forwards them again.
+	 * default), with `over`, a body of more than `over` bytes, and with `path`, a path that contains
+	 * it. `null` forwards them again.
 	 */
-	async refuse(body: string | null, options: { limit?: number; methods?: string[] } & Refusal = {}): Promise<void> {
+	async refuse(body: string | null, options: { limit?: number; methods?: string[]; over?: number; path?: string } & Refusal = {}): Promise<void> {
 		await this.control({ refuse: body, ...options });
 	}
 
@@ -332,6 +333,32 @@ const listen = (server: Server): Promise<number> =>
 const b64 = (o: object): string => Buffer.from(JSON.stringify(o)).toString("base64url");
 
 /**
+ * An `ursula gateway` in front of `upstreams`, with `args` after its own (`--max-request-body-bytes`,
+ * say), started in `cwd`: up once it answers. The caller kills `proc`.
+ */
+export async function startGateway(upstreams: readonly string[], args: readonly string[] = [], cwd?: string): Promise<{ url: string; proc: ChildProcess }> {
+	const probe = createServer();
+	const port = await listen(probe);
+	await new Promise((res) => probe.close(res));
+	const all = ["gateway", "--listen", `127.0.0.1:${port}`, "--raft-group-count", process.env.E2E_GROUPS ?? "4"];
+	for (const upstream of upstreams) all.push("--upstream", upstream);
+	const proc = spawn(resolve(process.env.URSULA_BIN ?? ""), [...all, ...args], { cwd, stdio: "ignore" });
+	const url = `http://127.0.0.1:${port}`;
+	for (let i = 0; ; i++) {
+		const up = await fetch(`${url}/`).then(
+			() => true,
+			() => false,
+		);
+		if (up) return { url, proc };
+		if (i > 100 || proc.exitCode !== null) {
+			proc.kill("SIGKILL");
+			throw new Error("the gateway did not start");
+		}
+		await new Promise((r) => setTimeout(r, 100));
+	}
+}
+
+/**
  * An `ursula gateway` in front of `upstreams` that checks bearer tokens: RFC 9068 access tokens from
  * a JWKS this process serves. The bucket `sqlite-e2e` belongs to the tokens `mint` makes, and the
  * gateway hides its streams from a request without one (404).
@@ -362,25 +389,13 @@ export class AuthGateway {
 		const issuer = `http://127.0.0.1:${await listen(jwks)}`;
 		const policy = join(dir, `policy-${randomUUID()}.toml`);
 		writeFileSync(policy, `[[bucket]]\nid = "sqlite-e2e"\nowners = [{ issuer = "${issuer}", subject = "vfs-e2e" }]\n`);
-		const probe = createServer();
-		const port = await listen(probe);
-		await new Promise((res) => probe.close(res));
-		const args = ["gateway", "--listen", `127.0.0.1:${port}`, "--raft-group-count", process.env.E2E_GROUPS ?? "4"];
-		for (const upstream of upstreams) args.push("--upstream", upstream);
-		args.push("--auth-issuer", issuer, "--auth-audience", AuthGateway.audience, "--auth-policy", policy, "--auth-jwks-url", `${issuer}/jwks.json`);
-		const proc = spawn(resolve(process.env.URSULA_BIN ?? ""), args, { cwd: dir, stdio: "ignore" });
-		const gateway = new AuthGateway(`http://127.0.0.1:${port}`, issuer, privateKey, proc, jwks);
-		for (let i = 0; ; i++) {
-			const up = await fetch(`${gateway.url}/`).then(
-				() => true,
-				() => false,
-			);
-			if (up) return gateway;
-			if (i > 100 || proc.exitCode !== null) {
-				gateway.close();
-				throw new Error("the gateway did not start");
-			}
-			await new Promise((r) => setTimeout(r, 100));
+		const auth = ["--auth-issuer", issuer, "--auth-audience", AuthGateway.audience, "--auth-policy", policy, "--auth-jwks-url", `${issuer}/jwks.json`];
+		try {
+			const { url, proc } = await startGateway(upstreams, auth, dir);
+			return new AuthGateway(url, issuer, privateKey, proc, jwks);
+		} catch (e) {
+			jwks.close();
+			throw e;
 		}
 	}
 

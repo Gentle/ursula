@@ -146,9 +146,11 @@ export interface AttachStatus {
 	readonly snapshot_due_bytes: number;
 	/** Milliseconds since this owner last saw a snapshot published; `null` for none since the attach. */
 	readonly snapshot_age_ms: number | null;
-	/** Snapshot attempts that failed in a row (0 once one succeeds), and the last failure. */
+	/** Snapshot attempts that failed in a row (0 once one succeeds), and the last failure. After a failure the next attempt waits, from 100 ms and twice as long after each further one, up to an hour while the body is too large and five minutes otherwise, give or take a fifth, unless the database shrinks by more than a quarter (a `VACUUM`). After an outage the first commit that succeeds brings the next attempt forward once. A retention move that fails is not counted: it is logged as `retention_failed` and tried again after the next snapshot. */
 	readonly snapshot_failures: number;
 	readonly snapshot_error: string | null;
+	/** Compressed size of the latest snapshot body this owner built, published or not (`null` for none since the attach). Ursula's gateway refuses a body above its `--max-request-body-bytes` (32 MiB by default) with `413`. Absent with an extension before 0.7.3. */
+	readonly snapshot_bytes?: number | null;
 }
 
 export function status(file: string): AttachStatus {
@@ -288,9 +290,10 @@ export interface MeterLike {
  *   `sqlite_ursula.commit.unmeasured` (commits whose durations the histograms did not get: each
  *   drain hands over the newest 8,192 commits at most, while `status(file).commits` counts all);
  * - gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`
- *   (ms), `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned`, `sqlite_ursula.fenced`,
- *   `sqlite_ursula.payment_required` and `sqlite_ursula.writes_refused` (0 or 1; the latter is not
- *   measured with an extension before 0.7.3, which does not report it).
+ *   (ms), `sqlite_ursula.snapshot.failures`, `sqlite_ursula.snapshot.bytes`,
+ *   `sqlite_ursula.poisoned`, `sqlite_ursula.fenced`, `sqlite_ursula.payment_required` and
+ *   `sqlite_ursula.writes_refused` (0 or 1). An extension before 0.7.3 does not report
+ *   `snapshot.bytes` or `writes_refused`, so they are not measured.
  *
  * Every measurement carries `sqlite.file` and `attributes`. The per-commit numbers come from
  * {@link drainStats} every `intervalMs` (10 s by default), so do not call `drainStats` on the same
@@ -329,6 +332,7 @@ export function instrument(file: string, meter: MeterLike, options: { intervalMs
 		["sqlite_ursula.snapshot.due_bytes", "By", (s) => s.snapshot_due_bytes],
 		["sqlite_ursula.snapshot.age", "ms", (s) => s.snapshot_age_ms],
 		["sqlite_ursula.snapshot.failures", undefined, (s) => s.snapshot_failures],
+		["sqlite_ursula.snapshot.bytes", "By", (s) => s.snapshot_bytes ?? null],
 		["sqlite_ursula.poisoned", undefined, (s) => (s.poisoned ? 1 : 0)],
 		["sqlite_ursula.fenced", undefined, (s) => (s.fenced ? 1 : 0)],
 		["sqlite_ursula.payment_required", undefined, (s) => (s.payment_required ? 1 : 0)],

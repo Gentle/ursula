@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::ffi::CStr;
 use std::ffi::c_int;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::frame::FrameError;
 use crate::frame::PAGE;
@@ -221,6 +222,31 @@ pub(crate) enum Error {
     SnapshotOffset { at: String, reflects: String },
     #[error("the snapshot at {offset} does not read back")]
     SnapshotNotReadBack { offset: String },
+    /// A snapshot publish answered 413: its body is over the request size limit of the server or
+    /// of a layer in front of it.
+    #[error(
+        "publish snapshot {url}: 413{}: a body of {bytes} bytes is over the request size limit of \
+         the server or of a layer in front of it (ursulagw: --max-request-body-bytes)",
+        with_body(.body)
+    )]
+    SnapshotTooLarge {
+        url: String,
+        bytes: usize,
+        body: String,
+    },
+    /// A snapshot publish answered 408: the server or a layer in front of it did not read the
+    /// body in time, which a body too large for a slow layer can cause
+    /// (`snapshotter::FailureKind`).
+    #[error(
+        "publish snapshot {url}: 408{}: a body of {bytes} bytes was not read in time by the server \
+         or a layer in front of it",
+        with_body(.body)
+    )]
+    SnapshotTimedOut {
+        url: String,
+        bytes: usize,
+        body: String,
+    },
     #[error(
         "read {url} at {offset}: beyond the end of the stream that acknowledged it (the server \
          lost acknowledged data?); the local files are kept (delete them to rebuild)"
@@ -347,6 +373,17 @@ pub(crate) enum ClaimScanError {
 pub(crate) enum Attempt {
     #[error("{status}{}", with_body(.body))]
     Status { status: u16, body: String },
+    /// A 5xx by which the server, or a layer in front of it, put the request off: it asked for a
+    /// later attempt (`Retry-After`, as `retry_after`) or marked that it applied nothing
+    /// (`x-ursula-not-applied`, vouched for or not), the way the server's ingress admission
+    /// refuses a write under pressure. Only `client::put_idempotent` tells it apart: such a
+    /// refusal is not about the body's size, which is refused with a 413.
+    #[error("{status}{}", with_body(.body))]
+    Deferred {
+        status: u16,
+        body: String,
+        retry_after: Option<Duration>,
+    },
     #[error("{0}")]
     Transport(#[source] Box<ureq::Error>),
 }
@@ -465,6 +502,18 @@ impl WriteRefusal {
 }
 
 impl Error {
+    /// How long the server, or a layer in front of it, asked to wait before another attempt: the
+    /// `Retry-After` of the answer that put off the last attempt of a `PUT` (`Attempt::Deferred`).
+    pub(crate) fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::PutUnknown {
+                last: Attempt::Deferred { retry_after, .. },
+                ..
+            } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// The data lies below the stream's retention, or a snapshot was superseded: retry from the
     /// stream's latest snapshot.
     pub(crate) fn is_gone(&self) -> bool {
@@ -564,6 +613,27 @@ mod tests {
         };
         assert!(recreated.is_recreated() && recreated.is_fenced() && !recreated.is_gone());
         assert!(recreated.to_string().contains("deleted and recreated"));
+        let too_large = Error::SnapshotTooLarge {
+            url: "http://h/b/s/snapshot/7".into(),
+            bytes: 41_943_040,
+            body: "snapshot body is too large".into(),
+        };
+        assert_eq!(
+            too_large.to_string(),
+            "publish snapshot http://h/b/s/snapshot/7: 413 snapshot body is too large: a body of \
+             41943040 bytes is over the request size limit of the server or of a layer in front of \
+             it (ursulagw: --max-request-body-bytes)"
+        );
+        let timed_out = Error::SnapshotTimedOut {
+            url: "http://h/b/s/snapshot/7".into(),
+            bytes: 41_943_040,
+            body: String::new(),
+        };
+        assert_eq!(
+            timed_out.to_string(),
+            "publish snapshot http://h/b/s/snapshot/7: 408: a body of 41943040 bytes was not read in \
+             time by the server or a layer in front of it"
+        );
         let superseded = Error::Fenced(Fence::Superseded {
             epoch: 2,
             current: Some(3),

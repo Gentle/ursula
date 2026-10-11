@@ -74,6 +74,9 @@ pub(crate) struct Applier {
     pub(crate) from: (String, u64, u64),
     /// Offset of the snapshot installed (`START`: none).
     pub(crate) installed: String,
+    /// The size of the installed snapshot's body as it came over the wire (compressed), 0 for
+    /// none: the first baseline of `Db::snapshot_published_bytes`.
+    pub(crate) installed_bytes: usize,
     /// Frame bytes since the latest snapshot (`Db::log`): `from`'s, plus every frame replayed;
     /// reset by an install.
     pub(crate) log: u64,
@@ -316,6 +319,7 @@ pub(crate) fn sync(
             });
         }
         applier.install(snap)?;
+        applier.installed_bytes = body.len();
         s.clone_into(pos);
     } else if *pos != START && *pos < head.retained {
         return Err(Error::Gone(Gone::RetentionPassed {
@@ -588,6 +592,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         stamp: initial,
         from: (from.clone(), epoch, log),
         installed: START.into(),
+        installed_bytes: 0,
         log,
         written: 0,
         file: emptied,
@@ -615,7 +620,11 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
             Err(e) => return Err(e),
         }
     };
-    let (installed, log) = (std::mem::take(&mut applier.installed), applier.log);
+    let (installed, installed_bytes, log) = (
+        std::mem::take(&mut applier.installed),
+        applier.installed_bytes,
+        applier.log,
+    );
     // Untouched trusted files keep their claim; otherwise the WAL is gone (`Applier::file`,
     // `install`, or never there) and the db file alone holds the state.
     let wal = local.and_then(|s| s.wal.filter(|_| applier.file.is_none()));
@@ -679,8 +688,9 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         attach_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         append_retries: 0,
         snapshot_published_at: None,
-        snapshot_failures: 0,
-        snapshot_error: None,
+        snapshot_failing: None,
+        snapshot_bytes: None,
+        snapshot_published_bytes: installed_bytes,
         attached_from: from,
         installed,
     }));

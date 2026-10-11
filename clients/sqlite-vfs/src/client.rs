@@ -71,12 +71,22 @@ fn bulk_agent() -> &'static ureq::Agent {
     })
 }
 
+/// How long resolving a host, and connecting to it (the TLS handshake included), may take, each:
+/// well below either agent's timeout. A host that does not answer fails the request as
+/// `Timeout::Resolve` or `Timeout::Connect`, before anything of it was sent (`before_connection`),
+/// rather than holding it for the whole timeout (ureq reports the earliest deadline, and a
+/// connection's starts when the host resolved).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// An agent whose requests time out after `timeout` and that keeps a connection for
-/// `max_idle_age` after its last request. The pool keeps ureq's bounds: at most 3 idle
-/// connections per host and 10 in all.
+/// `max_idle_age` after its last request. Resolving and connecting time out after
+/// `CONNECT_TIMEOUT` each. The pool keeps ureq's bounds: at most 3 idle connections per host and
+/// 10 in all.
 fn new_agent(timeout: Duration, max_idle_age: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
+        .timeout_resolve(Some(CONNECT_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
         .http_status_as_error(false)
         // Every redirect comes back to the caller, which sends a 307 again to the same URL and
         // fails on any other (`redirect_retried`). Followed, a redirect would go out without
@@ -175,6 +185,45 @@ fn no_answer(e: &ureq::Error) -> bool {
         ureq::Error::Timeout(_) => true,
         _ => false,
     }
+}
+
+/// A transport failure before any connection carried the request: the host did not resolve, the
+/// connection was refused or failed, the TLS handshake failed, or resolving or connecting (TLS
+/// included) timed out. Nothing of the request was sent.
+pub(crate) fn before_connection(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::Tls(_)
+        | ureq::Error::Rustls(_)
+        | ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => true,
+        ureq::Error::Io(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::InvalidData
+        ),
+        _ => false,
+    }
+}
+
+/// Whether the stream at `url` answers a `HEAD` with a status below 500 that is no redirect, in one
+/// attempt, on a new connection or one used within the last second (`Resend::fresh`): the layers
+/// in front of the stream pass a request without a body, and the server behind them is up (a
+/// gateway whose servers are down answers 502 or 503). A redirect is no answer, as everywhere
+/// else in the client. The snapshot thread asks after a large body failed, to tell a body too
+/// large for a layer in front of the stream from an outage (`snapshotter::FailureKind`).
+pub(crate) fn answers(url: &str) -> bool {
+    let resend = Resend {
+        fresh: true,
+        ..Resend::default()
+    };
+    prepared(agent().head(url), resend).call().is_ok_and(|r| {
+        let status = r.status().as_u16();
+        status < 500 && !(300..400).contains(&status)
+    })
 }
 
 /// A token went out in clear (`authorized`), and the log said so.
@@ -811,7 +860,7 @@ const BODY_SHOWN: usize = 256;
 /// The start of a response's body as text, for an error message or a log line: at most
 /// `BODY_SHOWN` bytes, followed by `...` when there is more (a gateway's error page, say), and
 /// what could be read when the body breaks off.
-fn body_text(r: &mut ureq::http::Response<ureq::Body>) -> String {
+pub(crate) fn body_text(r: &mut ureq::http::Response<ureq::Body>) -> String {
     let mut bytes = Vec::new();
     let limit = u64::try_from(BODY_SHOWN.saturating_add(1)).unwrap_or(u64::MAX);
     if let Err(_broken) = r.body_mut().as_reader().take(limit).read_to_end(&mut bytes) {
@@ -996,14 +1045,30 @@ pub(crate) fn get_snapshot(
     }
 }
 
+/// How many times `put_idempotent` sends a body larger than [`RESENT_UP_TO`] (a snapshot's) whose
+/// outcome stays unknown (no answer, a 5xx or a 307): once, and once again. Such a body can be hundreds
+/// of MiB, and one that a layer in front of the stream cuts off for its size (a gateway stops
+/// reading at its limit and closes the connection, which the client sees as a failed write), or
+/// that a proxy times out, fails the same way every time. So the snapshot thread backs off before
+/// its next attempt instead (`snapshotter::SnapshotFailing`).
+const UNKNOWN_SENDS: u32 = 2;
+
+/// The largest body `put_idempotent` sends again until the retry budget runs out, as before 0.7.3.
+pub(crate) const RESENT_UP_TO: usize = 1 << 20;
+
 /// `PUT` to stream incarnation `incarnation` (a 412 when it is not) with retries while the outcome
-/// is unknown (transport errors, 5xx, a 307: `redirect_retried`), no sooner than
-/// Retry-After (seconds): both publishing a snapshot and advancing retention are idempotent, so a
-/// 402 fails the request alone ([`Error::Refused`]), whatever an earlier attempt did, and so does
-/// any other redirect ([`Error::Redirected`]). No other answer refuses it, whatever headers it
-/// carries: no answer here decides a producer sequence, so none needs `applied_nothing`, and a
-/// marked 413 for a snapshot body over a gateway's limit stays a snapshot failure, which the
-/// snapshot thread counts. Returns the status and response. Gives up once `stopped` (a re-attach is
+/// is unknown (transport errors, 5xx, a 307: `redirect_retried`), no sooner than Retry-After
+/// (seconds): both publishing a snapshot and advancing retention are idempotent, so a 402 fails
+/// the request alone ([`Error::Refused`]), whatever an earlier attempt did, and so does any other
+/// redirect ([`Error::Redirected`]). No other answer refuses it, whatever headers it carries: no
+/// answer here decides a producer sequence, so none needs `applied_nothing`, and a marked 413 for
+/// a snapshot body over a gateway's limit stays a snapshot failure, which the snapshot thread
+/// counts. A body larger than [`RESENT_UP_TO`] is sent [`UNKNOWN_SENDS`] times at most while its
+/// outcome stays unknown (a refused token, sent again with the token read again, does not count),
+/// a smaller one (a small snapshot, a retention move) until the retry budget runs out. The count
+/// is checked before the pause, so the last send of a large body ends the call without waiting
+/// for its Retry-After, which the error keeps when a 5xx put the request off (`Attempt::Deferred`,
+/// `Error::retry_after`). Returns the status and response. Gives up once `stopped` (a re-attach is
 /// waiting for the snapshot thread).
 pub(crate) fn put_idempotent(
     url: &str,
@@ -1015,6 +1080,8 @@ pub(crate) fn put_idempotent(
     let mut backoff = Duration::from_millis(50);
     // How the next attempt goes out, after a refused token or no answer.
     let mut resend = Resend::default();
+    // Sends whose outcome is unknown, for a body larger than `RESENT_UP_TO`.
+    let mut unknown_sends: u32 = 0;
     loop {
         let mut retry_after = None;
         let unknown = match prepared(bulk_agent().put(url), std::mem::take(&mut resend))
@@ -1044,6 +1111,18 @@ pub(crate) fn put_idempotent(
                             None => Ok((status, r)),
                         };
                     }
+                    // A 5xx that asks for a later attempt or says it applied nothing: put off,
+                    // not about the body's size (`Attempt::Deferred`).
+                    (_, status)
+                        if status >= 500
+                            && (retry_after.is_some() || r.headers().contains_key(NOT_APPLIED)) =>
+                    {
+                        Attempt::Deferred {
+                            status,
+                            body: body_text(&mut r),
+                            retry_after,
+                        }
+                    }
                     (_, status) => Attempt::Status {
                         status,
                         body: body_text(&mut r),
@@ -1055,7 +1134,13 @@ pub(crate) fn put_idempotent(
                 Attempt::Transport(Box::new(e))
             }
         };
-        if stopped() || !pause(retry_after, &mut backoff, deadline) {
+        if !resend.refresh {
+            unknown_sends = unknown_sends.saturating_add(1);
+        }
+        if (body.len() > RESENT_UP_TO && unknown_sends >= UNKNOWN_SENDS)
+            || stopped()
+            || !pause(retry_after, &mut backoff, deadline)
+        {
             return Err(if resend.refresh {
                 unauthorized("put", url, 401)
             } else {
@@ -1090,9 +1175,13 @@ pub(crate) fn stream_seq((epoch, seq): (u64, u64)) -> String {
 /// A stand-in for the stream in tests: canned answers, in order.
 #[cfg(test)]
 pub(crate) mod mock {
+    use std::io::ErrorKind;
     use std::io::Read as _;
     use std::io::Write as _;
     use std::net::TcpListener;
+    use std::net::TcpStream;
+    use std::time::Duration;
+    use std::time::Instant;
 
     /// Ends an append's retry budget with the answer that carries it: a Retry-After too large to
     /// wait for (or even add to now).
@@ -1101,15 +1190,19 @@ pub(crate) mod mock {
     /// Answers one connection per answer, in order, and returns each request's head. An empty
     /// answer closes the connection without one: the attempt's outcome is unknown. The request's
     /// body is read whole before the answer: a connection closed with unread bytes is reset, which
-    /// can drop the answer before the client reads it.
+    /// can drop the answer before the client reads it. A connection it waits for over a minute
+    /// fails it, so a client that sends fewer requests than answers fails the test's `join`
+    /// instead of hanging it.
     pub(crate) fn serve(answers: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/b/s", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             answers
                 .into_iter()
-                .map(|answer| {
-                    let (mut conn, _) = listener.accept().unwrap();
+                .enumerate()
+                .map(|(i, answer)| {
+                    let mut conn = accepted(&listener, i);
                     let mut request = Vec::new();
                     let mut byte = [0u8; 1];
                     while !request.ends_with(b"\r\n\r\n") {
@@ -1126,6 +1219,26 @@ pub(crate) mod mock {
                 .collect()
         });
         (url, server)
+    }
+
+    /// The `i`-th connection on `listener`, which does not block, within a minute.
+    fn accepted(listener: &TcpListener, i: usize) -> TcpStream {
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    conn.set_nonblocking(false).unwrap();
+                    return conn;
+                }
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock
+                        && start.elapsed() < Duration::from_secs(60) =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("no request {i}: {e}"),
+            }
+        }
     }
 
     /// An answer without a body: `head` is the status and the headers.
@@ -1182,6 +1295,7 @@ mod tests {
     use super::Append;
     use super::Proof;
     use super::agent;
+    use super::answers;
     use super::append;
     use super::applied_nothing;
     use super::bulk_agent;
@@ -1724,6 +1838,150 @@ mod tests {
             Append::Acked { attempts: 1, .. }
         ));
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    // The probe after a large snapshot body failed: the stream answers it only with a status below
+    // 500 that is no redirect, on the first attempt. A redirect, a 5xx (a gateway whose servers are
+    // down), no answer or nothing listening is none.
+    #[test]
+    fn the_stream_answers_a_probe_only_below_500() {
+        for (status, answered) in [
+            ("200 OK", true),
+            ("404 Not Found", true),
+            ("401 Unauthorized", true),
+            (
+                "307 Temporary Redirect\r\nlocation: http://127.0.0.1:9/b/s",
+                false,
+            ),
+            ("500 Internal Server Error", false),
+            ("502 Bad Gateway", false),
+            ("503 Service Unavailable", false),
+            ("504 Gateway Timeout", false),
+            ("", false),
+        ] {
+            let (url, server) = serve(vec![if status.is_empty() {
+                String::new()
+            } else {
+                answer(status)
+            }]);
+            assert_eq!(answers(&url), answered, "{status:?}");
+            let requests = server.join().unwrap();
+            assert!(requests[0].starts_with("HEAD /b/s "), "{requests:?}");
+        }
+        let nothing = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", nothing.local_addr().unwrap());
+        drop(nothing);
+        assert!(!answers(&url), "nothing listening");
+    }
+
+    // A 5xx that asks for a later attempt (Retry-After) or says it applied nothing puts the request
+    // off (`Attempt::Deferred`), as the server's ingress admission does under pressure. The second
+    // send of a large body ends the call at once, without waiting the 30 s it asked for: the error
+    // keeps the Retry-After, for the snapshot thread's wait.
+    #[test]
+    fn a_large_body_put_off_ends_the_call_and_keeps_the_retry_after() {
+        let large = vec![7u8; (1 << 20) + 1];
+        let (url, server) = serve(vec![
+            String::new(),
+            answer("503 Service Unavailable\r\nretry-after: 30"),
+        ]);
+        let started = Instant::now();
+        let put = put_idempotent(&format!("{url}/snapshot/7"), "i1", &large, &|| false);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(matches!(put, Err(Error::PutUnknown {
+            last: Attempt::Deferred {
+                status: 503,
+                retry_after: Some(after),
+                ..
+            },
+            ..
+        }) if after == Duration::from_secs(30)));
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        let marked = || {
+            answer(&format!(
+                "503 Service Unavailable\r\n{}",
+                marker("IngressBodyBytesLimitReached")
+            ))
+        };
+        let (url, server) = serve(vec![marked(), marked()]);
+        let put = put_idempotent(&format!("{url}/snapshot/7"), "i1", &large, &|| false);
+        assert!(matches!(
+            put,
+            Err(Error::PutUnknown {
+                last: Attempt::Deferred {
+                    status: 503,
+                    retry_after: None,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    // A body over 1 MiB whose outcome stays unknown is sent twice at most: a large snapshot that a
+    // layer in front cuts off for its size, or a proxy times out, fails the same way again, and the
+    // snapshot thread backs off instead. A refused token, sent again with the token read again,
+    // does not count, and a 307 counts like a 503. A smaller body (a small snapshot, a retention
+    // move) is retried within the budget, as before. Each stand-in answers exactly the requests
+    // expected: one more would find nothing listening.
+    #[test]
+    fn a_large_body_is_sent_twice_at_most_while_its_outcome_stays_unknown() {
+        let large = vec![7u8; (1 << 20) + 1];
+        let sent = |answers: Vec<String>, body: &[u8]| {
+            let (url, server) = serve(answers);
+            let put = put_idempotent(&format!("{url}/snapshot/7"), "i1", body, &|| false);
+            (put, server)
+        };
+
+        // Its token refused, then no answer, then a 503.
+        let (put, server) = sent(
+            vec![
+                answer("401 Unauthorized"),
+                String::new(),
+                answer("503 Service Unavailable"),
+            ],
+            &large,
+        );
+        assert!(matches!(
+            put,
+            Err(Error::PutUnknown {
+                last: Attempt::Status { status: 503, .. },
+                ..
+            })
+        ));
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        // A redirect, which is never followed, then a 503.
+        let (put, server) = sent(
+            vec![
+                answer("307 Temporary Redirect\r\nlocation: http://127.0.0.1:9/b/s/snapshot/7"),
+                answer("503 Service Unavailable"),
+            ],
+            &large,
+        );
+        assert!(matches!(
+            put,
+            Err(Error::PutUnknown {
+                last: Attempt::Status { status: 503, .. },
+                ..
+            })
+        ));
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        // A small snapshot: three answers with an unknown outcome, then accepted.
+        let (put, server) = sent(
+            vec![
+                answer("503 Service Unavailable"),
+                String::new(),
+                answer("502 Bad Gateway"),
+                answer("204 No Content"),
+            ],
+            &[7u8; 4096],
+        );
+        assert!(matches!(put, Ok((204, _))));
+        assert_eq!(server.join().unwrap().len(), 4);
     }
 
     // One attempt whose outcome is unknown (no answer, an unmarked 5xx) and the append may be in
@@ -2286,6 +2544,19 @@ mod tests {
             assert_eq!(config.max_idle_age(), Duration::from_secs(age));
             assert_eq!(config.max_idle_connections_per_host(), 3);
             assert_eq!(config.max_idle_connections(), 10);
+        }
+    }
+
+    // Both agents resolve and connect (the TLS handshake included) within 5 s each, well below
+    // their timeouts: a host that does not answer fails as `Timeout::Resolve` or `Timeout::Connect`
+    // (`before_connection`), not as the whole request's timeout.
+    #[test]
+    fn agents_resolve_and_connect_within_5_s() {
+        for agent in [agent(), bulk_agent()] {
+            let timeouts = agent.config().timeouts();
+            assert_eq!(timeouts.resolve, Some(Duration::from_secs(5)));
+            assert_eq!(timeouts.connect, Some(Duration::from_secs(5)));
+            assert!(timeouts.global > Some(Duration::from_secs(5)));
         }
     }
 

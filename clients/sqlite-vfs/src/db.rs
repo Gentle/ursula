@@ -22,6 +22,7 @@ use crate::host::OK;
 use crate::log;
 use crate::log::Level;
 use crate::snapshotter::Snapper;
+use crate::snapshotter::SnapshotFailing;
 use crate::stats::Stats;
 use crate::wal::db_len;
 
@@ -143,9 +144,16 @@ pub(crate) struct Db {
     pub(crate) append_retries: u64,
     /// When this owner last saw a snapshot published (its own, or a newer one it found).
     pub(crate) snapshot_published_at: Option<Instant>,
-    /// Snapshot attempts that failed since the last one that did not, and the last failure.
-    pub(crate) snapshot_failures: u32,
-    pub(crate) snapshot_error: Option<String>,
+    /// Snapshot attempts that failed in a row since one published a snapshot or found one at its
+    /// offset, and the wait before the next (`None` while none has).
+    pub(crate) snapshot_failing: Option<SnapshotFailing>,
+    /// The compressed size of the latest snapshot body built, published or not.
+    pub(crate) snapshot_bytes: Option<usize>,
+    /// The largest snapshot body this owner published, or installed at attach
+    /// (`attach::Applier::installed_bytes`), in bytes: the publish of a larger body that fails may
+    /// have failed for its size, which a probe of the stream decides
+    /// (`snapshotter::FailureKind::may_be_size`).
+    pub(crate) snapshot_published_bytes: usize,
 }
 
 /// Why an attached database is poisoned: the first reason, and what any reason so far showed.
@@ -488,8 +496,9 @@ impl Db {
             attach_ms: 0,
             append_retries: 0,
             snapshot_published_at: None,
-            snapshot_failures: 0,
-            snapshot_error: None,
+            snapshot_failing: None,
+            snapshot_bytes: None,
+            snapshot_published_bytes: 0,
         }
     }
 }

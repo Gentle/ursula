@@ -86,10 +86,23 @@ fn status_json(db: &Db) -> String {
             db.snapshot_published_at
                 .map_or_else(null, |at| at.elapsed().as_millis().to_string()),
         ),
-        ("snapshot_failures", db.snapshot_failures.to_string()),
+        (
+            "snapshot_failures",
+            db.snapshot_failing
+                .as_ref()
+                .map_or(0, |failing| failing.count)
+                .to_string(),
+        ),
         (
             "snapshot_error",
-            db.snapshot_error.as_deref().map_or_else(null, json_str),
+            db.snapshot_failing
+                .as_ref()
+                .map_or_else(null, |failing| json_str(&failing.error)),
+        ),
+        (
+            "snapshot_bytes",
+            db.snapshot_bytes
+                .map_or_else(null, |bytes| bytes.to_string()),
         ),
     ];
     let body: Vec<String> = fields

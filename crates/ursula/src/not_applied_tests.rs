@@ -67,6 +67,7 @@ use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
+use ursula_runtime::StreamErrorCode;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
@@ -536,6 +537,30 @@ async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
         // The append did commit.
         assert_eq!(stream_content(&app).await, "abc", "{case}");
     }
+
+    // Apply refuses a write with a stream error, such as a `Stream-Seq` that
+    // is not greater than the stored one, after its command reached the Raft
+    // log. So the `409` carries no marker, although the cleanup rule deletes
+    // a staged body, because apply refuses the write on every replica alike.
+    let (app, cold_store) = node_with_cold_store(
+        FailingFactory {
+            failure: WriteFailure::Refuse(GroupEngineError::stream(
+                StreamErrorCode::StreamSeqConflict,
+                "Stream-Seq is not greater than the stored one",
+            )),
+        },
+        Peers::None,
+    );
+    for write in ONE_COMMAND_WRITES {
+        let events = observe(&cold_store);
+        let response = send(&app, write.method, REFUSED, write.headers, write.body).await;
+        let name = write.name;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{name}");
+        assert_eq!(not_applied(&response), None, "{name}");
+        let staged = staged_external_paths(&events);
+        assert_eq!(staged.len(), usize::from(write.external()), "{name}");
+        assert_eq!(deleted_paths(&events), staged, "{name}");
+    }
 }
 
 /// The stream every refused write below addresses.
@@ -743,9 +768,9 @@ async fn backpressure_refusals_are_marked_not_applied() {
 ///
 /// [`send`] checks every response in this module for the vouch, among them
 /// the runtime refusals and the answers that can follow a proposal above.
-/// This test adds a plain create, append and `404`, and the two admission
-/// refusals a node with a small body budget makes. The `WalDiskPressure` and
-/// `RaftLogPressure` tests in `tests.rs` check their refusals.
+/// This test adds a plain create, append and `404`, and the budget refusal
+/// and the size refusal. The `WalDiskPressure` and `RaftLogPressure` tests in
+/// `tests.rs` check their refusals.
 #[tokio::test]
 async fn a_node_never_sets_the_vouch() {
     let app = node_with_body_budget(4);

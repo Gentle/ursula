@@ -2455,10 +2455,11 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
 
 /// A follower finds that it does not lead the group before it proposes an
 /// append or a close, so its redirect applied nothing and carries
-/// `x-ursula-not-applied`. A create on these nodes, which run without cold
-/// admission, goes straight to `client_write`. A forward that OpenRaft
-/// reports from there can follow a committed entry, so that redirect carries
-/// no marker, although here too nothing was proposed.
+/// `x-ursula-not-applied`. A delete goes straight to `client_write`, and so
+/// does a create on these nodes, which run without cold admission. A forward
+/// that OpenRaft reports from there can follow a committed entry, so those
+/// redirects carry no marker, although here too nothing was proposed. No
+/// redirect carries the vouch: only a gateway adds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
     let mut listeners = Vec::new();
@@ -2556,6 +2557,10 @@ async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
             Some("NotLeader"),
             "{write}"
         );
+        assert!(
+            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+            "{write}"
+        );
     }
 
     let create = client
@@ -2565,10 +2570,33 @@ async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
         .send()
         .await
         .expect("create on a follower");
-    assert_eq!(create.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(not_applied(&create), None);
+    let delete = client
+        .delete(format!("{follower}/benchcmp/marked"))
+        .send()
+        .await
+        .expect("delete on a follower");
+    for (write, response, target) in [
+        ("create", &create, format!("{leader}/benchcmp/unmarked")),
+        ("delete", &delete, leader_target.clone()),
+    ] {
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{write}");
+        assert_eq!(
+            response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(target.as_str()),
+            "{write}"
+        );
+        assert_eq!(not_applied(response), None, "{write}");
+        assert!(
+            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+            "{write}"
+        );
+    }
 
-    // The follower proposed none of them.
+    // The follower proposed none of them: the stream is still there, empty
+    // and open, and the create made nothing.
     let head = client
         .head(leader_target.as_str())
         .send()

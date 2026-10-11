@@ -168,3 +168,146 @@ pub fn spawn_cold_health_gate(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::ProptestConfig;
+    use proptest::prelude::Strategy;
+    use proptest::prelude::prop;
+    use proptest::prop_assert_eq;
+    use proptest::prop_oneof;
+    use proptest::proptest;
+
+    use super::ColdHealthDecision;
+    use super::ColdHealthSample;
+    use super::ColdHealthTracker;
+
+    /// `ColdHealthTracker::evaluate` as it was before the gates shared one
+    /// hysteresis: streak counters and a `yielded` flag.
+    struct CountingTracker {
+        unhealthy_ticks: usize,
+        heal_ticks: usize,
+        hot_high_bytes: u64,
+        hot_low_bytes: u64,
+        errors_per_tick_high: u64,
+        last_errors: Option<u64>,
+        consecutive_bad: usize,
+        consecutive_good: usize,
+        yielded: bool,
+    }
+
+    impl CountingTracker {
+        fn new(
+            unhealthy_ticks: usize,
+            heal_ticks: usize,
+            hot_high_bytes: u64,
+            hot_low_bytes: u64,
+            errors_per_tick_high: u64,
+        ) -> Self {
+            Self {
+                unhealthy_ticks: unhealthy_ticks.max(1),
+                heal_ticks: heal_ticks.max(1),
+                hot_high_bytes,
+                hot_low_bytes,
+                errors_per_tick_high,
+                last_errors: None,
+                consecutive_bad: 0,
+                consecutive_good: 0,
+                yielded: false,
+            }
+        }
+
+        fn evaluate(&mut self, sample: ColdHealthSample) -> ColdHealthDecision {
+            let prev_errors = self.last_errors.unwrap_or(sample.cold_flush_write_errors);
+            let delta_errors = sample.cold_flush_write_errors.saturating_sub(prev_errors);
+            self.last_errors = Some(sample.cold_flush_write_errors);
+
+            let errors_unhealthy = delta_errors > self.errors_per_tick_high;
+            let hot_unhealthy = sample.cold_hot_group_bytes_max >= self.hot_high_bytes;
+            let unhealthy = errors_unhealthy || hot_unhealthy;
+            let healthy =
+                delta_errors == 0 && sample.cold_hot_group_bytes_max <= self.hot_low_bytes;
+
+            if unhealthy {
+                self.consecutive_bad = self.consecutive_bad.saturating_add(1);
+                self.consecutive_good = 0;
+            } else if healthy {
+                self.consecutive_good = self.consecutive_good.saturating_add(1);
+                self.consecutive_bad = 0;
+            } else {
+                self.consecutive_good = 0;
+            }
+
+            if !self.yielded && self.consecutive_bad >= self.unhealthy_ticks {
+                self.yielded = true;
+                let reason = if errors_unhealthy {
+                    format!(
+                        "cold_flush_write_errors +{delta_errors}/tick > {}",
+                        self.errors_per_tick_high
+                    )
+                } else {
+                    format!(
+                        "cold_hot_max {} ≥ HIGH {}",
+                        sample.cold_hot_group_bytes_max, self.hot_high_bytes
+                    )
+                };
+                return ColdHealthDecision::Shed { reason };
+            }
+
+            if self.yielded && self.consecutive_good >= self.heal_ticks {
+                self.yielded = false;
+                return ColdHealthDecision::Heal;
+            }
+
+            ColdHealthDecision::NoChange
+        }
+    }
+
+    const HOT_LOW: u64 = 32;
+    const HOT_HIGH: u64 = 48;
+    const HOT_MAX: u64 = 96;
+
+    /// Hot bytes below, inside or above the watermark band, with both
+    /// watermarks themselves.
+    fn hot_bytes() -> impl Strategy<Value = u64> {
+        prop_oneof![0..=HOT_LOW, HOT_LOW..=HOT_HIGH, HOT_HIGH..=HOT_MAX]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2_048))]
+
+        #[test]
+        fn cold_health_decides_as_its_counting_predecessor(
+            base_errors in 0u64..1_000,
+            ticks in prop::collection::vec((0u64..4, hot_bytes()), 0..64),
+            unhealthy_ticks in 0usize..5,
+            heal_ticks in 0usize..5,
+            errors_per_tick_high in 0u64..5,
+        ) {
+            let mut tracker = ColdHealthTracker::new(
+                unhealthy_ticks,
+                heal_ticks,
+                HOT_HIGH,
+                HOT_LOW,
+                errors_per_tick_high,
+            );
+            let mut oracle = CountingTracker::new(
+                unhealthy_ticks,
+                heal_ticks,
+                HOT_HIGH,
+                HOT_LOW,
+                errors_per_tick_high,
+            );
+            let mut errors = base_errors;
+            for (new_errors, hot) in ticks {
+                errors = errors.saturating_add(new_errors);
+                let sample = ColdHealthSample {
+                    cold_flush_write_errors: errors,
+                    cold_hot_group_bytes_max: hot,
+                };
+                prop_assert_eq!(tracker.evaluate(sample), oracle.evaluate(sample));
+                prop_assert_eq!(tracker.yielded(), oracle.yielded);
+            }
+        }
+    }
+}

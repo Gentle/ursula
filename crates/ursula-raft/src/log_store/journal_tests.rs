@@ -864,19 +864,35 @@ async fn a_limited_read_weighs_cached_entries_too() {
 
 /// OpenRaft reads a caught-up follower's range from entries the writer has
 /// not flushed yet, so the limit weighs those pending entries too. A read
-/// stops inside the pending batch, and a durable prefix that stops early is
-/// never followed by pending entries past the gap, which the replication
-/// reader would refuse as a fatal storage error.
+/// stops inside the pending batch, after what a durable prefix left of the
+/// limit, and takes no pending entry at all when the durable prefix filled
+/// it. A pending entry over the whole limit comes alone rather than leaving
+/// the read empty, and a durable prefix that stops early is never followed by
+/// pending entries past the gap, which the replication reader would refuse as
+/// a fatal storage error. Here the durable prefix comes from the cache.
 #[tokio::test]
-async fn a_limited_read_weighs_pending_entries_and_keeps_them_consecutive() {
+async fn a_limited_read_weighs_pending_entries_after_a_cached_prefix() {
+    limited_reads_of_pending_entries(64 * 1024 * 1024, false).await;
+}
+
+/// [`a_limited_read_weighs_pending_entries_after_a_cached_prefix`] with a
+/// 2 MiB per-group cache, each group's share of the default 256 MiB
+/// `cache_size` at 128 groups, so the durable prefix comes from disk.
+#[tokio::test]
+async fn a_limited_read_weighs_pending_entries_after_a_prefix_from_disk() {
+    limited_reads_of_pending_entries(2 * 1024 * 1024, true).await;
+}
+
+async fn limited_reads_of_pending_entries(group_cache_bytes: u64, durable_from_disk: bool) {
     use openraft::type_config::TypeConfigExt;
+    use tokio::sync::oneshot::error::TryRecvError;
 
     use super::writer::CoreWriteOp;
 
     let core = Core::new(JournalTuning {
         fsync: WalFsync::Never,
         segment_bytes: 64 * 1024 * 1024,
-        group_cache_bytes: 64 * 1024 * 1024,
+        group_cache_bytes,
     });
     let writer = core.writer();
     let mib = 1024 * 1024;
@@ -886,14 +902,21 @@ async fn a_limited_read_weighs_pending_entries_and_keeps_them_consecutive() {
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        LIMITED_READ_BYTES / entry_log_bytes(&payload_entry(1, mib)),
-        3
+        LIMITED_READ_BYTES.checked_div(entry_log_bytes(&payload_entry(1, mib))),
+        Some(3)
     );
     let mut only_pending = core.store(&writer, 1);
+    // One durable entry, so the limit it leaves lets exactly two pending
+    // entries through.
     let mut after_durable = core.store(&writer, 2);
-    append(&mut after_durable, entries(1, 2, mib)).await;
+    append(&mut after_durable, entries(1, 1, mib)).await;
     let mut after_a_stop = core.store(&writer, 3);
     append(&mut after_a_stop, entries(1, 6, mib)).await;
+    let mut oversized_first = core.store(&writer, 4);
+    // A durable prefix that fills the limit: the first pending entry is
+    // refused too, or the read would carry a whole entry past the limit.
+    let mut filled_by_durable = core.store(&writer, 5);
+    append(&mut filled_by_durable, entries(1, 3, mib)).await;
 
     let (entered, wait_entered) = tokio::sync::oneshot::channel();
     let (release, wait_release) = std::sync::mpsc::channel::<()>();
@@ -909,12 +932,18 @@ async fn a_limited_read_weighs_pending_entries_and_keeps_them_consecutive() {
         },
     );
     wait_entered.await.expect("writer reached barrier");
+    let oversized = usize::try_from(2 * LIMITED_READ_BYTES).expect("fits in usize");
     let mut flushes = Vec::new();
     for (store, pending) in [
         (&mut only_pending, entries(1, 10, mib)),
-        (&mut after_durable, entries(3, 12, mib)),
+        (&mut after_durable, entries(2, 12, mib)),
         // Small enough to fit in what the durable prefix leaves of the limit.
         (&mut after_a_stop, entries(7, 12, 1024)),
+        (&mut oversized_first, vec![
+            payload_entry(1, oversized),
+            payload_entry(2, 16),
+        ]),
+        (&mut filled_by_durable, entries(4, 12, mib)),
     ] {
         let (flushed, result) = UrsulaRaftTypeConfig::oneshot();
         store
@@ -924,7 +953,25 @@ async fn a_limited_read_weighs_pending_entries_and_keeps_them_consecutive() {
         flushes.push(result);
     }
 
-    for store in [&only_pending, &after_durable, &after_a_stop] {
+    for (label, store, expected, from_disk) in [
+        ("only_pending", &only_pending, &[1, 2, 3][..], false),
+        // A single 1 MiB durable entry stays cached even in a 2 MiB cache.
+        ("after_durable", &after_durable, &[1, 2, 3][..], false),
+        (
+            "after_a_stop",
+            &after_a_stop,
+            &[1, 2, 3][..],
+            durable_from_disk,
+        ),
+        ("oversized_first", &oversized_first, &[1][..], false),
+        (
+            "filled_by_durable",
+            &filled_by_durable,
+            &[1, 2, 3][..],
+            durable_from_disk,
+        ),
+    ] {
+        let misses = core.metrics.snapshot().wal_cache_misses;
         let mut reader = store.clone();
         let read = reader
             .limited_get_log_entries(1, 13)
@@ -933,7 +980,19 @@ async fn a_limited_read_weighs_pending_entries_and_keeps_them_consecutive() {
             .into_iter()
             .map(|entry| entry.log_id.index)
             .collect::<Vec<_>>();
-        assert_eq!(read, [1, 2, 3]);
+        assert_eq!(read, expected, "{label}, {group_cache_bytes} B group cache");
+        assert_eq!(
+            core.metrics.snapshot().wal_cache_misses > misses,
+            from_disk,
+            "{label}, {group_cache_bytes} B group cache: whether the durable prefix came from disk"
+        );
+    }
+    // No append has completed, so every read above found its batch pending.
+    for flush in &mut flushes {
+        assert!(
+            matches!(flush.try_recv(), Err(TryRecvError::Empty)),
+            "an append completed during the reads"
+        );
     }
     drop(release);
     for flush in flushes {
@@ -942,7 +1001,7 @@ async fn a_limited_read_weighs_pending_entries_and_keeps_them_consecutive() {
             .expect("callback delivered")
             .expect("durable append");
     }
-    writer.close().await.unwrap();
+    writer.close().await.expect("close the writer");
 }
 
 /// Recovery reads every segment in order and truncates an incomplete final

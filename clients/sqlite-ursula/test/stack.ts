@@ -116,9 +116,11 @@ async function waitWritable(url: string, logs: () => string): Promise<void> {
 	throw new Error(`ursula not writable: ${last}\n${logs()}`);
 }
 
-/** A server node: its HTTP URL and process id (for RSS sampling). */
+/** A server node: its Raft node id, its HTTP URL, its admin URL and its process id (for RSS sampling). */
 export interface StackNode {
+	readonly id: number;
 	readonly url: string;
+	readonly admin: string;
 	readonly pid: number;
 }
 
@@ -166,7 +168,7 @@ async function startSingle(): Promise<Stack> {
 		await stop();
 		throw error;
 	}
-	return { url, nodes: [{ url, pid: node.pid }], stop };
+	return { url, nodes: [{ id: 1, url, admin: `http://127.0.0.1:${adminPort}`, pid: node.pid }], stop };
 }
 
 // ---- S3: backend resolution, and MinIO bucket creation with a minimal path-style SigV4 request
@@ -306,7 +308,7 @@ async function startCluster(): Promise<Stack> {
 		procs.push(new Proc(ursulaBin(), args, dir, {}, "gateway"));
 		const url = `http://127.0.0.1:${gatewayPort}`;
 		await waitWritable(url, logs);
-		return { url, nodes: nodes.map((node, i) => ({ url: `http://127.0.0.1:${node.port}`, pid: (procs[i] as Proc).pid })), stop };
+		return { url, nodes: nodes.map((node, i) => ({ id: node.id, url: `http://127.0.0.1:${node.port}`, admin: node.admin, pid: (procs[i] as Proc).pid })), stop };
 	} catch (error) {
 		await stop();
 		throw error;

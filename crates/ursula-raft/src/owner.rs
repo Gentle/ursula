@@ -293,7 +293,7 @@ impl OwnerRaftHandle {
         self.call(move |raft| async move { raft.install_full_snapshot(vote, snapshot).await })
             .await?
     }
-    pub async fn handle_transfer_leader(
+    pub(crate) async fn handle_transfer_leader(
         &self,
         request: TransferLeaderRequest<C>,
     ) -> Result<openraft::raft::TransferLeaderResponse<C>, Fatal<C>> {

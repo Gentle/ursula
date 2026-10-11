@@ -2,40 +2,30 @@
 // tokens from a JWKS this test serves), in front of the stack under test. An HTTPS proxy with a
 // certificate from a throwaway CA terminates TLS in front of the gateway. Each owner runs in a
 // child process, because the CA file and the token file are read from its environment.
-import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { type Server, createServer, request as httpRequest } from "node:http";
+import { type Server, request as httpRequest } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterAll, beforeAll, expect, inject, it } from "vitest";
 import { attach } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
-import { type Child, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
+import { AuthGateway, type Child, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-auth-"));
 const caFile = join(dir, "ca.pem");
-const audience = "https://streams.e2e";
-const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-let issuer = "";
 let secureUrl = "";
 const servers: Server[] = [];
-let gateway: ChildProcess | undefined;
+let gateway: AuthGateway | undefined;
 
 const listen = (server: Server): Promise<number> =>
 	new Promise((res) => server.listen(0, "127.0.0.1", () => res((server.address() as AddressInfo).port)));
 
-const b64 = (o: object): string => Buffer.from(JSON.stringify(o)).toString("base64url");
-
 /** An access token the gateway accepts, valid for an hour. */
-function mint(): string {
-	const now = Math.floor(Date.now() / 1000);
-	const head = b64({ alg: "RS256", typ: "at+jwt", kid: "e2e" });
-	const claims = b64({ iss: issuer, sub: "vfs-e2e", aud: audience, client_id: "vfs-e2e", iat: now, exp: now + 3600, jti: randomUUID() });
-	return `${head}.${claims}.${sign("sha256", Buffer.from(`${head}.${claims}`), privateKey).toString("base64url")}`;
-}
+const mint = (): string => (gateway as AuthGateway).mint();
 
 /** A CA, and a server certificate for 127.0.0.1 it signed. */
 function certificates(): { key: Buffer; cert: Buffer } {
@@ -50,31 +40,8 @@ function certificates(): { key: Buffer; cert: Buffer } {
 }
 
 beforeAll(async () => {
-	const jwks = createServer((_, res) => {
-		res.writeHead(200, { "content-type": "application/json" });
-		res.end(JSON.stringify({ keys: [{ ...publicKey.export({ format: "jwk" }), kid: "e2e", alg: "RS256", use: "sig" }] }));
-	});
-	servers.push(jwks);
-	const jwksPort = await listen(jwks);
-	issuer = `http://127.0.0.1:${jwksPort}`;
-	const policy = join(dir, "policy.toml");
-	writeFileSync(policy, `[[bucket]]\nid = "sqlite-e2e"\nowners = [{ issuer = "${issuer}", subject = "vfs-e2e" }]\n`);
-	const probe = createServer();
-	const gatewayPort = await listen(probe);
-	await new Promise((res) => probe.close(res));
-	const args = ["gateway", "--listen", `127.0.0.1:${gatewayPort}`, "--raft-group-count", process.env.E2E_GROUPS ?? "4"];
-	for (const node of inject("ursulaNodes")) args.push("--upstream", node.url);
-	args.push("--auth-issuer", issuer, "--auth-audience", audience, "--auth-policy", policy, "--auth-jwks-url", `${issuer}/jwks.json`);
-	gateway = spawn(resolve(process.env.URSULA_BIN ?? ""), args, { cwd: dir, stdio: "ignore" });
-	for (let i = 0; ; i++) {
-		const up = await fetch(`http://127.0.0.1:${gatewayPort}/`).then(
-			() => true,
-			() => false,
-		);
-		if (up) break;
-		if (i > 100) throw new Error("the gateway did not start");
-		await new Promise((r) => setTimeout(r, 100));
-	}
+	gateway = await AuthGateway.start(inject("ursulaNodes").map((node) => node.url), dir);
+	const gatewayPort = new URL(gateway.url).port;
 	const proxy = createHttpsServer(certificates(), (req, res) => {
 		const upstream = httpRequest({ host: "127.0.0.1", port: gatewayPort, method: req.method, path: req.url, headers: req.headers }, (answer) => {
 			res.writeHead(answer.statusCode ?? 502, answer.headers);
@@ -89,7 +56,7 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-	gateway?.kill("SIGKILL");
+	gateway?.close();
 	for (const server of servers) server.close();
 	rmSync(dir, { recursive: true, force: true });
 });

@@ -686,15 +686,15 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::TransferLeader,
         });
-        if *req.to_node_id() == self.target
-            && self
-                .registry
-                .rejoin(self.target)
-                .is_some_and(|rejoin| !crate::ElectionPolicy::default().may_campaign(Some(&rejoin)))
+        if let Some((group, endpoint)) = self.registry.endpoint(self.target)
+            && let Err(refusal) = endpoint.election_policy().validate_incoming_transfer(
+                group,
+                self.target,
+                &req,
+                endpoint.rejoin(group).as_deref(),
+            )
         {
-            return Err(RPCError::Network(NetworkError::from_string(
-                "the recovery gate is closed; refusing leadership transfer",
-            )));
+            return Err(RPCError::Network(NetworkError::new(&refusal)));
         }
         target.handle_transfer_leader(req).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!(

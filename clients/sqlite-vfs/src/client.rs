@@ -166,30 +166,60 @@ fn prepared<B>(req: ureq::RequestBuilder<B>, resend: Resend) -> ureq::RequestBui
 
 /// A request that got no answer for a reason another attempt on a new connection may not meet:
 /// the connection was reset, aborted or closed under it (a server closing it mid-answer included,
-/// an early EOF), the request timed out (a pooled connection closed as the request went out, or
-/// dropped by a device without telling either end), or a signal interrupted it. Not a refused
-/// connection (nothing listens there, so a server still restarting fails the read), a failed TLS
-/// handshake (`InvalidData`), a protocol error (an answer that is not HTTP/1, such as from a gRPC
-/// port, is the same every time), nor anything about the request or the setup.
+/// an early EOF, and on macOS a reset reported as `EINVAL`: `reset_on_macos`), the request timed
+/// out (a pooled connection closed as the request went out, or dropped by a device without telling
+/// either end), or a signal interrupted it. Not a refused connection (nothing listens there, so a
+/// server still restarting fails the read), a failed TLS handshake (`InvalidData`), a protocol
+/// error (an answer that is not HTTP/1, such as from a gRPC port, is the same every time), nor
+/// anything about the request or the setup.
 fn no_answer(e: &ureq::Error) -> bool {
     match e {
-        ureq::Error::Io(e) => matches!(
-            e.kind(),
-            std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::Interrupted
-        ),
+        ureq::Error::Io(e) => {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+            ) || reset_on_macos(e)
+        }
         ureq::Error::Timeout(_) => true,
         _ => false,
     }
 }
 
+/// Whether `e` is a reset as macOS reports it when the reset came in between two calls on the
+/// socket (#542): `EINVAL` from the OS (`Invalid argument (os error 22)`), where Linux reports
+/// `EPIPE` or `ECONNRESET`.
+///
+/// A reset shuts a socket down both ways, and macOS then fails every `setsockopt` on it with
+/// `EINVAL` (XNU's `sosetoptlock`). ureq 3.4.2 (`TcpTransport`) sets the socket's write timeout
+/// before it writes each buffer of a request (128 KiB), its read timeout before each read (each to
+/// the time left, which differs every time), and `TCP_NODELAY` once connected. So a reset that
+/// comes in as a request goes out or as its answer starts (a pooled connection the server closed
+/// just before, or a body a gateway stopped reading, #540) fails the request this way. Under TLS
+/// too: rustls hands the socket's error back unchanged.
+///
+/// No error about the request or the setup reaches here. ureq and ureq-proto make no
+/// `InvalidInput` of their own, and neither does rustls on ureq's path (its one is for TLS early
+/// data, which ureq never sends). A bad header or URL fails as `Error::Http` or `Error::BadUri`.
+/// The `InvalidInput` that std makes up for an argument it refuses carries no OS error code: from
+/// ureq's resolver, a host and port that do not parse or a NUL in the host (the other one, a zero
+/// timeout, ureq never sets). Those stay final. A request that meets any other `EINVAL` from the OS
+/// on macOS is sent again until the retry budget runs out, and then fails as before. Other systems
+/// keep `EINVAL` final: Linux reports a reset as a reset, and its `connect` fails with `EINVAL`
+/// for a wrong URL (an IPv6 link-local address without a zone).
+fn reset_on_macos(e: &std::io::Error) -> bool {
+    cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EINVAL)
+}
+
 /// A transport failure before any connection carried the request: the host did not resolve, the
 /// connection was refused or failed, the TLS handshake failed, or resolving or connecting (TLS
-/// included) timed out. Nothing of the request was sent.
+/// included) timed out. Nothing of the request was sent. A reset is none of these, whatever error
+/// reports it (`EINVAL` on macOS among them, `reset_on_macos`): the connection was open, so part
+/// of the request or the whole of it may have gone out.
 pub(crate) fn before_connection(e: &ureq::Error) -> bool {
     match e {
         ureq::Error::HostNotFound
@@ -1222,7 +1252,7 @@ pub(crate) mod mock {
     }
 
     /// The `i`-th connection on `listener`, which does not block, within a minute.
-    fn accepted(listener: &TcpListener, i: usize) -> TcpStream {
+    pub(crate) fn accepted(listener: &TcpListener, i: usize) -> TcpStream {
         let start = Instant::now();
         loop {
             match listener.accept() {
@@ -1279,10 +1309,12 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
     use std::io::Read as _;
     use std::io::Write as _;
     use std::net::TcpListener;
     use std::net::TcpStream;
+    use std::net::ToSocketAddrs as _;
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::Mutex;
@@ -1298,6 +1330,7 @@ mod tests {
     use super::answers;
     use super::append;
     use super::applied_nothing;
+    use super::before_connection;
     use super::bulk_agent;
     use super::create_stream;
     use super::get_snapshot;
@@ -1305,12 +1338,14 @@ mod tests {
     use super::in_clear;
     use super::mock::LAST;
     use super::mock::VOUCH;
+    use super::mock::accepted;
     use super::mock::answer;
     use super::mock::answer_with_body;
     use super::mock::marker;
     use super::mock::serve;
     use super::mock::vouched;
     use super::new_agent;
+    use super::no_answer;
     use super::put_idempotent;
     use super::read_from;
     use crate::auth::set_token;
@@ -2612,6 +2647,165 @@ mod tests {
             "{refused}"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // On macOS a reset that comes in between two calls on the socket fails the next one with
+    // `EINVAL` (`reset_on_macos`, #542): no answer there, as a reset is everywhere, and final on
+    // other systems. An `InvalidInput` that std makes up for an argument it refuses (from ureq's
+    // resolver: a host and port that do not parse, a NUL in the host) carries no OS error code and
+    // stays final everywhere. Neither is a failure before the connection, so a large snapshot body
+    // whose write met one may be too large (`snapshotter::FailureKind::may_be_size`).
+    #[test]
+    fn einval_from_the_os_is_no_answer_on_macos_only() {
+        let einval = ureq::Error::Io(std::io::Error::from_raw_os_error(libc::EINVAL));
+        assert_eq!(einval.to_string(), "io: Invalid argument (os error 22)");
+        assert_eq!(no_answer(&einval), cfg!(target_os = "macos"));
+        assert!(!before_connection(&einval));
+        for reset in [libc::EPIPE, libc::ECONNRESET] {
+            let reset = ureq::Error::Io(std::io::Error::from_raw_os_error(reset));
+            assert!(no_answer(&reset) && !before_connection(&reset), "{reset}");
+        }
+        let made_up = [
+            "ursula.invalid".to_socket_addrs().err().unwrap(),
+            ("ursula\0.invalid", 80).to_socket_addrs().err().unwrap(),
+        ];
+        for e in made_up {
+            assert_eq!(
+                (e.kind(), e.raw_os_error()),
+                (ErrorKind::InvalidInput, None),
+                "{e}"
+            );
+            let e = ureq::Error::Io(e);
+            assert!(!no_answer(&e) && !before_connection(&e), "{e}");
+        }
+    }
+
+    /// How `serve_resetting` resets a connection: it drops it with bytes of the request unread,
+    /// which resets it (an RST, on Linux and on macOS alike, as `SO_LINGER` 0 would).
+    #[derive(Clone, Copy)]
+    enum Reset {
+        /// As the answer starts: after the request's first byte, and with the first line of an
+        /// answer sent, which the client reads before it meets the reset.
+        AsTheAnswerStarts,
+        /// While the body goes out: once the head and `after` bytes of the body were read, as
+        /// fast as they came, so the client is still writing.
+        WhileTheBodyGoesOut { after: usize },
+    }
+
+    /// A stand-in that resets its first `resets` connections (`Reset`), then answers the next one
+    /// with `answer`, if any, after it read the request whole. Returns the URL, and the number of
+    /// connections it accepted.
+    fn serve_resetting(
+        reset: Reset,
+        resets: usize,
+        answer: Option<String>,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/b/s", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for i in 0..resets {
+                let mut conn = accepted(&listener, i);
+                match reset {
+                    Reset::AsTheAnswerStarts => {
+                        conn.read_exact(&mut [0u8; 1]).unwrap();
+                        conn.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+                    }
+                    Reset::WhileTheBodyGoesOut { after } => {
+                        assert!(read_head(&mut conn));
+                        conn.read_exact(&mut vec![0u8; after]).unwrap();
+                    }
+                }
+                // Bytes of the request unread: a reset.
+                drop(conn);
+            }
+            let Some(answer) = answer else {
+                return resets;
+            };
+            let mut conn = accepted(&listener, resets);
+            assert!(read_request(&mut conn));
+            conn.write_all(answer.as_bytes()).unwrap();
+            resets.saturating_add(1)
+        });
+        (url, server)
+    }
+
+    /// Whether `e`, a reset, is reported as `EINVAL`: after asserting that it is no answer, after
+    /// the connection carried the request, as a reset is whatever error reports it.
+    fn met_as_einval(e: &ureq::Error) -> bool {
+        assert!(no_answer(e) && !before_connection(e), "{e}");
+        matches!(e, ureq::Error::Io(io) if io.raw_os_error() == Some(libc::EINVAL))
+    }
+
+    // A reset that comes in between two calls on the socket fails the next one with `EINVAL` on
+    // macOS, where Linux reports `ECONNRESET` or `EPIPE` (#542). A stand-in that resets the
+    // connection as a `HEAD`'s answer starts makes the client meet the reset at its read after
+    // that first line, while it is between two calls: on macOS as `EINVAL` almost every time, on
+    // Linux as `ECONNRESET`. Each `HEAD` is sent once, with no retry to hide the error.
+    #[test]
+    fn a_reset_as_the_answer_starts_is_met_as_einval_on_macos_only() {
+        let mut einval: usize = 0;
+        for _ in 0..10 {
+            let (url, server) = serve_resetting(Reset::AsTheAnswerStarts, 1, None);
+            if met_as_einval(&agent().head(url.as_str()).call().unwrap_err()) {
+                einval = einval.saturating_add(1);
+            }
+            assert_eq!(server.join().unwrap(), 1);
+        }
+        if cfg!(target_os = "macos") {
+            assert!(einval > 0, "no reset met as EINVAL");
+        } else {
+            assert_eq!(einval, 0);
+        }
+    }
+
+    // A reset while a large snapshot body goes out (as a gateway that stopped reading a body over
+    // its limit does, #540) reaches the writer as `EINVAL` on macOS when it was between two writes
+    // (about a third of the time), and otherwise, as on Linux, as `EPIPE` or `ECONNRESET`. Either
+    // way it is no answer, after the connection carried part of the body, so the failure may be
+    // about the size (`snapshotter::FailureKind::may_be_size`). `put_idempotent` sends the body
+    // twice and keeps the last error.
+    #[test]
+    fn a_reset_while_a_large_body_goes_out_is_no_answer() {
+        let large = vec![7u8; 16 << 20];
+        for _ in 0..5 {
+            let (url, server) =
+                serve_resetting(Reset::WhileTheBodyGoesOut { after: 1 << 20 }, 2, None);
+            let put = put_idempotent(&format!("{url}/snapshot/7"), "i1", &large, &|| false);
+            let Err(Error::PutUnknown {
+                last: Attempt::Transport(e),
+                ..
+            }) = put
+            else {
+                panic!("not an unknown outcome");
+            };
+            assert!(!met_as_einval(&e) || cfg!(target_os = "macos"), "{e}");
+            assert_eq!(server.join().unwrap(), 2);
+        }
+    }
+
+    // A read whose connection is reset as its answer starts is sent again on a new connection,
+    // within the budget, whatever error reports the reset: on macOS it is usually `EINVAL`
+    // (`a_reset_as_the_answer_starts_is_met_as_einval_on_macos_only`), which failed the attach
+    // before #542.
+    #[test]
+    fn a_read_reset_as_its_answer_starts_is_sent_again_on_a_new_connection() {
+        let (url, server) = serve_resetting(
+            Reset::AsTheAnswerStarts,
+            3,
+            Some(answer("200 OK\r\nstream-incarnation: i1")),
+        );
+        let head_ok = head(&url, &|| false).unwrap();
+        assert_eq!(head_ok.incarnation.as_deref(), Some("i1"));
+        assert_eq!(server.join().unwrap(), 4);
+        let (url, server) = serve_resetting(
+            Reset::AsTheAnswerStarts,
+            3,
+            Some(answer_with_body("200 OK\r\nstream-next-offset: 7", "abc")),
+        );
+        let (bytes, next) = read_from(&url, "i1", "4").unwrap();
+        assert_eq!((&bytes[..], next.as_str()), (&b"abc"[..], "7"));
+        assert_eq!(server.join().unwrap(), 4);
     }
 
     /// A server whose connections answer every request (200 ms later, so that two requests sent at

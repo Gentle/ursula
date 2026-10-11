@@ -52,6 +52,8 @@ use ursula_runtime::BootstrapStreamRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdWriteAdmission;
+#[cfg(not(madsim))]
+use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::ExternalPayloadRef;
@@ -1750,13 +1752,16 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     shutdown_all(&engines).await;
 }
 
-/// A write whose leadership the engine checks itself before it hands the
-/// write to OpenRaft.
+/// A write that the engine hands to OpenRaft on a leader: after its own
+/// leadership check, but for an external create, which it hands straight to
+/// `client_write`.
 #[cfg(not(madsim))]
 #[derive(Debug, Clone, Copy)]
-enum LeaderCheckedWrite {
+enum WriteToOpenRaft {
     /// An inline create, with cold admission on.
     Create,
+    /// An external create, which the engine does not check first.
+    CreateExternal,
     Append,
     /// Two appends, which a leader hands to `client_write_many` together.
     AppendBatch,
@@ -1765,9 +1770,10 @@ enum LeaderCheckedWrite {
 }
 
 #[cfg(not(madsim))]
-impl LeaderCheckedWrite {
-    const ALL: [Self; 5] = [
+impl WriteToOpenRaft {
+    const ALL: [Self; 6] = [
         Self::Create,
+        Self::CreateExternal,
         Self::Append,
         Self::AppendBatch,
         Self::Close,
@@ -1778,7 +1784,11 @@ impl LeaderCheckedWrite {
     fn entries(self) -> u64 {
         match self {
             Self::AppendBatch => 2,
-            Self::Create | Self::Append | Self::Close | Self::AppendExternal => 1,
+            Self::Create
+            | Self::CreateExternal
+            | Self::Append
+            | Self::Close
+            | Self::AppendExternal => 1,
         }
     }
 
@@ -1802,6 +1812,23 @@ impl LeaderCheckedWrite {
                         create_req(bsid("created-on-a-deposed-leader")),
                         placement(),
                         admission,
+                    )
+                    .await
+                    .map(drop),
+            ],
+            Self::CreateExternal => vec![
+                engine
+                    .create_stream_external(
+                        CreateStreamExternalRequest::from_create_request(
+                            create_req(bsid("created-external-on-a-deposed-leader")),
+                            ExternalPayloadRef {
+                                s3_path: "external/staged-before-the-step-down".to_owned(),
+                                payload_len: 3,
+                                object_size: 3,
+                            },
+                            Vec::new(),
+                        ),
+                        placement(),
                     )
                     .await
                     .map(drop),
@@ -1861,26 +1888,23 @@ impl LeaderCheckedWrite {
 }
 
 /// A write the engine handed to OpenRaft is never refused before proposal,
-/// even by a node that lost leadership since. Each write below passes the
-/// engine's own leadership check on a leader cut off from its followers. The
-/// leader appends the write's entries but cannot commit them. The followers
+/// even by a node that lost leadership since. Each write below reaches
+/// OpenRaft on a leader cut off from its followers, all but the external
+/// create after the engine's own leadership check. The leader appends the
+/// write's entries but cannot commit them. The followers
 /// elect a new leader, and once the partition heals, the new leader's log
 /// replaces the entries and OpenRaft answers the write with a forward to it.
 /// Had a follower stored an entry first, the new leader could have committed
 /// it instead, and the deposed node cannot tell the two apart. That node's
 /// own leadership check now refuses before proposal, so running the check
 /// again after the hand-off, or reporting OpenRaft's forward as raised
-/// before proposal, would mark a write that may have committed. Of the
-/// engine's errors, the HTTP layer marks as applying nothing
-/// (`PreProposalRefusal`) exactly those that
-/// [`GroupEngineError::is_forward_before_proposal`] or
-/// [`GroupEngineError::is_backpressure`] accept, so no answer here may be
-/// either.
+/// before proposal, would mark a write that may have committed. The HTTP
+/// layer marks as applying nothing exactly the engine's errors that
+/// [`GroupEngineError::refused_before_proposal`] reports, so no answer here
+/// may report one.
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_down() {
-    use openraft::rt::WatchReceiver;
-
     let policy = InProcessRaftNetworkPolicy::default();
     let (_registry, mut engines, mut leader_id, _wal_roots) =
         build_three_node_cluster("handed-to-openraft", Some(policy.clone())).await;
@@ -1894,7 +1918,7 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
     let stream_id = bsid("handed-to-openraft");
     create_stream_via_raft(&engines[index(leader_id)], stream_id.clone()).await;
 
-    for write in LeaderCheckedWrite::ALL {
+    for write in WriteToOpenRaft::ALL {
         for raft in &rafts {
             raft.wait(Some(Duration::from_secs(10)))
                 .current_leader(leader_id, "every node follows the leader")
@@ -1903,9 +1927,24 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
         }
         let followers: Vec<u64> = (1..=3).filter(|node_id| *node_id != leader_id).collect();
         let leader = &rafts[index(leader_id)];
-        let appended = leader
-            .metrics()
-            .borrow_watched()
+        // The leader's log once it has applied all of it, the blank entry a
+        // new leader appends included: metrics published before then can lag
+        // the log, and the wait below would then end before the write is
+        // appended.
+        let settled = leader
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    metrics.current_leader == Some(leader_id)
+                        && metrics.last_log_index.is_some()
+                        && metrics.last_applied.as_ref().map(|applied| applied.index())
+                            == metrics.last_log_index
+                },
+                "the leader applied its whole log",
+            )
+            .await
+            .expect("the leader applied its whole log");
+        let appended = settled
             .last_log_index
             .expect("the leader holds entries")
             .checked_add(write.entries());
@@ -1951,8 +1990,11 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
             let Err(error) = outcome else {
                 panic!("{write:?}: an entry the new leader replaced was applied");
             };
-            assert!(!error.is_forward_before_proposal(), "{write:?}: {error:?}");
-            assert!(!error.is_backpressure(), "{write:?}: {error:?}");
+            assert_eq!(
+                error.refused_before_proposal(),
+                None,
+                "{write:?}: {error:?}"
+            );
             assert_eq!(
                 error.leader_hint().and_then(|hint| hint.node_id),
                 Some(new_leader),

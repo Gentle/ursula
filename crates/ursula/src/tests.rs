@@ -6835,6 +6835,25 @@ mod leadership_shed {
             PeerParticipation::new(1, &self.peers, peer_client())
         }
 
+        /// Node 1's participation when its leadership-shed requests to node
+        /// 2 never get an answer, while Raft still reaches node 2. Each
+        /// request gives up after 500 ms. The requests go unanswered as long
+        /// as the returned listener lives.
+        async fn participation_with_node_2_silent(
+            &self,
+        ) -> (PeerParticipation, tokio::net::TcpListener) {
+            let (silent_2, listener) = silent_url().await;
+            let participation = PeerParticipation::new(
+                1,
+                &[self.peers[0].clone(), (2, silent_2), self.peers[2].clone()],
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()
+                    .expect("peer client"),
+            );
+            (participation, listener)
+        }
+
         /// Each group's leader, as node 1 sees it.
         fn leaders(&self) -> BTreeMap<u32, Option<u64>> {
             self.node_1()
@@ -7025,19 +7044,7 @@ mod leadership_shed {
             .node(3)
             .registry
             .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
-        let (silent_2, _silent_2) = silent_url().await;
-        let participation = PeerParticipation::new(
-            1,
-            &[
-                cluster.peers[0].clone(),
-                (2, silent_2),
-                cluster.peers[2].clone(),
-            ],
-            reqwest::Client::builder()
-                .timeout(Duration::from_millis(500))
-                .build()
-                .expect("peer client"),
-        );
+        let (participation, _silent_2) = cluster.participation_with_node_2_silent().await;
         crate::bootstrap::spawn_snapshot_driver(
             &node_1.runtime,
             &node_1.registry,
@@ -7572,19 +7579,20 @@ mod leadership_shed {
             .append(AppendRequest::from_bytes(stream, vec![7; 8 * 1024]))
             .await
             .expect("append");
-        // Both peers drain, so neither may campaign.
-        for node_id in [2, 3] {
-            cluster
-                .node(node_id)
-                .registry
-                .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
-        }
+        // Node 3 drains, so it may not campaign. Node 2 may campaign, but
+        // node 1's questions to it get no answer, so the cold-health gate,
+        // which asks over a healthy path, must not hand it a leadership.
+        cluster
+            .node(3)
+            .registry
+            .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+        let (participation, _silent_2) = cluster.participation_with_node_2_silent().await;
         // One tick over the high watermark sheds, and the gate ticks every
         // 4 s.
         crate::bootstrap::spawn_cold_health_gate(
             &node_1.runtime,
             &node_1.registry,
-            &cluster.participation(),
+            &participation,
             &ursula_config::ColdHealthConfig {
                 interval: ursula_config::HumanDuration::sec(4),
                 unhealthy_ticks: 1,
@@ -7598,7 +7606,9 @@ mod leadership_shed {
             .await;
         cluster.assert_node_1_hands_nothing_off().await;
         // Once node 3 may campaign, the next step hands it four leaderships,
-        // the hottest group among them.
+        // the hottest group among them, and node 2 none. A gate that also
+        // tried a peer that did not answer would hand the hottest group to
+        // node 2, the lower id of two peers that lead nothing.
         cluster
             .node(3)
             .registry
@@ -7615,6 +7625,11 @@ mod leadership_shed {
         let leaders = cluster.leaders();
         assert_eq!(leaders[&HOT_GROUP], Some(3), "{leaders:?}");
         assert_eq!(cluster.led_by(3), PER_TICK, "{leaders:?}");
+        assert_eq!(
+            cluster.led_by(2),
+            0,
+            "node 2 did not answer whether it may campaign: {leaders:?}"
+        );
         assert_eq!(
             cluster.led_by(1),
             usize::try_from(GROUPS)

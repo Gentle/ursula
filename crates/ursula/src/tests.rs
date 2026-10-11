@@ -17,6 +17,7 @@ use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use serde_json::json;
 use tower::ServiceExt;
+use ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER;
 use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftLogProgressSnapshot;
@@ -5725,6 +5726,8 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
     .await;
     assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(header_str(&write, NOT_APPLIED_HEADER), "WalDiskPressure");
+    // Only a gateway vouches for the marker.
+    assert!(!write.headers().contains_key(NOT_APPLIED_CHECKED_HEADER));
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)
@@ -5826,6 +5829,8 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
             .contains_key(axum::http::header::RETRY_AFTER)
     );
     assert_eq!(header_str(&write, NOT_APPLIED_HEADER), "RaftLogPressure");
+    // Only a gateway vouches for the marker.
+    assert!(!write.headers().contains_key(NOT_APPLIED_CHECKED_HEADER));
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)

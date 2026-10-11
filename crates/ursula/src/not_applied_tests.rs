@@ -2,8 +2,9 @@
 //! before a request reaches a handler, and each marked refusal applied
 //! nothing. The refusals left unmarked on purpose are pinned here, and so is
 //! the rule that a node never sets the gateway's vouch,
-//! `x-ursula-not-applied-checked`. The pressure refusals are pinned with
-//! their tests in `tests.rs`.
+//! `x-ursula-not-applied-checked`, which [`send`] checks on every response.
+//! The pressure refusals are pinned with their tests in `tests.rs`, which
+//! check the vouch too.
 
 use axum::Router;
 use axum::body::Body;
@@ -215,6 +216,8 @@ fn node_with_body_budget(bytes: u64) -> Router {
     )
 }
 
+/// Sends one request to `app`. Every response a test here gets passes
+/// through this helper, and none may carry the gateway's vouch.
 async fn send(
     app: &Router,
     method: &str,
@@ -226,10 +229,17 @@ async fn send(
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
-    app.clone()
+    let response = app
+        .clone()
         .oneshot(request.body(Body::from(body)).expect("request"))
         .await
-        .expect("response")
+        .expect("response");
+    assert!(
+        !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+        "{method} {uri} answered {}: a node never sets the vouch",
+        response.status()
+    );
+    response
 }
 
 async fn create(app: &Router) {
@@ -354,10 +364,6 @@ async fn an_answer_that_can_follow_a_proposal_carries_no_marker() {
         assert_eq!(appended.status(), status, "{case}");
         assert_eq!(location(&appended), redirect.as_deref(), "{case}");
         assert_eq!(not_applied(&appended), None, "{case}");
-        assert!(
-            !appended.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
-            "{case}"
-        );
         // The append did commit.
         assert_eq!(stream_content(&app).await, "abc", "{case}");
     }
@@ -422,16 +428,34 @@ async fn runtime_refusals_before_proposal_stay_unmarked() {
 /// `x-ursula-not-applied-checked` itself would have its marker trusted after
 /// redirects that a gateway older than 0.7.3, or a client's HTTP library,
 /// follows without checking the redirect.
+///
+/// [`send`] checks every response in this module for the vouch, among them
+/// the runtime refusals and the answers that can follow a proposal above.
+/// This test adds a plain create, append and `404`, and the two admission
+/// refusals a node with a small body budget makes. The `WalDiskPressure` and
+/// `RaftLogPressure` tests in `tests.rs` check their refusals.
 #[tokio::test]
 async fn a_node_never_sets_the_vouch() {
     let app = node_with_body_budget(4);
     let oversized = MAX_HTTP_BODY_BYTES.saturating_add(1).to_string();
-    let responses = [
-        ("create", send(&app, "PUT", STREAM, &[TEXT], "").await),
-        ("append", send(&app, "POST", STREAM, &[TEXT], "abc").await),
+    let cases = [
+        (
+            "create",
+            send(&app, "PUT", STREAM, &[TEXT], "").await,
+            StatusCode::CREATED,
+            None,
+        ),
+        (
+            "append",
+            send(&app, "POST", STREAM, &[TEXT], "abc").await,
+            StatusCode::NO_CONTENT,
+            None,
+        ),
         (
             "budget refusal",
             send(&app, "POST", STREAM, &[TEXT], "abcde").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("IngressBodyBytesLimitReached"),
         ),
         (
             "size refusal",
@@ -443,22 +467,20 @@ async fn a_node_never_sets_the_vouch() {
                 "abc",
             )
             .await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Some("RequestBodyTooLarge"),
         ),
         (
             "missing stream",
             send(&app, "GET", "/benchcmp/missing?offset=-1", &[], "").await,
+            StatusCode::NOT_FOUND,
+            None,
         ),
     ];
 
-    let mut marked = 0;
-    for (case, response) in &responses {
-        if not_applied(response).is_some() {
-            marked += 1;
-        }
-        assert!(
-            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
-            "{case}"
-        );
+    // Each request got the answer it stands for.
+    for (case, response, status, marker) in &cases {
+        assert_eq!(response.status(), *status, "{case}");
+        assert_eq!(not_applied(response), *marker, "{case}");
     }
-    assert_eq!(marked, 2, "both refusals carry the marker");
 }

@@ -601,8 +601,10 @@ pub struct LeadershipBalanceConfig {
     pub max_per_tick: usize,
     /// How long the leadership balancer and the leadership health gates wait
     /// for a peer's leadership-shed state. A peer that does not answer in
-    /// time is treated as unable to campaign, except by the cluster-egress
-    /// gate, which leaves it to the Raft handoff check. Must be non-zero.
+    /// time is treated as unable to campaign, except that the cluster-egress
+    /// gate may give it a leadership's first handoff in a shed, on a tick
+    /// when no peer answered that it may not campaign, and leaves that
+    /// handoff to the Raft handoff check. Must be non-zero.
     pub peer_timeout: HumanDuration,
 }
 

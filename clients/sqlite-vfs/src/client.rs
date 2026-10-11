@@ -183,16 +183,30 @@ pub(crate) enum Proof {
 }
 
 impl Proof {
-    /// The refusal that an answer with `status` and `body`, proven this way, stands for: a 401, 402
-    /// or 403 keeps its own kind, a vouched marker names any other (`NotApplied`), and a 429
-    /// without one is rate limiting.
+    /// The refusal that an answer with `status` and `body`, proven this way, stands for: a 401,
+    /// 402, 403 or 429 keeps its own kind, marked or not, and a vouched marker names any other
+    /// (`NotApplied`, with the marker's token). A kind of its own carries the layer's explanation:
+    /// its body, or the marker's token when the body is empty (Ursula's gateway answers its
+    /// refusals without a body).
     pub(crate) fn refusal(self, status: u16, body: String) -> WriteRefusal {
-        match (status, self) {
-            (401, _) => WriteRefusal::Unauthorized { body },
-            (402, _) => WriteRefusal::PaymentRequired { body },
-            (403, _) => WriteRefusal::Forbidden { body },
-            (_, Proof::Marked(reason)) => WriteRefusal::NotApplied { status, reason },
-            (_, Proof::Status) => WriteRefusal::RateLimited { body },
+        let token = match self {
+            Proof::Marked(token) => token,
+            Proof::Status => String::new(),
+        };
+        let explained = if body.trim().is_empty() {
+            token.clone()
+        } else {
+            body
+        };
+        match status {
+            401 => WriteRefusal::Unauthorized { body: explained },
+            402 => WriteRefusal::PaymentRequired { body: explained },
+            403 => WriteRefusal::Forbidden { body: explained },
+            429 => WriteRefusal::RateLimited { body: explained },
+            _ => WriteRefusal::NotApplied {
+                status,
+                reason: token,
+            },
         }
     }
 }
@@ -222,15 +236,20 @@ pub(crate) fn applied_nothing<B>(r: &ureq::http::Response<B>) -> Option<Proof> {
     matches!(status.as_u16(), 401 | 402 | 429).then_some(Proof::Status)
 }
 
+/// The refusal a 402 stands for (`Proof::refusal`): its status proves that nothing was applied,
+/// and a vouched marker gives the reason when the body is empty.
+fn payment_refusal(r: &mut ureq::http::Response<ureq::Body>) -> WriteRefusal {
+    let proof = applied_nothing(r).unwrap_or(Proof::Status);
+    proof.refusal(402, body_text(r))
+}
+
 /// The error of request `op` to `url` that a layer in front of the stream refused (a refused
 /// token, a denial, or a 402), never a fence; `None` for any other answer.
 fn refusal(op: &'static str, url: &str, r: &mut ureq::http::Response<ureq::Body>) -> Option<Error> {
     let status = r.status().as_u16();
     match refused(r)? {
         Refused::Token | Refused::Denied => Some(unauthorized(op, url, status)),
-        Refused::PaymentRequired => Some(refused_request(op, url, WriteRefusal::PaymentRequired {
-            body: body_text(r),
-        })),
+        Refused::PaymentRequired => Some(refused_request(op, url, payment_refusal(r))),
         Refused::Fenced { .. } => None,
     }
 }
@@ -789,9 +808,7 @@ pub(crate) fn put_idempotent(
                 }
                 (Some(Refused::Denied), status) => return Err(unauthorized("put", url, status)),
                 (Some(Refused::PaymentRequired), _) => {
-                    return Err(refused_request("put", url, WriteRefusal::PaymentRequired {
-                        body: body_text(&mut r),
-                    }));
+                    return Err(refused_request("put", url, payment_refusal(&mut r)));
                 }
                 (_, status) if status < 500 => return Ok((status, r)),
                 (_, status) => Attempt::Status {
@@ -1275,7 +1292,7 @@ mod tests {
             ),
             answer("429 Too Many Requests\r\nretry-after: 0"),
             answer_with_body(&format!("429 Too Many Requests\r\n{LAST}"), "slow down"),
-            // A marked 429 is named by its marker.
+            // A marked 429 stays rate limiting, with the marker's token for the body it lacks.
             marked("429 Too Many Requests", "TenantRateLimited", LAST),
             // A marked final answer: refused at once. Unmarked: rejected (poisons).
             answer(&format!(
@@ -1303,7 +1320,7 @@ mod tests {
         let marked_429 = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
             &marked_429,
-            Append::Refused(WriteRefusal::NotApplied { status: 429, reason }) if reason == "TenantRateLimited"
+            Append::Refused(WriteRefusal::RateLimited { body }) if body == "TenantRateLimited"
         ));
         let too_large = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
@@ -1329,6 +1346,94 @@ mod tests {
             Append::Refused(WriteRefusal::NotApplied { status: 503, reason }) if *reason == "x".repeat(256)
         ));
         assert_eq!(server.join().unwrap().len(), 12);
+    }
+
+    // A 401, 402, 403 or 429 keeps its own kind, marked or not, with the layer's explanation, or
+    // the marker's token when the answer has no body. Only a 401, 402 or 429 proves anything by its
+    // status: a 502 or a 504 with only the vouch is an unknown outcome, and a 404 with only the
+    // marker a rejection. A snapshot publish decides no producer sequence, so a vouched 413 stays
+    // its status there, and a vouched 402 without a body is refused with the marker's token.
+    #[test]
+    fn refusals_keep_their_kind_and_no_other_status_proves_anything() {
+        let (url, server) = serve(vec![
+            answer(&format!(
+                "401 Unauthorized\r\n{}\r\n{LAST}",
+                vouched("InvalidCredential")
+            )),
+            answer_with_body(
+                &format!("402 Payment Required\r\n{}", vouched("QuotaExhausted")),
+                "quota",
+            ),
+            answer(&format!(
+                "402 Payment Required\r\n{}",
+                vouched("QuotaExhausted")
+            )),
+            answer(&format!("403 Forbidden\r\n{}", vouched("Forbidden"))),
+            answer(&format!(
+                "429 Too Many Requests\r\n{}\r\n{LAST}",
+                vouched("TenantRateLimited")
+            )),
+            answer(&format!("502 Bad Gateway\r\n{VOUCH}\r\n{LAST}")),
+            answer(&format!("504 Gateway Timeout\r\n{VOUCH}\r\n{LAST}")),
+            answer(&format!("404 Not Found\r\n{}", marker("NotFound"))),
+            answer(&format!(
+                "413 Payload Too Large\r\n{}",
+                vouched("RequestBodyTooLarge")
+            )),
+            answer(&format!(
+                "402 Payment Required\r\n{}",
+                vouched("QuotaExhausted")
+            )),
+        ]);
+        let refused = |expected: WriteRefusal| {
+            let outcome = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(
+                matches!(&outcome, Append::Refused(refusal) if *refusal == expected),
+                "{expected:?}"
+            );
+        };
+        refused(WriteRefusal::Unauthorized {
+            body: "InvalidCredential".into(),
+        });
+        refused(WriteRefusal::PaymentRequired {
+            body: "quota".into(),
+        });
+        refused(WriteRefusal::PaymentRequired {
+            body: "QuotaExhausted".into(),
+        });
+        refused(WriteRefusal::Forbidden {
+            body: "Forbidden".into(),
+        });
+        refused(WriteRefusal::RateLimited {
+            body: "TenantRateLimited".into(),
+        });
+        for status in [502, 504] {
+            let unknown = append(&url, "i1", "p", b"x", 1, 1);
+            assert!(
+                matches!(
+                    unknown,
+                    Append::Failed(Error::AppendUnknown {
+                        attempts: 1,
+                        last: Attempt::Status { status: s, .. }
+                    }) if s == status
+                ),
+                "{status}"
+            );
+        }
+        let rejected = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(
+            rejected,
+            Append::Failed(Error::AppendRejected { status: 404, .. })
+        ));
+        let (status, _) = put_idempotent(&url, "i1", b"x", &|| false).unwrap();
+        assert_eq!(status, 413);
+        let put = put_idempotent(&url, "i1", b"x", &|| false).err().unwrap();
+        assert!(matches!(put, Error::Refused {
+            op: "put",
+            refusal: WriteRefusal::PaymentRequired { ref body },
+            ..
+        } if body == "QuotaExhausted"));
+        assert_eq!(server.join().unwrap().len(), 10);
     }
 
     // One attempt whose outcome is unknown (no answer, an unmarked 5xx) and the append may be in

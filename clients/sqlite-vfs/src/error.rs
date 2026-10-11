@@ -312,7 +312,8 @@ pub(crate) enum Attempt {
 
 /// Why a write was refused before it reached the stream, so that the stream applied nothing of it
 /// (design doc §2): the write fails alone and never poisons a database (`Db::refuse`). A body is
-/// the refusing layer's explanation, as it sent it (cut short: `client::body_text`).
+/// the refusing layer's explanation: its response body (cut short: `client::body_text`), or the
+/// token of a vouched marker when the body is empty (`client::Proof::refusal`).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum WriteRefusal {
     /// 402 Payment Required: a layer in front of the stream (an authorizer, a quota or billing
@@ -333,13 +334,13 @@ pub(crate) enum WriteRefusal {
     /// `client::append`).
     #[error("403{}: an authorizer denied it", with_body(.body))]
     Forbidden { body: String },
-    /// 429 until the retry budget ran out, without a vouched marker (`NotApplied` otherwise).
+    /// 429 until the retry budget ran out, marked or not.
     #[error("429{}: rate limited until the retry budget ran out", with_body(.body))]
     RateLimited { body: String },
-    /// An answer marked `x-ursula-not-applied` (the server's ingress admission, a gateway or a
+    /// A refusal marked `x-ursula-not-applied` (the server's ingress admission, a gateway or a
     /// proxy refusing it before passing it on) and vouched for by a gateway
     /// (`x-ursula-not-applied-checked`, see `client::applied_nothing`): a final one, or the last
-    /// one when the retry budget ran out. A marked 401, 402 or 403 keeps its own kind. `reason` is
+    /// one when the retry budget ran out. A 401, 402, 403 or 429 keeps its own kind. `reason` is
     /// the marker's token (`RaftLogPressure`, say), empty when it has none.
     #[error("{status} (not applied{})", with_token(.reason))]
     NotApplied { status: u16, reason: String },
@@ -357,8 +358,9 @@ impl WriteRefusal {
         }
     }
 
-    /// Why, as `ursula_status` reports it (`refused_reason`): the marker's token, or the layer's
-    /// explanation, trimmed; `None` when it sent none.
+    /// Why, as `ursula_status` reports it (`refused_reason`): the layer's explanation (its body, or
+    /// the marker's token when the body is empty), and the marker's token for `NotApplied`,
+    /// trimmed; `None` when it sent neither.
     pub(crate) fn reason(&self) -> Option<&str> {
         let reason = match self {
             WriteRefusal::PaymentRequired { body }

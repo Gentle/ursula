@@ -73,7 +73,7 @@ Any other response proves nothing, including a `403`, `413` or `503` without bot
 
 `x-ursula-not-applied`, the marker, answers a request that was refused before anything of it was proposed, so nothing of it can apply later. Its value is a short token that names the refusal, such as `RaftLogPressure`. Log the token, but rely only on the presence of the header. `x-ursula-not-applied-checked: 1`, the vouch, comes only from a gateway at 0.7.3 or newer, which sets it on every response it returns after it applied the redirect rule below. Nodes never set the vouch, so a client that talks to the nodes directly ignores the marker.
 
-The three statuses count without the headers. A layer in front of the nodes, such as the gateway's access control and tenant limits, answers them before it forwards a request. The server never answers `401` or `402`, and answers `429` only to a new producer on a stream that has no room for one. That refusal applies nothing, and a replay of a write that did commit would be deduplicated instead.
+The three statuses count without the headers. A layer in front of the nodes, such as the gateway's access control and tenant limits, answers them before it forwards a request. The server never answers `401` or `402`, and answers `429` only to a new producer on a stream that has no room for one. That refusal applies nothing. Within the same attempt, a replay of a write that did commit, such as the one a gateway sends when it follows a redirect, would be deduplicated instead.
 
 The server sets the marker on every refusal of its write admission, which runs before a request reaches the stream:
 

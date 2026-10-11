@@ -27,8 +27,9 @@
 ///
 /// - its status is `401`, `402` or `429`, which a layer in front of the nodes
 ///   answers before it forwards a request, and which the state machine
-///   answers when a stream has no room for a new producer (a replay of a
-///   write that did commit is deduplicated instead), or
+///   answers when a stream has no room for a new producer (within the same
+///   attempt, a replay of a write that did commit is deduplicated instead),
+///   or
 /// - it carries both this header and [`NOT_APPLIED_CHECKED_HEADER`].
 ///
 /// Any other response proves nothing, including a `403`, `413` or `503`

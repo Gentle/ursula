@@ -9,6 +9,7 @@ use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
+use crate::bootstrap::health_gate::ShedCandidate;
 use crate::bootstrap::health_gate::TickHealth;
 use crate::bootstrap::health_gate::plan_shed_handoffs;
 
@@ -183,14 +184,15 @@ pub fn spawn_egress_gate(
                     registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
                     // A node that cannot reach a quorum cannot replicate, so its
                     // leaderships stall where they are: hand them all off now.
-                    let handoffs = plan_shed_handoffs(
+                    let plan = plan_shed_handoffs(
                         &snaps,
                         node_id,
+                        ShedCandidate::every_group_led_by(&snaps, node_id),
+                        &[],
                         usize::MAX,
-                        |_| true,
                         |group, target| registry.check_handoff(group, target).is_ok(),
                     );
-                    for handoff in handoffs {
+                    for handoff in plan.handoffs {
                         if let Err(err) = registry
                             .transfer_leader(RaftGroupId(handoff.group_id), handoff.target)
                             .await

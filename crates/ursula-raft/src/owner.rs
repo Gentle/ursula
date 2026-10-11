@@ -114,6 +114,17 @@ impl OwnerRaftHandle {
         self.handoff_ack_window
     }
 
+    /// How long after this leader submitted a leadership transfer it may
+    /// still lead at the transfer's vote: the transfer deadline, after which
+    /// it abandons the transfer and steps down
+    /// ([`Self::abandon_stalled_transfer`]), and one minimum election timeout
+    /// for a refused step-down to be retried. A node that still leads the
+    /// group after that long knows the transfer did not move its leadership.
+    pub fn handoff_settle_time(&self) -> Duration {
+        self.transfer_deadline
+            .saturating_add(self.handoff_ack_window)
+    }
+
     /// Abandons the leadership transfer to `target` this leader submitted at
     /// `vote` if it still leads at `vote` once the transfer deadline passed.
     ///

@@ -236,8 +236,8 @@ impl Drop for StoreHealthGate {
 /// store within `config.probe_timeout`, and reads the node's failed and
 /// successful cold-flush writes. After `config.unhealthy_ticks` bad ticks
 /// with no good tick between them the node stops campaigning and hands its
-/// leaderships off a few per tick. After `config.heal_ticks` good ticks in a
-/// row it may lead again.
+/// leaderships off a few per tick, hottest first. After `config.heal_ticks`
+/// good ticks in a row it may lead again.
 pub(crate) fn spawn_store_health_gate(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
@@ -303,7 +303,9 @@ pub(crate) fn spawn_store_health_gate(
                 }
                 HealthTransition::Hold => {}
             }
-            shed.step().await;
+            if shed.is_draining() {
+                shed.step(&snap.per_group_cold_hot_bytes).await;
+            }
             tokio::time::sleep(config.interval.saturating_sub(tick_started.elapsed())).await;
         }
     });

@@ -20,8 +20,8 @@ use crate::bootstrap::health_gate::TickHealth;
 ///    and writes will reactively backpressure at the cliff.
 ///
 /// Either condition sustained for `unhealthy_ticks` ticks triggers a soft
-/// shed: the node hands off the groups it leads, a few per tick, but it stays
-/// campaign-eligible. Cold-health is often cluster-wide during backlog;
+/// shed: the node hands off the groups it leads, a few per tick and the
+/// hottest first, but it stays campaign-eligible. Cold-health is often cluster-wide during backlog;
 /// disabling elections on every hot peer can freeze leadership movement. The
 /// node heals when error growth stops AND hot_max drops below HOT_LOW for
 /// `heal_ticks` ticks.
@@ -157,7 +157,9 @@ pub fn spawn_cold_health_gate(
                 ColdHealthDecision::Heal => shed.end(),
                 ColdHealthDecision::NoChange => {}
             }
-            shed.step().await;
+            if shed.is_draining() {
+                shed.step(&snap.per_group_cold_hot_bytes).await;
+            }
         }
     });
 }

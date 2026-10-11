@@ -44,6 +44,8 @@ use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
 use ursula_control::ControlCommand;
+#[cfg(not(madsim))]
+use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::BootstrapStreamRequest;
@@ -51,6 +53,8 @@ use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
+#[cfg(not(madsim))]
+use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 #[cfg(not(madsim))]
@@ -1717,6 +1721,231 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
         let error = entry.expect_err("OpenRaft refuses each batch entry on a follower");
         assert!(!error.is_forward_before_proposal(), "{error:?}");
         assert!(names_the_leader(&error), "{error:?}");
+    }
+
+    shutdown_all(&engines).await;
+}
+
+/// A write whose leadership the engine checks itself before it hands the
+/// write to OpenRaft.
+#[cfg(not(madsim))]
+#[derive(Debug, Clone, Copy)]
+enum LeaderCheckedWrite {
+    /// An inline create, with cold admission on.
+    Create,
+    Append,
+    /// Two appends, which a leader hands to `client_write_many` together.
+    AppendBatch,
+    Close,
+    AppendExternal,
+}
+
+#[cfg(not(madsim))]
+impl LeaderCheckedWrite {
+    const ALL: [Self; 5] = [
+        Self::Create,
+        Self::Append,
+        Self::AppendBatch,
+        Self::Close,
+        Self::AppendExternal,
+    ];
+
+    /// The entries the write appends to a leader's log.
+    fn entries(self) -> u64 {
+        match self {
+            Self::AppendBatch => 2,
+            Self::Create | Self::Append | Self::Close | Self::AppendExternal => 1,
+        }
+    }
+
+    /// Runs the write through `engine`'s [`GroupEngine`] entry point and
+    /// returns the outcome of each of its commands.
+    async fn run(
+        self,
+        engine: &mut RaftGroupEngine,
+        stream_id: &ursula_shard::BucketStreamId,
+    ) -> Vec<Result<(), GroupEngineError>> {
+        // Cold admission is on, as `storage.cold.max_hot_size_per_group` is
+        // by default, so the engine checks leadership for the create too.
+        let admission = ColdWriteAdmission {
+            max_hot_bytes_per_group: Some(1 << 20),
+        };
+        let append = || AppendRequest::from_bytes(stream_id.clone(), b"abc".to_vec());
+        match self {
+            Self::Create => vec![
+                engine
+                    .create_stream(
+                        create_req(bsid("created-on-a-deposed-leader")),
+                        placement(),
+                        admission,
+                    )
+                    .await
+                    .map(drop),
+            ],
+            Self::Append => vec![
+                engine
+                    .append(append(), placement(), admission)
+                    .await
+                    .map(drop),
+            ],
+            Self::AppendBatch => engine
+                .append_batch(vec![append(), append()], placement(), admission)
+                .await
+                .into_iter()
+                .map(|outcome| outcome.map(drop))
+                .collect(),
+            Self::Close => vec![
+                engine
+                    .close_stream(
+                        CloseStreamRequest {
+                            stream_id: stream_id.clone(),
+                            stream_seq: None,
+                            producer: None,
+                            now_ms: 0,
+                            if_incarnation: None,
+                        },
+                        placement(),
+                    )
+                    .await
+                    .map(drop),
+            ],
+            Self::AppendExternal => vec![
+                engine
+                    .append_external(
+                        AppendExternalRequest {
+                            stream_id: stream_id.clone(),
+                            content_type: "application/octet-stream".to_owned(),
+                            payload: ExternalPayloadRef {
+                                s3_path: "external/staged-before-the-step-down".to_owned(),
+                                payload_len: 3,
+                                object_size: 3,
+                            },
+                            record_ends: Vec::new(),
+                            close_after: false,
+                            stream_seq: None,
+                            producer: None,
+                            now_ms: 0,
+                            if_incarnation: None,
+                        },
+                        placement(),
+                    )
+                    .await
+                    .map(drop),
+            ],
+        }
+    }
+}
+
+/// A write the engine handed to OpenRaft is never refused before proposal,
+/// even by a node that lost leadership since. Each write below passes the
+/// engine's own leadership check on a leader cut off from its followers. The
+/// leader appends the write's entries but cannot commit them. The followers
+/// elect a new leader, and once the partition heals, the new leader's log
+/// replaces the entries and OpenRaft answers the write with a forward to it.
+/// Had a follower stored an entry first, the new leader could have committed
+/// it instead, and the deposed node cannot tell the two apart. That node's
+/// own leadership check now refuses before proposal, so running the check
+/// again after the hand-off, or reporting OpenRaft's forward as raised
+/// before proposal, would mark a write that may have committed. Of the
+/// engine's errors, the HTTP layer marks as applying nothing
+/// (`PreProposalRefusal`) exactly those that
+/// [`GroupEngineError::is_forward_before_proposal`] or
+/// [`GroupEngineError::is_backpressure`] accept, so no answer here may be
+/// either.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_down() {
+    use openraft::rt::WatchReceiver;
+
+    let policy = InProcessRaftNetworkPolicy::default();
+    let (_registry, mut engines, mut leader_id, _wal_roots) =
+        build_three_node_cluster("handed-to-openraft", Some(policy.clone())).await;
+    let rafts: Vec<_> = engines.iter().map(RaftGroupEngine::raft_handle).collect();
+    let index = |node_id: u64| {
+        usize::try_from(node_id)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .expect("node ids start at 1")
+    };
+    let stream_id = bsid("handed-to-openraft");
+    create_stream_via_raft(&engines[index(leader_id)], stream_id.clone()).await;
+
+    for write in LeaderCheckedWrite::ALL {
+        for raft in &rafts {
+            raft.wait(Some(Duration::from_secs(10)))
+                .current_leader(leader_id, "every node follows the leader")
+                .await
+                .expect("every node follows the leader");
+        }
+        let followers: Vec<u64> = (1..=3).filter(|node_id| *node_id != leader_id).collect();
+        let leader = &rafts[index(leader_id)];
+        let appended = leader
+            .metrics()
+            .borrow_watched()
+            .last_log_index
+            .expect("the leader holds entries")
+            .checked_add(write.entries());
+        for follower in &followers {
+            policy.partition_bidirectional(leader_id, *follower);
+        }
+        let depose = async {
+            leader
+                .wait(Some(Duration::from_secs(5)))
+                .log_index_at_least(appended, "the cut-off leader appends the write")
+                .await
+                .expect("the cut-off leader appends the write");
+            let new_leader = rafts[index(followers[0])]
+                .wait(Some(Duration::from_secs(10)))
+                .metrics(
+                    |metrics| metrics.current_leader.is_some_and(|id| id != leader_id),
+                    "the followers elect a new leader",
+                )
+                .await
+                .expect("the followers elect a new leader")
+                .current_leader
+                .expect("the new leader's id");
+            for follower in &followers {
+                policy.heal_bidirectional(leader_id, *follower);
+            }
+            new_leader
+        };
+        let (outcomes, new_leader) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                write.run(&mut engines[index(leader_id)], &stream_id),
+                depose
+            )
+        })
+        .await
+        .unwrap_or_else(|_elapsed| panic!("{write:?}: the deposed leader never answered"));
+
+        assert_eq!(
+            u64::try_from(outcomes.len()).expect("outcome count fits u64"),
+            write.entries(),
+            "{write:?}"
+        );
+        for outcome in outcomes {
+            let Err(error) = outcome else {
+                panic!("{write:?}: an entry the new leader replaced was applied");
+            };
+            assert!(!error.is_forward_before_proposal(), "{write:?}: {error:?}");
+            assert!(!error.is_backpressure(), "{write:?}: {error:?}");
+            assert_eq!(
+                error.leader_hint().and_then(|hint| hint.node_id),
+                Some(new_leader),
+                "{write:?}: {error:?}"
+            );
+        }
+        // The deposed node now follows, so its own check refuses before
+        // proposal. Running it after the hand-off would mark the write.
+        let checked = engines[index(leader_id)]
+            .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"abc"))
+            .await
+            .expect_err("the deposed node follows the new leader");
+        assert!(
+            checked.is_forward_before_proposal(),
+            "{write:?}: {checked:?}"
+        );
+        leader_id = new_leader;
     }
 
     shutdown_all(&engines).await;

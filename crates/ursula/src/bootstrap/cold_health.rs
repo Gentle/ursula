@@ -139,7 +139,7 @@ pub fn spawn_cold_health_gate(
             hot_low_bytes,
             errors_per_tick_high,
         );
-        let mut shed = LeadershipShed::new(LeadershipShedReason::ColdHealth, node_id);
+        let mut shed = LeadershipShed::new(&registry, LeadershipShedReason::ColdHealth, node_id);
         loop {
             tokio::time::sleep(interval).await;
             let snap = metrics.snapshot();
@@ -152,12 +152,12 @@ pub fn spawn_cold_health_gate(
                     tracing::warn!(
                         "cold-health: node {node_id} cold-impaired ({reason}); yielding leadership"
                     );
-                    shed.begin(&registry);
+                    shed.begin();
                 }
-                ColdHealthDecision::Heal => shed.end(&registry),
+                ColdHealthDecision::Heal => shed.end(),
                 ColdHealthDecision::NoChange => {}
             }
-            shed.step(&registry).await;
+            shed.step().await;
         }
     });
 }

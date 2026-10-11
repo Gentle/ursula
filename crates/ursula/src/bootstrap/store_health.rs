@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
@@ -193,32 +194,69 @@ impl StoreGateConfig {
     }
 }
 
+/// The snapshot-store gate stopped, so nothing judges the store any more.
+#[derive(Debug, thiserror::Error)]
+#[error("the snapshot-store health gate stopped")]
+pub(crate) struct StoreGateStopped;
+
+/// A running snapshot-store gate: its task and the verdict of its latest
+/// tick. Dropping it stops the gate, and a shed of the gate ends with it.
+#[derive(Debug)]
+pub(crate) struct StoreHealthGate {
+    latest_bad: watch::Receiver<bool>,
+    task: JoinHandle<()>,
+}
+
+impl StoreHealthGate {
+    /// Whether the gate's latest tick judged the store unhealthy.
+    pub(crate) fn latest_bad(&mut self) -> Result<bool, StoreGateStopped> {
+        match self.latest_bad.has_changed() {
+            Ok(_) => Ok(*self.latest_bad.borrow_and_update()),
+            Err(_closed) => Err(StoreGateStopped),
+        }
+    }
+
+    /// Waits for the verdict of the gate's next tick.
+    #[cfg(test)]
+    pub(crate) async fn next_verdict(&mut self) -> Result<bool, StoreGateStopped> {
+        match self.latest_bad.changed().await {
+            Ok(()) => Ok(*self.latest_bad.borrow_and_update()),
+            Err(_closed) => Err(StoreGateStopped),
+        }
+    }
+}
+
+impl Drop for StoreHealthGate {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Spawns the snapshot-store gate. Every `config.interval` it probes the
 /// store within `config.probe_timeout`, and reads the node's failed and
 /// successful cold-flush writes. After `config.unhealthy_ticks` bad ticks
 /// with no good tick between them the node stops campaigning and hands its
 /// leaderships off a few per tick. After `config.heal_ticks` good ticks in a
 /// row it may lead again.
-///
-/// Returns whether the latest tick was bad. The snapshot driver holds
-/// routine snapshots back while it is.
 pub(crate) fn spawn_store_health_gate(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     snapshot_store: SharedSnapshotStore,
     node_id: u64,
     config: StoreGateConfig,
-) -> watch::Receiver<bool> {
+) -> StoreHealthGate {
     let metrics = runtime.metrics();
     let registry = registry.clone();
     let (verdicts, latest_bad) = watch::channel(false);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut tracker = StoreHealthTracker::new(
             config.unhealthy_ticks,
             config.heal_ticks,
             config.flush_window_ticks,
         );
-        let mut shed = LeadershipShed::new(LeadershipShedReason::SnapshotDriverS3, node_id);
+        // The shed ends when the task does, however it stops.
+        let mut shed =
+            LeadershipShed::new(&registry, LeadershipShedReason::SnapshotDriverS3, node_id);
         loop {
             let tick_started = Instant::now();
             let probe_answered =
@@ -257,19 +295,19 @@ pub(crate) fn spawn_store_health_gate(
                         flush_window_ticks = config.flush_window_ticks,
                         "snapshot store unhealthy; shedding leadership"
                     );
-                    shed.begin(&registry);
+                    shed.begin();
                 }
                 HealthTransition::Heal => {
                     tracing::info!(node_id, "snapshot store healthy again");
-                    shed.end(&registry);
+                    shed.end();
                 }
                 HealthTransition::Hold => {}
             }
-            shed.step(&registry).await;
+            shed.step().await;
             tokio::time::sleep(config.interval.saturating_sub(tick_started.elapsed())).await;
         }
     });
-    latest_bad
+    StoreHealthGate { latest_bad, task }
 }
 
 #[cfg(test)]
@@ -298,9 +336,11 @@ mod tests {
     use ursula_runtime::SnapshotStoreFuture;
 
     use super::FlushOutcomes;
+    use super::StoreGateConfig;
     use super::StoreHealthSample;
     use super::StoreHealthTracker;
     use super::flush_window_ticks;
+    use super::spawn_store_health_gate;
     use crate::bootstrap::health_gate::HealthTransition;
     use crate::bootstrap::health_gate::TickHealth;
     use crate::bootstrap::snapshot::StoreGateInputs;
@@ -784,5 +824,42 @@ mod tests {
         assert_eq!(drive_with(store, &registry, Some(&s3), 5).await, vec![
             false, false, true, false, false
         ]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_gate_publishes_each_ticks_verdict() {
+        let registry = RaftGroupHandleRegistry::default();
+        let store = Arc::new(ScriptedProbeStore::new(&registry, [1]));
+        let runtime = hosted_runtime();
+        let mut gate = spawn_store_health_gate(
+            &runtime,
+            &registry,
+            store.clone(),
+            1,
+            StoreGateConfig::new(&ursula_config::S3Config::default(), FLUSH_INTERVAL, TICK),
+        );
+        assert!(!gate.latest_bad().unwrap(), "no tick yet");
+        let mut verdicts = Vec::new();
+        for _ in 0..4 {
+            verdicts.push(gate.next_verdict().await.unwrap());
+            assert_eq!(gate.latest_bad().unwrap(), *verdicts.last().unwrap());
+        }
+        assert_eq!(verdicts, vec![false, true, false, false]);
+        assert!(
+            !shedding_for_the_store(&registry),
+            "one bad tick is no shed"
+        );
+
+        // A stopped gate reports that it stopped, and leaves no shed behind.
+        registry.mark_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
+        gate.task.abort();
+        tokio::task::yield_now().await;
+        let mut waited = 0_u32;
+        while gate.latest_bad().is_ok() {
+            assert!(waited < 100, "the gate does not stop");
+            waited = waited.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+        assert!(!shedding_for_the_store(&registry));
     }
 }

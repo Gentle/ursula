@@ -188,8 +188,12 @@ pub(crate) fn plan_shed_handoffs(
 
 /// One health gate's shed of this node: the leadership-shed mark of the
 /// gate's reason, and the leaderships the node still has to hand off.
+///
+/// Dropping it clears the mark, so a gate that stops does not keep the node
+/// out of elections.
 #[derive(Debug)]
 pub(crate) struct LeadershipShed {
+    registry: RaftGroupHandleRegistry,
     reason: LeadershipShedReason,
     node_id: u64,
     /// Groups the node led when the gate shed and has not handed off yet.
@@ -199,8 +203,13 @@ pub(crate) struct LeadershipShed {
 }
 
 impl LeadershipShed {
-    pub(crate) fn new(reason: LeadershipShedReason, node_id: u64) -> Self {
+    pub(crate) fn new(
+        registry: &RaftGroupHandleRegistry,
+        reason: LeadershipShedReason,
+        node_id: u64,
+    ) -> Self {
         Self {
+            registry: registry.clone(),
             reason,
             node_id,
             pending: BTreeSet::new(),
@@ -208,23 +217,24 @@ impl LeadershipShed {
     }
 
     /// Marks the shed and starts handing off the leaderships the node holds.
-    pub(crate) fn begin(&mut self, registry: &RaftGroupHandleRegistry) {
-        registry.mark_leadership_shed(self.reason);
-        self.start(&registry.metrics_snapshot());
+    pub(crate) fn begin(&mut self) {
+        self.registry.mark_leadership_shed(self.reason);
+        self.start(&self.registry.metrics_snapshot());
     }
 
     /// Clears the mark and stops handing off leaderships.
-    pub(crate) fn end(&mut self, registry: &RaftGroupHandleRegistry) {
-        registry.clear_leadership_shed(self.reason);
+    pub(crate) fn end(&mut self) {
+        self.registry.clear_leadership_shed(self.reason);
         self.pending.clear();
     }
 
     /// Hands off this tick's share of the pending leaderships.
-    pub(crate) async fn step(&mut self, registry: &RaftGroupHandleRegistry) {
+    pub(crate) async fn step(&mut self) {
         if self.pending.is_empty() {
             return;
         }
-        let snaps = registry.metrics_snapshot();
+        let snaps = self.registry.metrics_snapshot();
+        let registry = self.registry.clone();
         let handoffs = self.plan(&snaps, |group, target| {
             registry.check_handoff(group, target).is_ok()
         });
@@ -286,6 +296,12 @@ impl LeadershipShed {
     }
 }
 
+impl Drop for LeadershipShed {
+    fn drop(&mut self) {
+        self.registry.clear_leadership_shed(self.reason);
+    }
+}
+
 fn groups_led_by(snaps: &[RaftGroupMetricsSnapshot], node_id: u64) -> BTreeSet<u32> {
     snaps
         .iter()
@@ -304,6 +320,7 @@ mod tests {
     use proptest::proptest;
     use proptest::strategy::Just;
     use ursula_raft::LeadershipShedReason;
+    use ursula_raft::RaftGroupHandleRegistry;
     use ursula_raft::RaftGroupMetricsSnapshot;
 
     use super::CounterGrowth;
@@ -518,7 +535,11 @@ mod tests {
         let groups = 10_u32;
         let mut snaps: Vec<_> = (0..groups).map(|group| snap(group, Some(ME))).collect();
         snaps.push(snap(groups, Some(2)));
-        let mut shed = LeadershipShed::new(LeadershipShedReason::SnapshotDriverS3, ME);
+        let mut shed = LeadershipShed::new(
+            &RaftGroupHandleRegistry::default(),
+            LeadershipShedReason::SnapshotDriverS3,
+            ME,
+        );
         shed.start(&snaps);
 
         let mut ticks = 0_usize;
@@ -548,7 +569,11 @@ mod tests {
     #[test]
     fn drain_retries_ineligible_groups_and_ignores_leaderships_gained_later() {
         let mut snaps = vec![snap(0, Some(ME)), snap(1, Some(ME)), snap(2, Some(2))];
-        let mut shed = LeadershipShed::new(LeadershipShedReason::ColdHealth, ME);
+        let mut shed = LeadershipShed::new(
+            &RaftGroupHandleRegistry::default(),
+            LeadershipShedReason::ColdHealth,
+            ME,
+        );
         shed.start(&snaps);
 
         // No eligible target for group 1 yet: it stays pending. Group 0 goes

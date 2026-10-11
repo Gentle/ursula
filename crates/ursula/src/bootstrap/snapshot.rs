@@ -199,10 +199,10 @@ pub(crate) struct StoreGateInputs<'a> {
 /// Config-driven snapshot driver. Reads parameters from typed config.
 ///
 /// With an external snapshot store it also spawns the store health gate
-/// ([`spawn_store_health_gate`]) on the same interval. Only an external store
-/// is probed: inline snapshots depend on nothing outside the node, so the
-/// inline driver never sheds leadership. A drive interval of 0 turns both
-/// off.
+/// ([`spawn_store_health_gate`]) on the same interval, and owns it: the gate
+/// stops when the driver does. Only an external store is probed: inline
+/// snapshots depend on nothing outside the node, so the inline driver never
+/// sheds leadership. A drive interval of 0 turns both off.
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
@@ -218,7 +218,7 @@ pub fn spawn_snapshot_driver(
         return;
     }
     let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
-    let gate = snapshot_store.map(|store| {
+    let mut gate = snapshot_store.map(|store| {
         let default_s3 = ursula_config::S3Config::default();
         spawn_store_health_gate(
             runtime,
@@ -239,7 +239,19 @@ pub fn spawn_snapshot_driver(
     tokio::spawn(async move {
         loop {
             let snaps = registry.metrics_snapshot();
-            let store_trouble = gate.as_ref().is_some_and(|latest_bad| *latest_bad.borrow());
+            let store_trouble = match gate.as_mut().map(|gate| gate.latest_bad()) {
+                None => false,
+                Some(Ok(latest_bad)) => latest_bad,
+                Some(Err(err)) => {
+                    tracing::error!(
+                        %err,
+                        "snapshot driver: the store is no longer judged; driving routine \
+                         snapshots as if it were healthy"
+                    );
+                    gate = None;
+                    false
+                }
+            };
             let mut pause = interval;
             let lagging = wal_lagging
                 .as_ref()

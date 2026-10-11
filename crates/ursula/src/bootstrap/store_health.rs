@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
+use ursula_runtime::RuntimeMetricsSnapshot;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::s3_operation_budget;
@@ -33,6 +34,18 @@ pub(crate) struct StoreHealthSample {
     pub cold_flush_write_errors: u64,
     /// The node's successful cold-flush writes so far.
     pub cold_flush_uploads: u64,
+}
+
+impl StoreHealthSample {
+    /// The sample of a tick whose probe `probe_answered`, with the node's
+    /// cold-flush counters from `metrics`.
+    pub(crate) fn read(probe_answered: bool, metrics: &RuntimeMetricsSnapshot) -> Self {
+        Self {
+            probe_answered,
+            cold_flush_write_errors: metrics.cold_flush_write_errors,
+            cold_flush_uploads: metrics.cold_flush_uploads,
+        }
+    }
 }
 
 /// The failed and successful cold-flush writes one tick recorded.
@@ -312,11 +325,7 @@ pub(crate) fn spawn_store_health_gate(
                     }
                 };
             let snap = metrics.snapshot();
-            let tick = tracker.evaluate(StoreHealthSample {
-                probe_answered,
-                cold_flush_write_errors: snap.cold_flush_write_errors,
-                cold_flush_uploads: snap.cold_flush_uploads,
-            });
+            let tick = tracker.evaluate(StoreHealthSample::read(probe_answered, &snap));
             verdicts.send_replace(tick.health == TickHealth::Bad);
             match tick.transition {
                 HealthTransition::Shed => {
@@ -350,6 +359,7 @@ pub(crate) fn spawn_store_health_gate(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -364,7 +374,14 @@ mod tests {
     use ursula_raft::LeadershipShedReason;
     use ursula_raft::RaftGroupHandleRegistry;
     use ursula_raft::snapshot_cadence::SnapshotCadence;
+    use ursula_runtime::AppendRequest;
+    use ursula_runtime::ColdStore;
+    use ursula_runtime::ColdStoreFaultEffect;
+    use ursula_runtime::CreateStreamRequest;
+    use ursula_runtime::InMemoryGroupEngineFactory;
+    use ursula_runtime::PlanColdFlushRequest;
     use ursula_runtime::RuntimeConfig;
+    use ursula_runtime::RuntimeError;
     use ursula_runtime::RuntimeThreading;
     use ursula_runtime::ShardRuntime;
     use ursula_runtime::SnapshotKey;
@@ -372,6 +389,7 @@ mod tests {
     use ursula_runtime::SnapshotStore;
     use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
+    use ursula_shard::BucketStreamId;
 
     use super::FlushEvidence;
     use super::FlushOutcomes;
@@ -871,27 +889,136 @@ mod tests {
             .contains(LeadershipShedReason::SnapshotDriverS3.into())
     }
 
+    /// Whether a scripted cold-flush write fails or uploads.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Flush {
+        Fails,
+        Uploads,
+    }
+
+    /// A runtime with one group and a memory cold store on the test's own
+    /// tokio runtime, and a stream it writes to the cold store on demand.
+    #[derive(Debug, Clone)]
+    struct ColdFlusher {
+        runtime: ShardRuntime,
+        cold_store: Arc<ColdStore>,
+        stream: BucketStreamId,
+    }
+
+    impl ColdFlusher {
+        async fn new() -> Self {
+            let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+            let mut config = RuntimeConfig::new(1, 1);
+            config.threading = RuntimeThreading::HostedTokio;
+            let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                config,
+                InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+                Some(cold_store.clone()),
+            )
+            .expect("runtime");
+            let stream = BucketStreamId::new("benchcmp", "store-gate");
+            runtime
+                .create_stream(CreateStreamRequest::new(
+                    stream.clone(),
+                    "application/octet-stream",
+                ))
+                .await
+                .expect("create the stream");
+            Self {
+                runtime,
+                cold_store,
+                stream,
+            }
+        }
+
+        /// Appends a payload and writes it to the cold store through the
+        /// runtime's flush path, with the store refusing the write or not.
+        async fn attempt(&self, flush: Flush) {
+            self.runtime
+                .append(AppendRequest::from_bytes(
+                    self.stream.clone(),
+                    b"payload".to_vec(),
+                ))
+                .await
+                .expect("append");
+            match flush {
+                Flush::Fails => self.cold_store.set_fault_policy(|_| {
+                    Some(ColdStoreFaultEffect::fail("the store refuses writes"))
+                }),
+                Flush::Uploads => self.cold_store.clear_fault_policy(),
+            }
+            let flushed = self
+                .runtime
+                .flush_cold_once(PlanColdFlushRequest {
+                    stream_id: self.stream.clone(),
+                    min_hot_bytes: 1,
+                    max_flush_bytes: 1 << 20,
+                })
+                .await;
+            match flush {
+                Flush::Fails => assert!(
+                    matches!(flushed, Err(RuntimeError::ColdStoreIo { .. })),
+                    "{flushed:?}"
+                ),
+                Flush::Uploads => assert!(matches!(flushed, Ok(Some(_))), "{flushed:?}"),
+            }
+        }
+    }
+
     /// A snapshot store whose health probes follow a script. Each probe
     /// records whether the node was shedding for the snapshot store when the
-    /// probe ran, and publishes how many probes ran.
+    /// probe ran, publishes how many probes ran, attempts the cold-flush
+    /// writes scripted for it on the node's runtime, and then answers.
     #[derive(Debug)]
     struct ScriptedProbeStore {
         registry: RaftGroupHandleRegistry,
+        /// The node's runtime, whose cold-flush counters the gate reads.
+        runtime: ShardRuntime,
+        flusher: Option<ColdFlusher>,
         failing: BTreeSet<usize>,
+        /// How long each probe takes, unless `slow` lists it.
         latency: Duration,
+        slow: BTreeMap<usize, Duration>,
+        flushes: BTreeMap<usize, Vec<Flush>>,
         shedding_at_probe: Mutex<Vec<bool>>,
         probes: watch::Sender<usize>,
     }
 
     impl ScriptedProbeStore {
+        /// Probes of a node without a cold store.
         fn new(
             registry: &RaftGroupHandleRegistry,
             failing: impl IntoIterator<Item = usize>,
         ) -> Self {
+            Self::with_runtime(registry, hosted_runtime(), None, failing)
+        }
+
+        /// Probes of the node `flusher` writes for.
+        fn flushing(
+            registry: &RaftGroupHandleRegistry,
+            flusher: &ColdFlusher,
+            flushes: impl IntoIterator<Item = (usize, Vec<Flush>)>,
+        ) -> Self {
+            let mut store =
+                Self::with_runtime(registry, flusher.runtime.clone(), Some(flusher.clone()), []);
+            store.flushes = flushes.into_iter().collect();
+            store
+        }
+
+        fn with_runtime(
+            registry: &RaftGroupHandleRegistry,
+            runtime: ShardRuntime,
+            flusher: Option<ColdFlusher>,
+            failing: impl IntoIterator<Item = usize>,
+        ) -> Self {
             Self {
                 registry: registry.clone(),
+                runtime,
+                flusher,
                 failing: failing.into_iter().collect(),
                 latency: Duration::ZERO,
+                slow: BTreeMap::new(),
+                flushes: BTreeMap::new(),
                 shedding_at_probe: Mutex::new(Vec::new()),
                 probes: watch::channel(0).0,
             }
@@ -931,8 +1058,16 @@ mod tests {
             };
             self.probes.send_replace(index.saturating_add(1));
             let fails = self.failing.contains(&index);
-            let latency = self.latency;
+            let latency = self.slow.get(&index).copied().unwrap_or(self.latency);
+            let flushes = self.flushes.get(&index).cloned().unwrap_or_default();
             Box::pin(async move {
+                for flush in flushes {
+                    self.flusher
+                        .as_ref()
+                        .expect("a flushing store")
+                        .attempt(flush)
+                        .await;
+                }
                 tokio::time::sleep(latency).await;
                 if fails {
                     Err(SnapshotStoreError::Backend("scripted probe failure".into()))
@@ -954,23 +1089,25 @@ mod tests {
         PeerParticipation::new(1, &[], reqwest::Client::new())
     }
 
-    /// Runs the snapshot driver, with `s3` as `[storage.cold.s3]`, against
-    /// `store` until it has been probed `probes` times.
+    /// Runs the snapshot driver on `store`'s runtime, with `s3` as
+    /// `[storage.cold.s3]` and `cold_flush_interval` as
+    /// `storage.cold.flush_interval`, until it has probed `store` `probes`
+    /// times.
     async fn drive_with(
         store: Arc<ScriptedProbeStore>,
         registry: &RaftGroupHandleRegistry,
         s3: Option<&ursula_config::S3Config>,
+        cold_flush_interval: Duration,
         probes: usize,
     ) -> Vec<bool> {
-        let runtime = hosted_runtime();
         let participation = no_peers();
         crate::bootstrap::snapshot::spawn_snapshot_driver(
-            &runtime,
+            &store.runtime,
             registry,
             Some(store.clone()),
             StoreGateInputs {
                 s3,
-                cold_flush_interval: FLUSH_INTERVAL,
+                cold_flush_interval,
                 participation: &participation,
             },
             5_000,
@@ -995,7 +1132,7 @@ mod tests {
         registry: &RaftGroupHandleRegistry,
         probes: usize,
     ) -> Vec<bool> {
-        drive_with(store, registry, None, probes).await
+        drive_with(store, registry, None, FLUSH_INTERVAL, probes).await
     }
 
     #[tokio::test(start_paused = true)]
@@ -1039,27 +1176,104 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_driver_hands_its_s3_settings_to_the_gate() {
-        // One bad tick sheds and one good tick heals with these settings,
-        // where the defaults ride the failed probe out.
+        // With these settings a probe that answers after 2 s misses its
+        // deadline, one bad tick sheds and one good tick heals. The defaults
+        // would take that probe as answered.
         let s3 = ursula_config::S3Config {
+            probe_timeout: ursula_config::HumanDuration::sec(1),
             unhealthy_ticks: 1,
             heal_ticks: 1,
             ..ursula_config::S3Config::default()
         };
         let registry = RaftGroupHandleRegistry::default();
-        let store = Arc::new(ScriptedProbeStore::new(&registry, [1]));
-        assert_eq!(drive_with(store, &registry, Some(&s3), 5).await, vec![
-            false, false, true, false, false
+        let mut store = ScriptedProbeStore::new(&registry, []);
+        store.slow.insert(1, Duration::from_secs(2));
+        assert_eq!(
+            drive_with(Arc::new(store), &registry, Some(&s3), FLUSH_INTERVAL, 5).await,
+            vec![false, false, true, false, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sample_reads_the_flush_counters_of_a_runtime_snapshot() {
+        let mut metrics = hosted_runtime().metrics().snapshot();
+        metrics.cold_flush_write_errors = 3;
+        metrics.cold_flush_uploads = 5;
+        assert_eq!(
+            StoreHealthSample::read(false, &metrics),
+            StoreHealthSample {
+                probe_answered: false,
+                cold_flush_write_errors: 3,
+                cold_flush_uploads: 5,
+            }
+        );
+        assert!(StoreHealthSample::read(true, &metrics).probe_answered);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_driver_judges_the_runtimes_failed_and_successful_flush_writes() {
+        // Every probe answers. A write the store refuses at the first tick
+        // makes that tick and the two after it bad, so the node sheds, and a
+        // write that succeeds at the fourth tick starts the good ticks that
+        // heal it.
+        let registry = RaftGroupHandleRegistry::default();
+        let flusher = ColdFlusher::new().await;
+        let store = Arc::new(ScriptedProbeStore::flushing(&registry, &flusher, [
+            (1, vec![Flush::Fails]),
+            (4, vec![Flush::Uploads]),
+        ]));
+        assert_eq!(drive(store, &registry, 7).await, vec![
+            false, false, false, false, true, true, false
         ]);
+        let metrics = flusher.runtime.metrics().snapshot();
+        assert_eq!(
+            (metrics.cold_flush_write_errors, metrics.cold_flush_uploads),
+            (1, 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_driver_sizes_the_flush_window_from_its_settings() {
+        // An S3 client that gives up on a write after one 1 s attempt, and a
+        // flush worker that pauses 9 s between passes: a failed write counts
+        // for 10 s, two ticks. So the write the store refuses at the first
+        // tick makes two ticks bad, which sheds with these settings, and the
+        // third tick heals. With the default S3 settings it would count for
+        // eleven ticks, and without the flush worker's pause for one.
+        let s3 = ursula_config::S3Config {
+            timeout: ursula_config::HumanDuration::sec(1),
+            max_retries: 0,
+            unhealthy_ticks: 2,
+            heal_ticks: 1,
+            ..ursula_config::S3Config::default()
+        };
+        let registry = RaftGroupHandleRegistry::default();
+        let flusher = ColdFlusher::new().await;
+        let store = Arc::new(ScriptedProbeStore::flushing(&registry, &flusher, [(
+            1,
+            vec![Flush::Fails],
+        )]));
+        assert_eq!(
+            drive_with(store, &registry, Some(&s3), Duration::from_secs(9), 6).await,
+            vec![false, false, false, true, false, false]
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_gate_publishes_each_ticks_verdict() {
         let registry = RaftGroupHandleRegistry::default();
-        let store = Arc::new(ScriptedProbeStore::new(&registry, [1]));
-        let runtime = hosted_runtime();
+        let flusher = ColdFlusher::new().await;
+        // Tick 1 fails its probe. Tick 3 records a failed write beside a
+        // successful one, which is inconclusive, not bad. Tick 4 records a
+        // failed write and no successful one.
+        let mut store = ScriptedProbeStore::flushing(&registry, &flusher, [
+            (3, vec![Flush::Uploads, Flush::Fails]),
+            (4, vec![Flush::Fails]),
+        ]);
+        store.failing.insert(1);
+        let store = Arc::new(store);
         let mut gate = spawn_store_health_gate(
-            &runtime,
+            &flusher.runtime,
             &registry,
             store.clone(),
             no_peers(),
@@ -1067,17 +1281,18 @@ mod tests {
         );
         assert!(!gate.latest_bad().unwrap(), "no tick yet");
         let mut verdicts = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             verdicts.push(gate.next_verdict().await.unwrap());
             assert_eq!(gate.latest_bad().unwrap(), *verdicts.last().unwrap());
         }
-        assert_eq!(verdicts, vec![false, true, false, false]);
+        assert_eq!(verdicts, vec![false, true, false, false, true]);
         assert!(
             !shedding_for_the_store(&registry),
-            "one bad tick is no shed"
+            "two bad ticks are no shed"
         );
 
-        // A stopped gate reports that it stopped, and leaves no shed behind.
+        // A gate whose task stopped reports that it stopped, and leaves no
+        // shed behind.
         registry.mark_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
         gate.task.abort();
         tokio::task::yield_now().await;
@@ -1088,5 +1303,27 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!shedding_for_the_store(&registry));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_gate_stops_it_and_ends_its_shed() {
+        let registry = RaftGroupHandleRegistry::default();
+        let store = Arc::new(ScriptedProbeStore::new(&registry, []));
+        let mut gate = spawn_store_health_gate(
+            &store.runtime,
+            &registry,
+            store.clone(),
+            no_peers(),
+            StoreGateConfig::new(&ursula_config::S3Config::default(), FLUSH_INTERVAL, TICK),
+        );
+        assert!(!gate.next_verdict().await.unwrap());
+        registry.mark_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
+        drop(gate);
+        let mut waited = 0_u32;
+        while shedding_for_the_store(&registry) {
+            assert!(waited < 100, "the dropped gate keeps running");
+            waited = waited.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
     }
 }

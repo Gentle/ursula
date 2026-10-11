@@ -378,6 +378,8 @@ Every behavior change is listed in the [0.7.0 release notes](/docs/release-notes
 
 0.7.2 upgrades 0.7.0 or 0.7.1 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.7.2 release notes](/docs/release-notes#072).
 
+For a patch upgrade, upgrade gateways before nodes, and roll back nodes before gateways, so that clients keep the benefit of the `x-ursula-not-applied` marker throughout. The order is a recommendation, not a safety requirement. A client trusts the marker only together with the vouch that gateways from 0.7.3 on add, so whatever order a `helm upgrade` or `helm rollback` replaces gateways and voters in, no client counts a committed write as never applied. See [refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing).
+
 To install 0.7:
 
 1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs. With cold storage off and S3 snapshots, also use a new `snapshotStore.prefix`. With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again.

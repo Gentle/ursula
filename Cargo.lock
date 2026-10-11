@@ -4549,6 +4549,7 @@ dependencies = [
  "toml",
  "tracing",
  "ursula-observability",
+ "ursula-proto",
  "ursula-shard",
 ]
 

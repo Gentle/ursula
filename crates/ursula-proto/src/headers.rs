@@ -43,6 +43,13 @@ pub const NOT_APPLIED_HEADER: &str = "x-ursula-not-applied";
 /// own refusals and on its own errors. It removes any vouch that came from an
 /// upstream before it adds its own. Nodes never set it.
 ///
+/// The gateway sees only its own exchanges with its upstreams, so they must be
+/// the nodes themselves. A proxy, service-mesh sidecar or another gateway
+/// between the gateway and the nodes must not resend requests, or the gateway
+/// vouches for a marker from a later delivery: a node can propose a write and
+/// answer an unmarked `503`, and a resent copy can then be refused at
+/// admission with a marked one.
+///
 /// Gateways before 0.7.3 pass a leader's marker on after any redirect they
 /// follow, including one that a node sent after it proposed the write. They
 /// never send the vouch, so a client that requires it does not trust their

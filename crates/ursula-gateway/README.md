@@ -148,6 +148,17 @@ The vouch covers only the one request the gateway received. A proxy in front
 of the gateway must not resend writes, and a client must not let its HTTP
 library follow redirects or retry writes on its own.
 
+The vouch also covers only the exchanges the gateway makes itself, so point
+`--upstream` at the nodes themselves. A proxy, service-mesh sidecar or
+another gateway between the gateway and the nodes must not resend requests,
+or the gateway vouches for a marker from a later delivery. For example, a
+node can propose a write and then answer `503` without a marker. If a
+sidecar resends the request on that `503`, as Istio's default retry policy
+does, and a node refuses the copy at admission with a marked `503`, the
+gateway sees only that refusal and vouches for it. A gateway older than
+0.7.3 used as an upstream causes the same problem, because it passes a
+leader's marker on after any redirect it follows.
+
 ## SSE Behavior
 
 `live=sse` responses stream through the gateway. `--response-header-timeout`
@@ -194,6 +205,9 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 
 --upstream <URL>
     Base URL for an Ursula HTTP or HTTPS node. Repeat once per node. Required.
+    Point it at the node itself. A proxy, service-mesh sidecar or another
+    gateway in between must not resend requests, or the gateway vouches for
+    an x-ursula-not-applied marker from a later delivery.
 
 --response-header-timeout <SECONDS>
     Timeout for sending the upstream request and receiving response headers.

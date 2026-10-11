@@ -152,6 +152,12 @@ as `examples/tls-ingress.yaml` does. A resent write can be answered as never
 applied although the first attempt committed (see
 [redirects and retries](https://ursula.tonbo.io/docs/api/overview#redirects-and-retries)).
 
+In a service mesh, also turn off retries for the stream routes, both to the
+gateway Service and from the gateway to the server pods. Istio's default
+policy, for example, resends a request up to twice when it gets a `503`.
+Nothing between the gateway and the nodes may resend a request, so set
+`gateway.upstreams` only to URLs that reach the nodes themselves.
+
 The internal server Service and headless peer Service expose the same
 `server.ports.client` process port. Ursula's current static peer URL is used
 both for Raft/gRPC traffic and for leader redirects, so the chart keeps those
@@ -533,7 +539,7 @@ Every server pod gets a `raft-data` PVC for its Raft WAL.
 | `gateway.ingress.tls` | `[]` | TLS entries rendered into `spec.tls`. Referenced Secrets must already exist. |
 | `gateway.ingress.tls[].secretName` | — | Existing Kubernetes TLS Secret name. |
 | `gateway.ingress.tls[].hosts` | `[]` | Hosts covered by the TLS Secret. |
-| `gateway.upstreams` | `[]` | Manual upstream URLs. When empty, the chart auto-generates upstreams from Ursula server pod DNS through the headless Service. |
+| `gateway.upstreams` | `[]` | Manual upstream URLs. When empty, the chart auto-generates upstreams from Ursula server pod DNS through the headless Service. Each must reach one node, with nothing in between that resends requests. |
 | `gateway.podAnnotations` | `{}` | Extra annotations applied to gateway pods. |
 | `gateway.podLabels` | `{}` | Extra labels applied to gateway pods. Must not set selector labels `app.kubernetes.io/name` or `app.kubernetes.io/instance`. |
 | `gateway.rustLog` | `ursula_gateway=info` | `RUST_LOG` tracing filter for the gateway. |

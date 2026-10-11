@@ -247,6 +247,9 @@ export class StallProxy {
 /** How the gate answers the writes it refuses: `402` without extra headers unless set. */
 export type Refusal = { status?: number; headers?: Record<string, string> };
 
+/** What `gate.mjs` did so far (see {@link Gate.counts}). */
+export type GateCounts = { refused: number; forwarded: number; dropped: number; replaced: number; droppedStatuses: number[]; replacedStatuses: number[] };
+
 /**
  * An HTTP layer in front of the node that refuses writes on demand (`gate.mjs`), with `402 Payment
  * Required` by default, the way an authorizer or a quota or billing service may, or with any status
@@ -304,10 +307,10 @@ export class Gate {
 		await this.control({ refuse: null, dropNextPost: null, forwardNextPost: null });
 	}
 
-	/** Requests refused, forwarded, forwarded with their answer cut, and forwarded with their answer replaced by a refusal, so far. */
-	async counts(): Promise<{ refused: number; forwarded: number; dropped: number; replaced: number }> {
+	/** Requests refused, forwarded, forwarded with their answer cut, and forwarded with their answer replaced by a refusal, so far, and the node's status for each answer cut or replaced, in order. */
+	async counts(): Promise<GateCounts> {
 		const r = await fetch(`${this.url}/__gate`);
-		return (await r.json()) as { refused: number; forwarded: number; dropped: number; replaced: number };
+		return (await r.json()) as GateCounts;
 	}
 
 	private async control(body: object): Promise<void> {

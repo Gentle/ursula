@@ -170,6 +170,8 @@ it("a refusal for a commit the stream applied is caught at the next commit, whic
 	expect((await child.exited).code, child.stderr()).toBe(0);
 	const after = await gate.counts();
 	expect(after.replaced - before.replaced).toBe(1);
+	// The node applied the refused commit as a fresh append.
+	expect(after.replacedStatuses.slice(before.replacedStatuses.length)).toEqual([200]);
 	expect(step(child, 3)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
 	expect(step(child, 4)?.status).toMatchObject({ poisoned: false, writes_refused: true, refused_kind: "not_applied", refused_reason: "RaftLogPressure" });
 	expect(step(child, 6)).toMatchObject({ ok: false, errcode: POISONED });
@@ -177,6 +179,44 @@ it("a refusal for a commit the stream applied is caught at the next commit, whic
 	expect(done.reason).toMatch(/^a commit refused as never applied may have been applied after all: the next commit, at epoch \d+ seq \d+ after \S+, was answered as a duplicate \(receipt \S+\), so the stream holds either the refused commit \(.+\) or this one \(.+\), and the local file holds neither: attach the database again/);
 	expect(child.stderr()).toMatch(/event=poisoned file=\S+ stream=\S+ fenced=false reason="a commit refused as never applied may have been applied after all/);
 	// The stream holds the refused transaction, and not the next one.
+	const copy = freshFile();
+	attach(copy, ursulaUrl() + path);
+	expect(xs(copy)).toEqual(["f1", "f2"]);
+});
+
+// The gap that check leaves (design doc §2): when an attempt of the next commit got no answer before the
+// duplicate's answer, that answer is taken for the lost attempt's own. The next commit is acknowledged
+// without its pages, and the file and the stream diverge without an error. The extension logs
+// `refused_commit_unchecked`, the one trace of this case.
+it("a duplicate's answer after a lost attempt of the commit after a false refusal is acknowledged, with a warning", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const [armed, accepting] = [`${file}.armed`, `${file}.accepting`];
+	const steps = ["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('f1')", `@wait:${armed}`, "INSERT INTO t VALUES ('f2')", `@wait:${accepting}`, "INSERT INTO t VALUES ('f3')", "@query:SELECT x FROM t ORDER BY x"];
+	const child = runChild(file, gate.url + path, steps, { CHILD_EXIT: "1", ...SHORT_BUDGET });
+	await child.waitFor((l) => l.step === 2 && l.phase === "start");
+	const before = await gate.counts();
+	await gate.forwardNextPostThenRefuse(PRESSURE_BODY, 100, PRESSURE);
+	writeFileSync(armed, "");
+	await child.waitFor((l) => l.step === 4 && l.phase === "start");
+	// The next commit's first attempt reaches the node, which answers it as the refused commit's
+	// duplicate, and that answer is lost. Its second attempt gets a 503 that proves nothing, and its third
+	// reaches the node again.
+	await gate.reset();
+	await gate.dropNextPostThenRefuse("", 1, { status: 503 });
+	writeFileSync(accepting, "");
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code, child.stderr()).toBe(0);
+	const after = await gate.counts();
+	expect(after.replacedStatuses.slice(before.replacedStatuses.length)).toEqual([200]);
+	expect(after.droppedStatuses.slice(before.droppedStatuses.length)).toEqual([204]);
+	expect(step(child, 3)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
+	expect(step(child, 5)).toMatchObject({ ok: true });
+	expect(done).toMatchObject({ poisoned: false, fenced: false, writes_refused: false });
+	expect(done.attempts?.at(-1)).toBe(3);
+	expect(child.stderr()).toMatch(/event=refused_commit_unchecked file=\S+ stream=\S+ epoch=\d+ seq=\d+ offset=\S+ receipt=\S+/);
+	// Diverged: the file holds the next transaction, and the stream the refused one.
+	expect(step(child, 6)?.rows).toEqual([{ x: "f1" }, { x: "f3" }]);
 	const copy = freshFile();
 	attach(copy, ursulaUrl() + path);
 	expect(xs(copy)).toEqual(["f1", "f2"]);

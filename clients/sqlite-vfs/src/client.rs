@@ -479,8 +479,13 @@ fn send_retrying(
 pub(crate) enum Append {
     /// Applied, or answered as a duplicate of an earlier attempt of this append (or, for a claim,
     /// of any append at its epoch and sequence 0, verified separately); the stream offset after it
-    /// when known.
-    Acked { next: Option<String>, attempts: u32 },
+    /// when known. `duplicate`: the answer was a duplicate's (204), which a commit gets only after
+    /// an attempt that may have reached the stream (see `append`).
+    Acked {
+        next: Option<String>,
+        attempts: u32,
+        duplicate: bool,
+    },
     /// A commit's attempt answered 204, the server's answer to a duplicate, while no earlier
     /// attempt of it can have reached the stream (see `append`): the stream held an append at this
     /// epoch and sequence before that attempt reached it, which no attempt of this append put
@@ -531,9 +536,10 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// answer (204) while no earlier attempt of this append can have reached the stream ends the
 /// append as [`Append::UnexplainedDuplicate`], which `Db::append_commit` takes for such a refused
 /// commit when one was refused at this sequence. After an attempt that may have reached the
-/// stream, a duplicate's answer is taken for that attempt's ([`Append::Acked`]), so a refused
-/// commit applied after all goes unnoticed when an attempt of the next commit got no answer, or an
-/// answer that proves nothing, before the duplicate's (design doc §2). A claim's answer is verified
+/// stream, a duplicate's answer is taken for that attempt's ([`Append::Acked`], `duplicate`), so a
+/// refused commit applied after all goes unchecked when an attempt of the next commit got no
+/// answer, or an answer that proves nothing (a 307, a 5xx without a vouched marker), before the
+/// duplicate's (design doc §2): `Db::append_commit` only logs it. A claim's answer is verified
 /// separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
 ///
 /// An attempt whose answer proves that it applied nothing (`applied_nothing`: a 401, 402 or 429, or
@@ -637,6 +643,7 @@ pub(crate) fn append(
                             return Append::Acked {
                                 next: header_offset(&r, "stream-next-offset"),
                                 attempts,
+                                duplicate: status == 204,
                             };
                         }
                         // Never followed (`new_agent`): a 307 is sent again, its outcome unknown
@@ -1419,7 +1426,7 @@ mod tests {
         ));
         let settled = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
-            matches!(settled, Append::Acked { next: Some(ref n), attempts: 5 } if n == "9"),
+            matches!(settled, Append::Acked { next: Some(ref n), attempts: 5, duplicate: false } if n == "9"),
             "a 402 after an unknown outcome is retried"
         );
         let create = create_stream(&url).unwrap_err();
@@ -1741,14 +1748,18 @@ mod tests {
             Append::Refused(_)
         ));
         let fresh = append(&url, "i1", "p", b"x", 1, 5);
-        assert!(matches!(fresh, Append::Acked { next: Some(ref n), attempts: 1 } if n == "12"));
+        assert!(
+            matches!(fresh, Append::Acked { next: Some(ref n), attempts: 1, duplicate: false } if n == "12")
+        );
         let within = append(&url, "i1", "p", b"x", 1, 5);
         assert!(matches!(within, Append::UnexplainedDuplicate {
             attempts: 2,
             ..
         }));
         let retried = append(&url, "i1", "p", b"x", 1, 5);
-        assert!(matches!(retried, Append::Acked { next: Some(ref n), attempts: 2 } if n == "12"));
+        assert!(
+            matches!(retried, Append::Acked { next: Some(ref n), attempts: 2, duplicate: true } if n == "12")
+        );
         let claim = append(&url, "i1", "p", b"x", 1, 0);
         assert!(matches!(claim, Append::Acked { attempts: 1, .. }));
         assert_eq!(server.join().unwrap().len(), 9);
@@ -1888,7 +1899,9 @@ mod tests {
         let (status, _) = put_idempotent(&retention, "i1", b"", &|| false).unwrap();
         assert_eq!(status, 204);
         let acked = append(&url, "i1", "p", b"commit", 1, 1);
-        assert!(matches!(acked, Append::Acked { next: Some(ref n), attempts: 3 } if n == "9"));
+        assert!(
+            matches!(acked, Append::Acked { next: Some(ref n), attempts: 3, duplicate: false } if n == "9")
+        );
         let moved = append(&url, "i1", "p", b"commit", 1, 2);
         assert!(matches!(
             moved,
@@ -2084,7 +2097,7 @@ mod tests {
         ]);
         let settled = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
-            matches!(settled, Append::Acked { next: Some(ref n), attempts: 3 } if n == "9"),
+            matches!(settled, Append::Acked { next: Some(ref n), attempts: 3, duplicate: false } if n == "9"),
             "a 402 after a 307 was taken to have applied nothing"
         );
         let unknown = append(&url, "i1", "p", b"x", 1, 2);
@@ -2299,7 +2312,7 @@ mod tests {
         });
         let appended = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
-            matches!(appended, Append::Acked { next: Some(ref n), attempts: 2 } if n == "9"),
+            matches!(appended, Append::Acked { next: Some(ref n), attempts: 2, duplicate: false } if n == "9"),
             "one attempt on the oldest pooled connection, then one on a new connection"
         );
         assert_eq!(

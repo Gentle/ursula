@@ -8,18 +8,20 @@
 //   PUT /__gate {"refuse": body | null, "limit"?: n, "methods"?: ["POST", "PUT"], "status"?: 402,
 //                "headers"?: {name: value}, "dropNextPost"?: {"refuse": body, "limit"?: n,
 //                "status"?: n, "headers"?: {...}} | null, "forwardNextPost"?: {...} | null}
-//   GET /__gate -> {"refused": n, "forwarded": n, "dropped": n, "replaced": n}
+//   GET /__gate -> {"refused": n, "forwarded": n, "dropped": n, "replaced": n, "droppedStatuses": [n],
+//                   "replacedStatuses": [n]}
 // While `refuse` is set, requests with one of `methods` (writes: POST and PUT by default) are answered
 // `status` (402 by default) with `headers` and that body without being forwarded, `limit` times at most
 // (then `refuse` clears). With `dropNextPost`, the next POST is forwarded but its answer is cut (its
 // outcome is unknown to the client), and its refusal is armed at once. With `forwardNextPost` (the same
 // fields), the next POST is forwarded and the node's answer is replaced by that refusal, which breaks the
 // rule for refusals (the node applied the write, and the client is told it did not), and its refusal is
-// armed at once for the writes after it.
+// armed at once for the writes after it. The node's status for each answer cut or replaced is kept, in
+// order (`droppedStatuses`, `replacedStatuses`).
 import { createServer, request } from "node:http";
 
 const target = new URL(process.argv[2]);
-const state = { refuse: null, limit: Number.POSITIVE_INFINITY, methods: ["POST", "PUT"], status: 402, headers: {}, dropNextPost: null, forwardNextPost: null, refused: 0, forwarded: 0, dropped: 0, replaced: 0 };
+const state = { refuse: null, limit: Number.POSITIVE_INFINITY, methods: ["POST", "PUT"], status: 402, headers: {}, dropNextPost: null, forwardNextPost: null, refused: 0, forwarded: 0, dropped: 0, replaced: 0, droppedStatuses: [], replacedStatuses: [] };
 
 const arm = ({ refuse, limit, methods, status, headers }) => {
 	state.refuse = refuse;
@@ -32,8 +34,8 @@ const arm = ({ refuse, limit, methods, status, headers }) => {
 const server = createServer((req, res) => {
 	if (req.url === "/__gate") {
 		if (req.method === "GET") {
-			const { refused, forwarded, dropped, replaced } = state;
-			res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ refused, forwarded, dropped, replaced }));
+			const { refused, forwarded, dropped, replaced, droppedStatuses, replacedStatuses } = state;
+			res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ refused, forwarded, dropped, replaced, droppedStatuses, replacedStatuses }));
 			return;
 		}
 		let body = "";
@@ -74,6 +76,7 @@ const server = createServer((req, res) => {
 	const up = request({ host: target.hostname, port: target.port, method: req.method, path: req.url, headers: req.headers }, (answer) => {
 		if (drop) {
 			state.dropped++;
+			state.droppedStatuses.push(answer.statusCode);
 			answer.resume();
 			answer.on("end", () => res.socket?.destroy());
 			return;
@@ -83,6 +86,7 @@ const server = createServer((req, res) => {
 			answer.resume();
 			answer.on("end", () => {
 				state.replaced++;
+				state.replacedStatuses.push(answer.statusCode);
 				res.writeHead(status ?? 402, { "content-type": "application/json", ...headers }).end(refuse);
 			});
 			return;

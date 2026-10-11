@@ -310,14 +310,31 @@ impl Db {
                     receipt,
                 }));
             }
-            // Elsewhere no commit at this sequence was refused, so an unexplained duplicate is this
-            // commit, applied by an exchange whose answer said otherwise (see
-            // `Append::UnexplainedDuplicate`): acknowledged like any other.
+            // A duplicate's answer after an attempt of this commit whose outcome is unknown is taken
+            // for that attempt's (`client::append`). At the sequence a refused commit left free it
+            // may be the refused commit's instead, which nothing here tells apart (design doc §2):
+            // acknowledged, with a warning that leaves a trace of the unchecked refusal.
             Append::Acked {
                 next: Some(n),
                 attempts,
+                duplicate,
+            } if n > self.offset => {
+                if duplicate && self.refused_at == Some((self.epoch, seq)) {
+                    log::emit(Level::Warn, "refused_commit_unchecked", &[
+                        ("file", &self.path),
+                        ("stream", &self.url),
+                        ("epoch", &self.epoch),
+                        ("seq", &seq),
+                        ("offset", &self.offset),
+                        ("receipt", &n),
+                    ]);
+                }
+                (n, attempts)
             }
-            | Append::UnexplainedDuplicate {
+            // Elsewhere no commit at this sequence was refused, so an unexplained duplicate is this
+            // commit, applied by an exchange whose answer said otherwise (see
+            // `Append::UnexplainedDuplicate`): acknowledged like any other.
+            Append::UnexplainedDuplicate {
                 next: Some(n),
                 attempts,
             } if n > self.offset => (n, attempts),

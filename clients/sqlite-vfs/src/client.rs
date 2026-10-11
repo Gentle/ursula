@@ -49,6 +49,11 @@ fn new_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
+        // Every redirect comes back to the caller, which sends a 307 again to the same URL and
+        // fails on any other (`redirect_retried`). Followed, a redirect would go out without
+        // the token (ureq drops it on every redirect, to the same host too), and a 301, 302 or 303
+        // would turn an append into a GET.
+        .max_redirects(0)
         .tls_config(tls())
         .build()
         .into()
@@ -176,6 +181,35 @@ fn payment_required(op: &'static str, url: &str, body: String) -> Error {
     }
 }
 
+/// A redirect the extension retries: a 307, which keeps the method and body and says that the
+/// request belongs elsewhere for now (a gateway passing on the server's redirect to the leader of
+/// the stream's group, which moved). Never followed (`new_agent`): the request is sent again to the
+/// same URL, like a 503, so it reaches the leader through the same gateway, with the token. An
+/// append so answered has an unknown outcome: a leader that loses its leadership answers so, and
+/// what it proposed may still be committed. A 308 is not retried: neither the server nor the
+/// gateway sends one, and a proxy that redirects `http://` to `https://` does (ingress-nginx and
+/// Caddy by default), so it fails the request at once with its Location (`redirected`).
+fn redirect_retried(status: u16) -> bool {
+    status == 307
+}
+
+/// The error of request `op` to `url` answered with a redirect the extension does not retry (any
+/// 3xx but 307: a 301, 302 or 303 would turn an append into a GET, and a 308 comes from a proxy in
+/// front of the stream); `None` for any other answer.
+fn redirected(op: &'static str, url: &str, r: &ureq::http::Response<ureq::Body>) -> Option<Error> {
+    let status = r.status().as_u16();
+    ((300..400).contains(&status) && !redirect_retried(status)).then(|| Error::Redirected {
+        op,
+        url: url.to_owned(),
+        status,
+        location: r
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+    })
+}
+
 fn header_u64(r: &ureq::http::Response<ureq::Body>, name: &str) -> Option<u64> {
     r.headers().get(name)?.to_str().ok()?.trim().parse().ok()
 }
@@ -231,11 +265,11 @@ fn retry_deadline() -> Instant {
 
 /// Sends a request that is safe to repeat (a read, or a create), retrying 429 (rate limiting), 503
 /// (overload, or a `consistency=leader` read, HEAD or snapshot read the leader could not confirm
-/// with a quorum in time) and a refused token (`Refused::Token`: sent again with the token read
-/// again) the way `append` does: no sooner than Retry-After (seconds), with backoff, within
-/// `retry_budget()`. Returns the first other answer, or the last retried one once the budget is
-/// spent or `stopped` (a re-attach is waiting for the snapshot thread). `send` takes whether to
-/// read the token again.
+/// with a quorum in time), a 307 (`redirect_retried`: sent again to the same URL, never followed)
+/// and a refused token (`Refused::Token`: sent again with the token read again) the way
+/// `append` does: no sooner than Retry-After (seconds), with backoff, within `retry_budget()`.
+/// Returns the first other answer, or the last retried one once the budget is spent or `stopped`
+/// (a re-attach is waiting for the snapshot thread). `send` takes whether to read the token again.
 fn send_retrying(
     send: impl Fn(bool) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     stopped: &dyn Fn() -> bool,
@@ -246,7 +280,8 @@ fn send_retrying(
     loop {
         let r = send(refresh)?;
         refresh = matches!(refused(&r), Some(Refused::Token));
-        if !refresh && !matches!(r.status().as_u16(), 429 | 503) {
+        let status = r.status().as_u16();
+        if !refresh && !matches!(status, 429 | 503) && !redirect_retried(status) {
             return Ok(r);
         }
         let retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
@@ -296,13 +331,17 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
 ///
 /// A 402 ends the append as [`Append::PaymentRequired`] only while no attempt of it can have
-/// reached the stream. After an attempt whose outcome is unknown (no answer, or a 5xx), the
-/// append may be in the stream, and the next commit, sent with the same sequence, would be
-/// acknowledged as its duplicate: the 402 is then retried like an unknown outcome, until an
+/// reached the stream. After an attempt whose outcome is unknown (no answer, a 5xx, or a 307), the
+/// append may be in the stream, and the next commit, sent with the same sequence, would
+/// be acknowledged as its duplicate: the 402 is then retried like an unknown outcome, until an
 /// answer settles it or the budget runs out ([`Error::AppendUnknown`]). An attempt answered 401,
 /// 402 or 429 is taken to have applied nothing, which every layer in front of the stream must
 /// ensure (design doc §2): one that passed the append on and then answered so would have the next
 /// commit acknowledged as this one's duplicate, its pages never appended.
+///
+/// A 307 is an unknown outcome, sent again to the same URL with the same sequence
+/// (`redirect_retried`); any other redirect (a 308 among them) fails the append
+/// ([`Error::Redirected`]).
 pub(crate) fn append(
     url: &str,
     incarnation: &str,
@@ -335,8 +374,9 @@ pub(crate) fn append(
         let unknown = match sent {
             Ok(mut r) => {
                 let status = r.status().as_u16();
-                // Rate limiting (429, e.g. ursulagw) and overload (503) are transient: retried
-                // with the same producer sequence, no sooner than Retry-After (seconds).
+                // Rate limiting (429, e.g. ursulagw), overload (503) and a redirect for the leader
+                // (307) are transient: retried with the same producer sequence, no sooner than
+                // Retry-After (seconds).
                 retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
                 match refused(&r) {
                     Some(Refused::Fenced { current }) => return Append::Fenced { current },
@@ -367,6 +407,15 @@ pub(crate) fn append(
                                 attempts,
                             };
                         }
+                        // Never followed (`new_agent`): a 307 is sent again, its outcome unknown
+                        // (`redirect_retried`), and any other redirect fails the append.
+                        300..=399 => match redirected("append", url, &r) {
+                            Some(e) => return Append::Failed(e),
+                            None => Attempt::Status {
+                                status,
+                                body: body_text(&mut r),
+                            },
+                        },
                         // The stream was deleted and recreated: nothing was appended.
                         412 => return Append::Recreated,
                         409 if seq > 0 && header_u64(&r, "producer-expected-seq") == Some(0) => {
@@ -402,8 +451,8 @@ pub(crate) fn append(
             Err(e) => Attempt::Transport(Box::new(e)),
         };
         // Refusals in front of the stream (401, 402) and rate limiting (429) apply nothing (a
-        // requirement on every layer in front of it, see above); any other answer, or none, may
-        // come after the stream applied the append.
+        // requirement on every layer in front of it, see above); any other answer (a 307 too:
+        // `redirect_retried`), or none, may come after the stream applied the append.
         if !matches!(unknown, Attempt::Status {
             status: 401 | 402 | 429,
             ..
@@ -450,7 +499,7 @@ pub(crate) fn create_stream(url: &str) -> Result<(), Error> {
         &|| false,
     )
     .map_err(|e| http_error("create", url, e))?;
-    if let Some(e) = refusal("create", url, &mut r) {
+    if let Some(e) = refusal("create", url, &mut r).or_else(|| redirected("create", url, &r)) {
         return Err(e);
     }
     let status = r.status().as_u16();
@@ -516,7 +565,8 @@ pub(crate) fn read_from(
         &|| false,
     )
     .map_err(|e| http_error("read", &request, e))?;
-    if let Some(e) = refusal("read", &request, &mut r) {
+    if let Some(e) = refusal("read", &request, &mut r).or_else(|| redirected("read", &request, &r))
+    {
         return Err(e);
     }
     let status = r.status().as_u16();
@@ -593,14 +643,14 @@ pub(crate) struct Head {
     pub(crate) incarnation: Option<String>,
 }
 
-/// `stopped` ends the retries of a 429/503 early (see `send_retrying`).
+/// `stopped` ends the retries early (`send_retrying` lists the answers it retries).
 pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error> {
     let mut r = send_retrying(
         |refresh| authorized(agent().head(url), refresh).call(),
         stopped,
     )
     .map_err(|e| http_error("head", url, e))?;
-    if let Some(e) = refusal("head", url, &mut r) {
+    if let Some(e) = refusal("head", url, &mut r).or_else(|| redirected("head", url, &r)) {
         return Err(e);
     }
     let status = r.status().as_u16();
@@ -626,7 +676,7 @@ pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error>
 }
 
 /// The snapshot at `offset`; `None` when it does not exist (superseded, or not yet visible here).
-/// `stopped` ends the retries of a 429/503 early (see `send_retrying`).
+/// `stopped` ends the retries early (`send_retrying` lists the answers it retries).
 pub(crate) fn get_snapshot(
     url: &str,
     incarnation: &str,
@@ -643,7 +693,9 @@ pub(crate) fn get_snapshot(
         stopped,
     )
     .map_err(|e| http_error("get snapshot", &request, e))?;
-    if let Some(e) = refusal("get snapshot", &request, &mut r) {
+    if let Some(e) = refusal("get snapshot", &request, &mut r)
+        .or_else(|| redirected("get snapshot", &request, &r))
+    {
         return Err(e);
     }
     let status = r.status().as_u16();
@@ -668,10 +720,11 @@ pub(crate) fn get_snapshot(
 }
 
 /// `PUT` to stream incarnation `incarnation` (a 412 when it is not) with retries while the outcome
-/// is unknown (transport errors, 5xx): both publishing a snapshot and advancing retention are
-/// idempotent, so a 402 fails the request alone ([`Error::PaymentRequired`]), whatever an earlier
-/// attempt did. Returns the status and response. Gives up once `stopped` (a re-attach is waiting
-/// for the snapshot thread).
+/// is unknown (transport errors, 5xx, a 307: `redirect_retried`), no sooner than
+/// Retry-After (seconds): both publishing a snapshot and advancing retention are idempotent, so a
+/// 402 fails the request alone ([`Error::PaymentRequired`]), whatever an earlier attempt did, and
+/// so does any other redirect ([`Error::Redirected`]). Returns the status and response. Gives up
+/// once `stopped` (a re-attach is waiting for the snapshot thread).
 pub(crate) fn put_idempotent(
     url: &str,
     incarnation: &str,
@@ -683,36 +736,43 @@ pub(crate) fn put_idempotent(
     // The last answer refused the token: the next attempt reads it again.
     let mut token_refused = false;
     loop {
+        let mut retry_after = None;
         let unknown = match authorized(bulk_agent().put(url), std::mem::take(&mut token_refused))
             .header("content-type", CONTENT_TYPE)
             .header("stream-incarnation", incarnation)
             .send(body)
         {
-            Ok(mut r) => match (refused(&r), r.status().as_u16()) {
-                (Some(Refused::Token), status) => {
-                    token_refused = true;
-                    Attempt::Status {
+            Ok(mut r) => {
+                retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
+                match (refused(&r), r.status().as_u16()) {
+                    (Some(Refused::Token), status) => {
+                        token_refused = true;
+                        Attempt::Status {
+                            status,
+                            body: body_text(&mut r),
+                        }
+                    }
+                    (Some(Refused::Denied), status) => {
+                        return Err(unauthorized("put", url, status));
+                    }
+                    (Some(Refused::PaymentRequired), _) => {
+                        return Err(payment_required("put", url, body_text(&mut r)));
+                    }
+                    (_, status) if status < 500 && !redirect_retried(status) => {
+                        return match redirected("put", url, &r) {
+                            Some(e) => Err(e),
+                            None => Ok((status, r)),
+                        };
+                    }
+                    (_, status) => Attempt::Status {
                         status,
                         body: body_text(&mut r),
-                    }
+                    },
                 }
-                (Some(Refused::Denied), status) => return Err(unauthorized("put", url, status)),
-                (Some(Refused::PaymentRequired), _) => {
-                    return Err(payment_required("put", url, body_text(&mut r)));
-                }
-                (_, status) if status < 500 => return Ok((status, r)),
-                (_, status) => Attempt::Status {
-                    status,
-                    body: body_text(&mut r),
-                },
-            },
+            }
             Err(e) => Attempt::Transport(Box::new(e)),
         };
-        if Instant::now()
-            .checked_add(backoff)
-            .is_none_or(|end| end > deadline)
-            || stopped()
-        {
+        if stopped() || !pause(retry_after, &mut backoff, deadline) {
             return Err(if token_refused {
                 unauthorized("put", url, 401)
             } else {
@@ -722,8 +782,6 @@ pub(crate) fn put_idempotent(
                 }
             });
         }
-        std::thread::sleep(backoff);
-        backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
     }
 }
 
@@ -751,6 +809,8 @@ mod tests {
     use std::io::Read as _;
     use std::io::Write as _;
     use std::net::TcpListener;
+    use std::sync::Mutex;
+    use std::sync::PoisonError;
 
     use super::Append;
     use super::append;
@@ -763,6 +823,9 @@ mod tests {
     use crate::auth::set_token;
     use crate::error::Attempt;
     use crate::error::Error;
+
+    /// Held by each test that sets the process-wide token (`set_token`): tests run in parallel.
+    static TOKEN: Mutex<()> = Mutex::new(());
 
     // A leader read the server could not confirm with a quorum in time answers 503 (Retry-After),
     // and a gateway may rate-limit with 429: catch-up reads and HEAD retry both, as appends do,
@@ -870,6 +933,7 @@ mod tests {
     // denial, never taken for a fence.
     #[test]
     fn auth_refusals_are_retried_or_final_never_fences() {
+        let _token = TOKEN.lock().unwrap_or_else(PoisonError::into_inner);
         set_token(Some("t1"));
         let (url, server) = serve(vec![
             answer("401 Unauthorized\r\nwww-authenticate: Bearer error=\"invalid_token\""),
@@ -1023,5 +1087,260 @@ mod tests {
             matches!(last, Attempt::Status { status: 402, ref body } if body == "quota exhausted")
         );
         assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    // Redirects are never followed: followed, a request would go out without the token (ureq
+    // drops it on every redirect), and a 301, 302 or 303 would turn an append into a GET. A 307 (a
+    // gateway passing on the server's redirect to a leader that moved) is sent again to the same
+    // URL, with the same method, sequence and token: reads, creates and PUTs retry it like a 503,
+    // an append as an unknown outcome. Any other redirect fails the request at once with its
+    // Location, a 308 among them (a proxy that redirects `http://` to `https://`).
+    #[test]
+    fn redirects_are_sent_again_in_place_or_fail_never_followed() {
+        let _token = TOKEN.lock().unwrap_or_else(PoisonError::into_inner);
+        set_token(Some("t2"));
+        let redirect = |status: &str| answer(&format!("{status}\r\nlocation: /elsewhere"));
+        let (url, server) = serve(vec![
+            redirect("307 Temporary Redirect"),
+            answer_with_body("200 OK\r\nstream-next-offset: 7", "abc"),
+            redirect("307 Temporary Redirect"),
+            answer("200 OK\r\nstream-incarnation: i1"),
+            redirect("307 Temporary Redirect"),
+            answer_with_body("200 OK", "snapshot"),
+            redirect("307 Temporary Redirect"),
+            answer("201 Created"),
+            redirect("307 Temporary Redirect"),
+            answer("204 No Content"),
+            redirect("307 Temporary Redirect"),
+            redirect("307 Temporary Redirect"),
+            answer("200 OK\r\nstream-next-offset: 9"),
+            redirect("301 Moved Permanently"),
+            redirect("302 Found"),
+            redirect("303 See Other"),
+            redirect("301 Moved Permanently"),
+            redirect("302 Found"),
+            redirect("301 Moved Permanently"),
+            redirect("308 Permanent Redirect"),
+            redirect("308 Permanent Redirect"),
+        ]);
+        let (bytes, next) = read_from(&url, "i1", "4").unwrap();
+        assert_eq!((&bytes[..], next.as_str()), (&b"abc"[..], "7"));
+        let head_answer = head(&url, &|| false).unwrap();
+        assert_eq!(head_answer.incarnation.as_deref(), Some("i1"));
+        let snapshot = get_snapshot(&url, "i1", "9", &|| false).unwrap();
+        assert_eq!(snapshot.as_deref(), Some(&b"snapshot"[..]));
+        create_stream(&url).unwrap();
+        let retention = format!("{url}/retention/5");
+        let (status, _) = put_idempotent(&retention, "i1", b"", &|| false).unwrap();
+        assert_eq!(status, 204);
+        let acked = append(&url, "i1", "p", b"commit", 1, 1);
+        assert!(matches!(acked, Append::Acked { next: Some(ref n), attempts: 3 } if n == "9"));
+        let moved = append(&url, "i1", "p", b"commit", 1, 2);
+        assert!(matches!(
+            moved,
+            Append::Failed(Error::Redirected { op: "append", status: 301, location: Some(ref l), .. })
+                if l == "/elsewhere"
+        ));
+        let found = head(&url, &|| false).err().unwrap();
+        assert!(matches!(found, Error::Redirected {
+            op: "head",
+            status: 302,
+            ..
+        }));
+        let other = read_from(&url, "i1", "4").unwrap_err();
+        assert!(matches!(other, Error::Redirected {
+            op: "read",
+            status: 303,
+            ..
+        }));
+        let put = put_idempotent(&url, "i1", b"", &|| false).err().unwrap();
+        assert!(matches!(put, Error::Redirected {
+            op: "put",
+            status: 301,
+            ..
+        }));
+        let create = create_stream(&url).unwrap_err();
+        assert!(matches!(create, Error::Redirected {
+            op: "create",
+            status: 302,
+            ..
+        }));
+        assert!(
+            create.to_string().contains("302 redirect to /elsewhere"),
+            "{create}"
+        );
+        let snapshot = get_snapshot(&url, "i1", "9", &|| false).unwrap_err();
+        assert!(matches!(snapshot, Error::Redirected {
+            op: "get snapshot",
+            status: 301,
+            ..
+        }));
+        let proxied = append(&url, "i1", "p", b"commit", 1, 2);
+        assert!(matches!(
+            proxied,
+            Append::Failed(Error::Redirected { op: "append", status: 308, location: Some(ref l), .. })
+                if l == "/elsewhere"
+        ));
+        let proxied = head(&url, &|| false).err().unwrap();
+        assert!(matches!(proxied, Error::Redirected {
+            op: "head",
+            status: 308,
+            ..
+        }));
+        set_token(None);
+        let requests = server.join().unwrap();
+        let lines: Vec<&str> = requests
+            .iter()
+            .map(|r| r.split(" HTTP/").next().unwrap())
+            .collect();
+        let read = "GET /b/s?offset=4&consistency=leader";
+        assert_eq!(lines, [
+            read,
+            read,
+            "HEAD /b/s",
+            "HEAD /b/s",
+            "GET /b/s/snapshot/9",
+            "GET /b/s/snapshot/9",
+            "PUT /b/s",
+            "PUT /b/s",
+            "PUT /b/s/retention/5",
+            "PUT /b/s/retention/5",
+            "POST /b/s",
+            "POST /b/s",
+            "POST /b/s",
+            "POST /b/s",
+            "HEAD /b/s",
+            read,
+            "PUT /b/s",
+            "PUT /b/s",
+            "GET /b/s/snapshot/9",
+            "POST /b/s",
+            "HEAD /b/s"
+        ]);
+        for request in &requests {
+            let request = request.to_ascii_lowercase();
+            assert!(
+                request.contains("authorization: bearer t2\r\n"),
+                "{request}"
+            );
+        }
+        for request in &requests[10..13] {
+            let request = request.to_ascii_lowercase();
+            assert!(request.contains("producer-seq: 1\r\n"), "{request}");
+            assert!(request.contains("content-length: 6\r\n"), "{request}");
+        }
+    }
+
+    // A 307 that lasts the whole retry budget leaves an append's or a PUT's outcome unknown (a
+    // leader that loses its leadership answers so, and what it proposed may still be committed),
+    // and fails a HEAD, a read, a snapshot GET or a create with its status: attach never takes it
+    // for a missing stream (a 404), nor a snapshot GET for a superseded snapshot.
+    #[test]
+    fn a_redirect_to_the_end_of_the_budget_is_an_unknown_outcome() {
+        // The budget ends once a wait would pass it: a Retry-After too large to wait for. The
+        // server's redirect explains itself in its body, which the gateway passes on.
+        let redirect = |body: &str| {
+            answer_with_body(
+                "307 Temporary Redirect\r\nlocation: /b/s\r\nretry-after: 18446744073709551615",
+                body,
+            )
+        };
+        let (url, server) = serve(vec![
+            redirect(""),
+            redirect(""),
+            redirect(""),
+            redirect("not the leader"),
+            redirect(""),
+            redirect("not the leader"),
+            redirect("not the leader"),
+        ]);
+        let unknown = append(&url, "i1", "p", b"x", 1, 1);
+        let Append::Failed(Error::AppendUnknown { attempts, last }) = unknown else {
+            panic!("not unknown");
+        };
+        assert_eq!(attempts, 1);
+        assert!(matches!(last, Attempt::Status { status: 307, .. }));
+        let put = put_idempotent(&url, "i1", b"", &|| false).err().unwrap();
+        assert!(
+            matches!(put, Error::PutUnknown {
+                last: Attempt::Status { status: 307, .. },
+                ..
+            }),
+            "{put}"
+        );
+        let head = head(&url, &|| false).err().unwrap();
+        assert!(
+            matches!(head, Error::Status {
+                op: "head",
+                status: 307,
+                ..
+            }),
+            "{head}"
+        );
+        let read = read_from(&url, "i1", "4").unwrap_err();
+        assert!(
+            matches!(read, Error::Status {
+                op: "read",
+                status: 307,
+                ..
+            }),
+            "{read}"
+        );
+        // Without a body and with one.
+        for _ in 0..2 {
+            let snapshot = get_snapshot(&url, "i1", "9", &|| false).unwrap_err();
+            assert!(
+                matches!(snapshot, Error::Status {
+                    op: "get snapshot",
+                    status: 307,
+                    ..
+                }),
+                "{snapshot}"
+            );
+        }
+        let create = create_stream(&url).unwrap_err();
+        assert!(
+            matches!(create, Error::Status {
+                op: "create",
+                status: 307,
+                ..
+            }),
+            "{create}"
+        );
+        assert_eq!(server.join().unwrap().len(), 7);
+    }
+
+    // A 307 leaves an append's outcome unknown (a leader that loses its leadership answers so, and
+    // what it proposed may still be committed): a 402 after it, and every later one, is retried as
+    // after a 503, until an answer settles the outcome or the budget runs out. Taken to have
+    // applied nothing, it would end the append as refused with its sequence free, and the next
+    // commit, sent with that sequence, could be acknowledged as this one's duplicate, its pages
+    // never appended.
+    #[test]
+    fn a_payment_refusal_after_a_redirect_is_retried() {
+        let refused = |head: &str| answer_with_body(head, "quota exhausted");
+        let (url, server) = serve(vec![
+            answer("307 Temporary Redirect\r\nlocation: /b/s"),
+            refused("402 Payment Required"),
+            answer("200 OK\r\nstream-next-offset: 9"),
+            answer("307 Temporary Redirect\r\nlocation: /b/s"),
+            refused("402 Payment Required"),
+            // The budget ends once a wait would pass it: a Retry-After too large to wait for.
+            refused("402 Payment Required\r\nretry-after: 18446744073709551615"),
+        ]);
+        let settled = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(settled, Append::Acked { next: Some(ref n), attempts: 3 } if n == "9"),
+            "a 402 after a 307 was taken to have applied nothing"
+        );
+        let unknown = append(&url, "i1", "p", b"x", 1, 2);
+        let Append::Failed(Error::AppendUnknown { attempts, last }) = unknown else {
+            panic!("a second 402 after a 307 was taken to have applied nothing");
+        };
+        assert_eq!(attempts, 3);
+        assert!(
+            matches!(last, Attempt::Status { status: 402, ref body } if body == "quota exhausted")
+        );
+        assert_eq!(server.join().unwrap().len(), 6);
     }
 }

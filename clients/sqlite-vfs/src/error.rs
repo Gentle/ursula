@@ -124,6 +124,19 @@ pub(crate) enum Error {
         status: u16,
         body: String,
     },
+    /// A redirect the extension does not retry (any 3xx but 307 and 308: `client::redirected`).
+    /// It never follows one: `location` is where it pointed.
+    #[error(
+        "{op} {url}: {status} redirect{}: the extension never follows redirects (point the stream \
+         URL at the server or gateway itself)",
+        .location.as_ref().map_or_else(String::new, |l| format!(" to {l}"))
+    )]
+    Redirected {
+        op: &'static str,
+        url: String,
+        status: u16,
+        location: Option<String>,
+    },
     #[error("append rejected: {status}{}", with_body(.body))]
     AppendRejected { status: u16, body: String },
     #[error("append: {last} (outcome unknown after {attempts} attempts)")]
@@ -430,5 +443,19 @@ mod tests {
              of the stream refused it, and nothing of it reached the stream"
         );
         assert!(!superseded.is_payment_required() && !local.is_payment_required());
+        // A redirect the extension does not retry fails the request: never a fence, never gone.
+        let redirected = Error::Redirected {
+            op: "head",
+            url: "http://h/b/s".into(),
+            status: 301,
+            location: Some("https://h/b/s".into()),
+        };
+        assert!(!redirected.is_fenced() && !redirected.is_gone());
+        assert!(!redirected.is_payment_required() && !redirected.is_recreated());
+        assert_eq!(
+            redirected.to_string(),
+            "head http://h/b/s: 301 redirect to https://h/b/s: the extension never follows \
+             redirects (point the stream URL at the server or gateway itself)"
+        );
     }
 }

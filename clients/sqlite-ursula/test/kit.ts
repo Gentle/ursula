@@ -1,7 +1,9 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { generateKeyPairSync, type KeyObject, randomUUID, sign } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, request, type Server } from "node:http";
-import { dirname, join } from "node:path";
+import type { AddressInfo } from "node:net";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { expect, inject } from "vitest";
@@ -96,7 +98,7 @@ export interface Child {
 const childScript = join(dirname(fileURLToPath(import.meta.url)), "child.mjs");
 const gateScript = join(dirname(fileURLToPath(import.meta.url)), "gate.mjs");
 
-/** Runs `child.mjs` with this build's extension, or with `ext`'s. */
+/** Runs `child.mjs` with this build's extension, or with `ext`'s. A child that a `waitFor` gives up on is killed, so it does not outlive the test. */
 export function runChild(file: string, url: string, sqls: readonly string[], env: Record<string, string> = {}, ext = vfsPath()): Child {
 	const proc = spawn(process.execPath, [childScript, ext, file, url, ...sqls], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
 	const lines: ChildLine[] = [];
@@ -125,7 +127,10 @@ export function runChild(file: string, url: string, sqls: readonly string[], env
 			const hit = lines.find(pred);
 			if (hit !== undefined) return Promise.resolve(hit);
 			return new Promise((res, rej) => {
-				const timer = setTimeout(() => rej(new Error(`child: timed out; lines ${JSON.stringify(lines)}; stderr ${err}`)), ms);
+				const timer = setTimeout(() => {
+					proc.kill("SIGKILL");
+					rej(new Error(`child: timed out; lines ${JSON.stringify(lines)}; stderr ${err}`));
+				}, ms);
 				waiters.push({ pred, res: (l) => (clearTimeout(timer), res(l)) });
 				void exited.then((x) => setTimeout(() => rej(new Error(`child exited ${JSON.stringify(x)}; lines ${JSON.stringify(lines)}; stderr ${err}`)), 50));
 			});
@@ -271,5 +276,77 @@ export class Gate {
 		const exited = new Promise((r) => this.proc.once("exit", r));
 		this.proc.kill();
 		await exited;
+	}
+}
+
+const listen = (server: Server): Promise<number> =>
+	new Promise((res) => server.listen(0, "127.0.0.1", () => res((server.address() as AddressInfo).port)));
+
+const b64 = (o: object): string => Buffer.from(JSON.stringify(o)).toString("base64url");
+
+/**
+ * An `ursula gateway` in front of `upstreams` that checks bearer tokens: RFC 9068 access tokens from
+ * a JWKS this process serves. The bucket `sqlite-e2e` belongs to the tokens `mint` makes, and the
+ * gateway hides its streams from a request without one (404).
+ */
+export class AuthGateway {
+	static readonly audience = "https://streams.e2e";
+	readonly url: string;
+	private readonly issuer: string;
+	private readonly key: KeyObject;
+	private readonly proc: ChildProcess;
+	private readonly jwks: Server;
+
+	private constructor(url: string, issuer: string, key: KeyObject, proc: ChildProcess, jwks: Server) {
+		this.url = url;
+		this.issuer = issuer;
+		this.key = key;
+		this.proc = proc;
+		this.jwks = jwks;
+	}
+
+	/** Starts the gateway, its JWKS and its policy file (written to `dir`). */
+	static async start(upstreams: readonly string[], dir: string): Promise<AuthGateway> {
+		const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+		const jwks = createServer((_, res) => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({ keys: [{ ...publicKey.export({ format: "jwk" }), kid: "e2e", alg: "RS256", use: "sig" }] }));
+		});
+		const issuer = `http://127.0.0.1:${await listen(jwks)}`;
+		const policy = join(dir, `policy-${randomUUID()}.toml`);
+		writeFileSync(policy, `[[bucket]]\nid = "sqlite-e2e"\nowners = [{ issuer = "${issuer}", subject = "vfs-e2e" }]\n`);
+		const probe = createServer();
+		const port = await listen(probe);
+		await new Promise((res) => probe.close(res));
+		const args = ["gateway", "--listen", `127.0.0.1:${port}`, "--raft-group-count", process.env.E2E_GROUPS ?? "4"];
+		for (const upstream of upstreams) args.push("--upstream", upstream);
+		args.push("--auth-issuer", issuer, "--auth-audience", AuthGateway.audience, "--auth-policy", policy, "--auth-jwks-url", `${issuer}/jwks.json`);
+		const proc = spawn(resolve(process.env.URSULA_BIN ?? ""), args, { cwd: dir, stdio: "ignore" });
+		const gateway = new AuthGateway(`http://127.0.0.1:${port}`, issuer, privateKey, proc, jwks);
+		for (let i = 0; ; i++) {
+			const up = await fetch(`${gateway.url}/`).then(
+				() => true,
+				() => false,
+			);
+			if (up) return gateway;
+			if (i > 100 || proc.exitCode !== null) {
+				gateway.close();
+				throw new Error("the gateway did not start");
+			}
+			await new Promise((r) => setTimeout(r, 100));
+		}
+	}
+
+	/** An access token the gateway accepts, valid for an hour. */
+	mint(): string {
+		const now = Math.floor(Date.now() / 1000);
+		const head = b64({ alg: "RS256", typ: "at+jwt", kid: "e2e" });
+		const claims = b64({ iss: this.issuer, sub: "vfs-e2e", aud: AuthGateway.audience, client_id: "vfs-e2e", iat: now, exp: now + 3600, jti: randomUUID() });
+		return `${head}.${claims}.${sign("sha256", Buffer.from(`${head}.${claims}`), this.key).toString("base64url")}`;
+	}
+
+	close(): void {
+		this.proc.kill("SIGKILL");
+		this.jwks.close();
 	}
 }

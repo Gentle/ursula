@@ -40,6 +40,7 @@ use crate::error::Error;
 use crate::error::Fence;
 use crate::frame;
 use crate::frame::PAGE;
+use crate::guard::contain;
 use crate::host::OK;
 use crate::host::unix;
 use crate::local::sidecar_line;
@@ -389,7 +390,7 @@ impl Db {
     }
 }
 
-pub(crate) unsafe extern "C" fn x_open(
+unsafe fn x_open(
     _vfs: *mut ffi::sqlite3_vfs,
     zname: ffi::sqlite3_filename,
     file: *mut ffi::sqlite3_file,
@@ -397,11 +398,6 @@ pub(crate) unsafe extern "C" fn x_open(
     out: *mut c_int,
 ) -> c_int {
     let f = file.cast::<File>();
-    // SAFETY: SQLite passes `szOsFile` writable bytes for the new file, laid out as `File`. Until
-    // its methods are set it is not open, so a failure leaves nothing for SQLite to close.
-    unsafe { (*f).base.pMethods = null() };
-    // SAFETY: as above.
-    unsafe { (*f).ext = null_mut() };
     let name = if zname.is_null() {
         None
     } else {
@@ -442,6 +438,9 @@ pub(crate) unsafe extern "C" fn x_open(
         }
         _ => None,
     };
+    // Released if the open fails, or a panic unwinds through it; once open, the file holds the
+    // count until `x_close`.
+    let mut counted = Counted(name.filter(|_| main.is_some()).map(str::to_owned));
     let u = unix();
     // SAFETY: `UNIX` is null or SQLite's "unix" VFS, which lives for the process.
     let open = unsafe { u.as_ref() }.and_then(|u| u.xOpen);
@@ -451,9 +450,6 @@ pub(crate) unsafe extern "C" fn x_open(
         open(u, zname, inner(file), flags, out)
     });
     if rc != OK {
-        if let Some(name) = name.filter(|_| main.is_some()) {
-            uncount_open(name);
-        }
         return rc;
     }
     let ext = match (name, main) {
@@ -464,54 +460,94 @@ pub(crate) unsafe extern "C" fn x_open(
             exclusive: Cell::new(false),
         }),
         (Some(name), None) if flags & ffi::SQLITE_OPEN_WAL != 0 => {
-            name.strip_suffix("-wal").and_then(lookup).map(|db| {
-                let mut d = lock(&db);
-                d.wal_open = d.wal_open.saturating_add(1);
-                drop(d);
-                Ext {
-                    path: None,
-                    db: Some(db),
-                    wal: true,
-                    exclusive: Cell::new(false),
-                }
+            name.strip_suffix("-wal").and_then(lookup).map(|db| Ext {
+                path: None,
+                db: Some(db),
+                wal: true,
+                exclusive: Cell::new(false),
             })
         }
         _ => None,
     };
+    // Counted once the file is open, below: `x_close` uncounts it.
+    let wal_of = ext.as_ref().filter(|e| e.wal).and_then(|e| e.db.clone());
     if let Some(ext) = ext {
         // SAFETY: as above.
         unsafe { (*f).ext = Box::into_raw(Box::new(ext)) };
     }
     // SAFETY: as above. From here the file is open, and SQLite calls its methods.
     unsafe { (*f).base.pMethods = &raw const METHODS };
+    if let Some(db) = wal_of {
+        let mut d = lock(&db);
+        d.wal_open = d.wal_open.saturating_add(1);
+    }
+    counted.0 = None;
     OK
 }
 
-unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
+/// Sets up `file` as not open: no methods (until they are set it is not open, so a failure leaves
+/// nothing for SQLite to close), no state, and a "unix" file without methods, which its own xOpen
+/// sets once it succeeds (so a panic in between can tell whether there is one to close).
+///
+/// # Safety
+///
+/// `file` is SQLite's allocation for a new file of this VFS (`szOsFile` bytes, laid out as `File`).
+unsafe fn not_open(file: *mut ffi::sqlite3_file) {
     let f = file.cast::<File>();
-    // SAFETY: SQLite closes an open file of this VFS once; its state is taken here.
+    // SAFETY: the caller's contract.
+    unsafe { (*f).base.pMethods = null() };
+    // SAFETY: as above.
+    unsafe { (*f).ext = null_mut() };
+    // SAFETY: as above.
+    unsafe { (*f).inner.pMethods = null() };
+}
+
+/// An open of `path` counted in the registry (`x_open`), released when dropped: also when a panic
+/// unwinds through `x_open` or `x_close`, so the file is not taken for open in this process for
+/// good (attach refuses a file that is open).
+struct Counted(Option<String>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            uncount_open(&path);
+        }
+    }
+}
+
+/// Takes `file`'s state out of it, for `x_close`.
+///
+/// # Safety
+///
+/// `file` is an open file of this VFS that SQLite is closing: it closes a file once.
+unsafe fn take_ext(file: *mut ffi::sqlite3_file) -> Option<Box<Ext>> {
+    let f = file.cast::<File>();
+    // SAFETY: the caller's contract; the state is taken once, here.
     let ext = unsafe { std::mem::replace(&mut (*f).ext, null_mut()) };
-    let ext = if ext.is_null() {
+    if ext.is_null() {
         None
     } else {
         // SAFETY: a non-null `ext` is the `Box` `x_open` leaked for this file, freed only here.
         Some(unsafe { Box::from_raw(ext) })
-    };
-    if let Some(e) = &ext
-        && let Some(db) = &e.db
-    {
+    }
+}
+
+/// The database's bookkeeping of a handle that closes: the WAL handles open, and the main db
+/// handle that holds an EXCLUSIVE lock.
+fn closing(ext: &Ext) {
+    if let Some(db) = &ext.db {
         let mut db = lock(db);
-        if e.wal {
+        if ext.wal {
             db.wal_open = db.wal_open.saturating_sub(1);
-        } else if e.exclusive.get() {
+        } else if ext.exclusive.get() {
             db.exclusive = 0;
         }
     }
-    let rc = fwd!(file, xClose);
-    if let Some(path) = ext.and_then(|e| e.path) {
-        uncount_open(&path);
-    }
-    rc
+}
+
+/// Closes the "unix" file under `file`, whose state `c_close` took and accounted for.
+unsafe fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
+    fwd!(file, xClose)
 }
 
 fn uncount_open(path: &str) {
@@ -606,7 +642,7 @@ unsafe fn overlay_read(
     }
 }
 
-unsafe extern "C" fn x_read(
+unsafe fn x_read(
     file: *mut ffi::sqlite3_file,
     buf: *mut c_void,
     amt: c_int,
@@ -625,7 +661,7 @@ unsafe extern "C" fn x_read(
     unsafe { overlay_read(file, &mut lock(&db), buf, off) }
 }
 
-unsafe extern "C" fn x_write(
+unsafe fn x_write(
     file: *mut ffi::sqlite3_file,
     buf: *const c_void,
     amt: c_int,
@@ -861,7 +897,7 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     OK
 }
 
-unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> c_int {
+unsafe fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> c_int {
     // SAFETY: the module contract.
     if let Some(db) = unsafe { main_db(file) } {
         let mut db = lock(&db);
@@ -902,7 +938,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
 /// A no-op for the db file and WAL of an attached database, whatever `PRAGMA synchronous` says:
 /// they are a cache of the stream, rebuilt after a reboot (see the crate docs), so an fsync would
 /// only add latency to commits and checkpoints.
-unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
+unsafe fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     // SAFETY: the module contract.
     if unsafe { ext(file) }.is_some_and(|e| e.db.is_some()) {
         OK
@@ -911,10 +947,7 @@ unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int
     }
 }
 
-unsafe extern "C" fn x_file_size(
-    file: *mut ffi::sqlite3_file,
-    out: *mut ffi::sqlite3_int64,
-) -> c_int {
+unsafe fn x_file_size(file: *mut ffi::sqlite3_file, out: *mut ffi::sqlite3_int64) -> c_int {
     let rc = fwd!(file, xFileSize, out);
     // SAFETY: the module contract.
     let db = unsafe { wal_db(file) };
@@ -952,7 +985,7 @@ unsafe fn track_exclusive(file: *mut ffi::sqlite3_file, exclusive: bool) {
     }
 }
 
-unsafe extern "C" fn x_lock(file: *mut ffi::sqlite3_file, l: c_int) -> c_int {
+unsafe fn x_lock(file: *mut ffi::sqlite3_file, l: c_int) -> c_int {
     let rc = fwd!(file, xLock, l);
     if rc == OK && l == ffi::SQLITE_LOCK_EXCLUSIVE {
         // SAFETY: the module contract.
@@ -961,7 +994,7 @@ unsafe extern "C" fn x_lock(file: *mut ffi::sqlite3_file, l: c_int) -> c_int {
     rc
 }
 
-unsafe extern "C" fn x_unlock(file: *mut ffi::sqlite3_file, l: c_int) -> c_int {
+unsafe fn x_unlock(file: *mut ffi::sqlite3_file, l: c_int) -> c_int {
     let rc = fwd!(file, xUnlock, l);
     if l < ffi::SQLITE_LOCK_EXCLUSIVE {
         // SAFETY: the module contract.
@@ -970,18 +1003,14 @@ unsafe extern "C" fn x_unlock(file: *mut ffi::sqlite3_file, l: c_int) -> c_int {
     rc
 }
 
-unsafe extern "C" fn x_check_reserved_lock(file: *mut ffi::sqlite3_file, out: *mut c_int) -> c_int {
+unsafe fn x_check_reserved_lock(file: *mut ffi::sqlite3_file, out: *mut c_int) -> c_int {
     fwd!(file, xCheckReservedLock, out)
 }
 
 /// An attached database's WAL persists past its last connection (checkpointed, not deleted), so
 /// the sidecar's claim on it (`WalClaim`) still holds after a clean close. A connection leaving
 /// WAL then reopens it and commits the format change through it, which `commit` refuses.
-unsafe extern "C" fn x_file_control(
-    file: *mut ffi::sqlite3_file,
-    op: c_int,
-    arg: *mut c_void,
-) -> c_int {
+unsafe fn x_file_control(file: *mut ffi::sqlite3_file, op: c_int, arg: *mut c_void) -> c_int {
     // SAFETY: the module contract.
     if op == ffi::SQLITE_FCNTL_PERSIST_WAL && unsafe { main_db(file) }.is_some() {
         // SAFETY: PERSIST_WAL passes a pointer to one `int`, which it writes the setting to.
@@ -991,15 +1020,15 @@ unsafe extern "C" fn x_file_control(
     fwd!(file, xFileControl, op, arg)
 }
 
-unsafe extern "C" fn x_sector_size(file: *mut ffi::sqlite3_file) -> c_int {
+unsafe fn x_sector_size(file: *mut ffi::sqlite3_file) -> c_int {
     fwd!(file, xSectorSize)
 }
 
-unsafe extern "C" fn x_device_characteristics(file: *mut ffi::sqlite3_file) -> c_int {
+unsafe fn x_device_characteristics(file: *mut ffi::sqlite3_file) -> c_int {
     fwd!(file, xDeviceCharacteristics)
 }
 
-unsafe extern "C" fn x_shm_map(
+unsafe fn x_shm_map(
     file: *mut ffi::sqlite3_file,
     pg: c_int,
     pgsz: c_int,
@@ -1024,12 +1053,7 @@ unsafe extern "C" fn x_shm_map(
 /// state the bookkeeping would otherwise see (or whose commit the sidecar would cover before its
 /// rewrites reach the WAL). Lock order: the real shm lock may be taken without the mutex, and the
 /// mutex may be held while releasing it, which never blocks.
-unsafe extern "C" fn x_shm_lock(
-    file: *mut ffi::sqlite3_file,
-    offset: c_int,
-    n: c_int,
-    flags: c_int,
-) -> c_int {
+unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flags: c_int) -> c_int {
     let tracked = flags & ffi::SQLITE_SHM_EXCLUSIVE != 0
         && n == 1
         && (offset == WAL_WRITE_LOCK || offset == WAL_CKPT_LOCK);
@@ -1076,7 +1100,7 @@ unsafe extern "C" fn x_shm_lock(
     rc
 }
 
-unsafe extern "C" fn x_shm_barrier(file: *mut ffi::sqlite3_file) {
+unsafe fn x_shm_barrier(file: *mut ffi::sqlite3_file) {
     // SAFETY: the module contract.
     let (i, methods) = unsafe { unix_file(file) };
     if let Some(barrier) = methods.and_then(|m| m.xShmBarrier) {
@@ -1085,11 +1109,11 @@ unsafe extern "C" fn x_shm_barrier(file: *mut ffi::sqlite3_file) {
     }
 }
 
-unsafe extern "C" fn x_shm_unmap(file: *mut ffi::sqlite3_file, delete: c_int) -> c_int {
+unsafe fn x_shm_unmap(file: *mut ffi::sqlite3_file, delete: c_int) -> c_int {
     fwd!(file, xShmUnmap, delete)
 }
 
-unsafe extern "C" fn x_fetch(
+unsafe fn x_fetch(
     file: *mut ffi::sqlite3_file,
     off: ffi::sqlite3_int64,
     amt: c_int,
@@ -1098,7 +1122,7 @@ unsafe extern "C" fn x_fetch(
     fwd!(file, xFetch, off, amt, pp)
 }
 
-unsafe extern "C" fn x_unfetch(
+unsafe fn x_unfetch(
     file: *mut ffi::sqlite3_file,
     off: ffi::sqlite3_int64,
     p: *mut c_void,
@@ -1106,34 +1130,186 @@ unsafe extern "C" fn x_unfetch(
     fwd!(file, xUnfetch, off, p)
 }
 
+/// A file method's C entry point: runs the method named without `c_` through [`contain`], so a
+/// panic in it answers `$on_panic` instead of unwinding into SQLite (which aborts the host process)
+/// and poisons the file's database, whose state it may have left half changed. `xOpen`, `xClose`
+/// and `xFetch` have entry points of their own.
+macro_rules! io_entry {
+    ($entry:ident => $method:ident($file:ident $(, $arg:ident: $ty:ty)*) -> $ret:ty, $on_panic:expr) => {
+        unsafe extern "C" fn $entry($file: *mut ffi::sqlite3_file $(, $arg: $ty)*) -> $ret {
+            contain(
+                stringify!($method),
+                || {
+                    // SAFETY: `$file` is the open file SQLite called the method on.
+                    unsafe { poison_after_panic($file, stringify!($method)) };
+                    $on_panic
+                },
+                || {
+                    // SAFETY: SQLite's call of the method, forwarded with its arguments.
+                    unsafe { $method($file $(, $arg)*) }
+                },
+            )
+        }
+    };
+}
+
+/// After a panic in a method of `f`: poisons the database `f` belongs to, if any, since the panic
+/// may have left its state half changed. Not after `x_close`, which may have freed `f`'s state.
+/// Not `Db::poison`: the overlay belongs to the connection that holds the WAL write lock, maybe
+/// another than `f`'s, and its reads of pages it spilled must still find them. Its next write
+/// fails (`x_write` refuses a poisoned database), which rolls its transaction back.
+///
+/// # Safety
+///
+/// `f` is an open file of this VFS.
+unsafe fn poison_after_panic(f: *mut ffi::sqlite3_file, entry: &'static str) {
+    // SAFETY: the caller's contract.
+    if let Some(db) = unsafe { ext(f) }.and_then(|e| e.db.clone()) {
+        lock(&db).set_poisoned(Error::Panicked { entry }, None);
+    }
+}
+
+/// `xOpen`'s C entry point (see `io_entry`): nothing is open yet, so a panic has nothing to poison.
+/// The file is set up as not open before the body runs, so whatever the body did before a panic,
+/// the fallback finds initialized fields.
+pub(crate) unsafe extern "C" fn c_open(
+    vfs: *mut ffi::sqlite3_vfs,
+    zname: ffi::sqlite3_filename,
+    file: *mut ffi::sqlite3_file,
+    flags: c_int,
+    out: *mut c_int,
+) -> c_int {
+    // SAFETY: SQLite passes `szOsFile` writable bytes for the new file, laid out as `File`.
+    unsafe { not_open(file) };
+    contain(
+        "x_open",
+        || {
+            // A failed xOpen leaves no methods: SQLite closes a file only when it has them. So the
+            // "unix" file, if its own open succeeded before the panic, is closed here, and the
+            // state `x_open` made for the file freed (its open count was released as the panic
+            // unwound through `x_open`).
+            let _closed = fwd!(file, xClose);
+            // SAFETY: `file` is SQLite's allocation for the new file, which `x_open` initialized
+            // (`ext` null, or the `Box` it made).
+            drop(unsafe { take_ext(file) });
+            // SAFETY: as above.
+            unsafe { (*file).pMethods = null() };
+            ffi::SQLITE_CANTOPEN
+        },
+        || {
+            // SAFETY: SQLite's call of `xOpen`, forwarded with its arguments.
+            unsafe { x_open(vfs, zname, file, flags, out) }
+        },
+    )
+}
+
+/// `xClose`'s C entry point (see `io_entry`). The file's state is taken and accounted for
+/// (`closing`) before the body runs, and its open count released when this returns, however the
+/// body ended: a file that stays counted could never be attached again in this process. So a panic
+/// poisons nothing (the database's state is whole), and the fallback closes the "unix" file, which
+/// is all the body does.
+unsafe extern "C" fn c_close(file: *mut ffi::sqlite3_file) -> c_int {
+    // SAFETY: SQLite's call of `xClose` on an open file of this VFS.
+    let ext = unsafe { take_ext(file) };
+    let _counted = Counted(ext.as_ref().and_then(|e| e.path.clone()));
+    if let Some(e) = &ext {
+        closing(e);
+    }
+    contain(
+        "x_close",
+        || {
+            let _closed = fwd!(file, xClose);
+            ffi::SQLITE_IOERR_CLOSE
+        },
+        || {
+            // SAFETY: as above, with the state taken.
+            unsafe { x_close(file) }
+        },
+    )
+}
+io_entry!(c_read => x_read(file, buf: *mut c_void, amt: c_int, off: ffi::sqlite3_int64) -> c_int, ffi::SQLITE_IOERR_READ);
+io_entry!(c_write => x_write(file, buf: *const c_void, amt: c_int, off: ffi::sqlite3_int64) -> c_int, ffi::SQLITE_IOERR_WRITE);
+io_entry!(c_truncate => x_truncate(file, size: ffi::sqlite3_int64) -> c_int, ffi::SQLITE_IOERR_TRUNCATE);
+io_entry!(c_sync => x_sync(file, flags: c_int) -> c_int, ffi::SQLITE_IOERR_FSYNC);
+io_entry!(c_file_size => x_file_size(file, out: *mut ffi::sqlite3_int64) -> c_int, ffi::SQLITE_IOERR_FSTAT);
+io_entry!(c_lock => x_lock(file, l: c_int) -> c_int, ffi::SQLITE_IOERR_LOCK);
+io_entry!(c_unlock => x_unlock(file, l: c_int) -> c_int, ffi::SQLITE_IOERR_UNLOCK);
+io_entry!(c_check_reserved_lock => x_check_reserved_lock(file, out: *mut c_int) -> c_int, ffi::SQLITE_IOERR_CHECKRESERVEDLOCK);
+io_entry!(c_file_control => x_file_control(file, op: c_int, arg: *mut c_void) -> c_int, ffi::SQLITE_IOERR);
+// SQLite's default sector size and no device characteristics: neither method can report an error.
+io_entry!(c_sector_size => x_sector_size(file) -> c_int, 4096);
+io_entry!(c_device_characteristics => x_device_characteristics(file) -> c_int, 0);
+io_entry!(c_shm_map => x_shm_map(file, pg: c_int, pgsz: c_int, extend: c_int, pp: *mut *mut c_void) -> c_int, ffi::SQLITE_IOERR_SHMMAP);
+io_entry!(c_shm_lock => x_shm_lock(file, offset: c_int, n: c_int, flags: c_int) -> c_int, ffi::SQLITE_IOERR_SHMLOCK);
+io_entry!(c_shm_barrier => x_shm_barrier(file) -> (), ());
+io_entry!(c_shm_unmap => x_shm_unmap(file, delete: c_int) -> c_int, ffi::SQLITE_IOERR);
+io_entry!(c_unfetch => x_unfetch(file, off: ffi::sqlite3_int64, p: *mut c_void) -> c_int, ffi::SQLITE_IOERR);
+
+/// `xFetch`'s C entry point (see `io_entry`): after a panic it also leaves no mapping in `*pp`.
+unsafe extern "C" fn c_fetch(
+    file: *mut ffi::sqlite3_file,
+    off: ffi::sqlite3_int64,
+    amt: c_int,
+    pp: *mut *mut c_void,
+) -> c_int {
+    contain(
+        "x_fetch",
+        || {
+            // SAFETY: `file` is the open file SQLite called the method on.
+            unsafe { poison_after_panic(file, "x_fetch") };
+            if !pp.is_null() {
+                // SAFETY: SQLite passes `pp` writable for the mapping.
+                unsafe { *pp = null_mut() };
+            }
+            ffi::SQLITE_IOERR
+        },
+        || {
+            // SAFETY: SQLite's call of `xFetch`, forwarded with its arguments.
+            unsafe { x_fetch(file, off, amt, pp) }
+        },
+    )
+}
+
 static METHODS: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
     iVersion: 3,
-    xClose: Some(x_close),
-    xRead: Some(x_read),
-    xWrite: Some(x_write),
-    xTruncate: Some(x_truncate),
-    xSync: Some(x_sync),
-    xFileSize: Some(x_file_size),
-    xLock: Some(x_lock),
-    xUnlock: Some(x_unlock),
-    xCheckReservedLock: Some(x_check_reserved_lock),
-    xFileControl: Some(x_file_control),
-    xSectorSize: Some(x_sector_size),
-    xDeviceCharacteristics: Some(x_device_characteristics),
-    xShmMap: Some(x_shm_map),
-    xShmLock: Some(x_shm_lock),
-    xShmBarrier: Some(x_shm_barrier),
-    xShmUnmap: Some(x_shm_unmap),
-    xFetch: Some(x_fetch),
-    xUnfetch: Some(x_unfetch),
+    xClose: Some(c_close),
+    xRead: Some(c_read),
+    xWrite: Some(c_write),
+    xTruncate: Some(c_truncate),
+    xSync: Some(c_sync),
+    xFileSize: Some(c_file_size),
+    xLock: Some(c_lock),
+    xUnlock: Some(c_unlock),
+    xCheckReservedLock: Some(c_check_reserved_lock),
+    xFileControl: Some(c_file_control),
+    xSectorSize: Some(c_sector_size),
+    xDeviceCharacteristics: Some(c_device_characteristics),
+    xShmMap: Some(c_shm_map),
+    xShmLock: Some(c_shm_lock),
+    xShmBarrier: Some(c_shm_barrier),
+    xShmUnmap: Some(c_shm_unmap),
+    xFetch: Some(c_fetch),
+    xUnfetch: Some(c_unfetch),
 };
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::ffi::c_int;
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+    use std::ptr::null;
+    use std::ptr::null_mut;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     use libsqlite3_sys as ffi;
 
+    use super::Ext;
+    use super::File;
+    use super::METHODS;
+    use super::c_open;
     use super::lost_page;
     use crate::client::mock::LAST;
     use crate::client::mock::VOUCH;
@@ -1143,7 +1319,10 @@ mod tests {
     use crate::client::mock::request_header;
     use crate::client::mock::serve;
     use crate::client::mock::vouched;
+    use crate::config::set_panic_in_for_tests;
     use crate::db::Db;
+    use crate::db::lock;
+    use crate::db::registry;
     use crate::error::Error;
     use crate::error::WriteRefusal;
     use crate::frame::PAGE;
@@ -1488,5 +1667,222 @@ mod tests {
         );
         // A read that covers part of a page does not check it.
         assert_eq!(lost_page(&written, &none, &[0u8; 100], first), None);
+    }
+
+    // Every file method's C entry point contains a panic (one on purpose here: the entry point
+    // panics before its body touches the file). It answers the method's own error code (the sector
+    // size and device characteristics, which cannot report one, answer 4096 and 0) and poisons the
+    // file's database with the method's name, except `xClose`, which may have freed the file's
+    // state. The calls go through the methods table SQLite gets, so each method is wired to its
+    // entry point. `xOpen` answers SQLITE_CANTOPEN and leaves the file without methods.
+    #[test]
+    fn every_file_entry_point_contains_a_panic() {
+        let db = Arc::new(Mutex::new(Db::for_tests()));
+        let mut file = wal_file_of(&db);
+        let f = (&raw mut file).cast::<ffi::sqlite3_file>();
+        let mut buf = [0u8; 16];
+        let mut size: ffi::sqlite3_int64 = 0;
+        let mut flag: c_int = 0;
+        let mut region: *mut c_void = null_mut();
+        let m = &METHODS;
+        macro_rules! contained {
+            ($entry:literal, $call:expr, $code:expr) => {{
+                set_panic_in_for_tests(Some($entry));
+                // SAFETY: the entry point panics before its body touches `f`, whose own state
+                // (`ext`) is valid.
+                let answer = unsafe { $call };
+                assert_eq!(answer, $code, $entry);
+                let mut d = lock(&db);
+                let poisoned = d.poisoned.take();
+                assert!(
+                    matches!(&poisoned, Some(p) if matches!(p.first, Error::Panicked { entry } if entry == $entry)),
+                    $entry
+                );
+            }};
+        }
+        contained!(
+            "x_read",
+            m.xRead.unwrap()(f, buf.as_mut_ptr().cast(), 16, 0),
+            ffi::SQLITE_IOERR_READ
+        );
+        contained!(
+            "x_write",
+            m.xWrite.unwrap()(f, buf.as_ptr().cast(), 16, 0),
+            ffi::SQLITE_IOERR_WRITE
+        );
+        contained!(
+            "x_truncate",
+            m.xTruncate.unwrap()(f, 0),
+            ffi::SQLITE_IOERR_TRUNCATE
+        );
+        contained!("x_sync", m.xSync.unwrap()(f, 0), ffi::SQLITE_IOERR_FSYNC);
+        contained!(
+            "x_file_size",
+            m.xFileSize.unwrap()(f, &raw mut size),
+            ffi::SQLITE_IOERR_FSTAT
+        );
+        contained!("x_lock", m.xLock.unwrap()(f, 1), ffi::SQLITE_IOERR_LOCK);
+        contained!(
+            "x_unlock",
+            m.xUnlock.unwrap()(f, 0),
+            ffi::SQLITE_IOERR_UNLOCK
+        );
+        contained!(
+            "x_check_reserved_lock",
+            m.xCheckReservedLock.unwrap()(f, &raw mut flag),
+            ffi::SQLITE_IOERR_CHECKRESERVEDLOCK
+        );
+        contained!(
+            "x_file_control",
+            m.xFileControl.unwrap()(f, 0, null_mut()),
+            ffi::SQLITE_IOERR
+        );
+        contained!("x_sector_size", m.xSectorSize.unwrap()(f), 4096);
+        contained!(
+            "x_device_characteristics",
+            m.xDeviceCharacteristics.unwrap()(f),
+            0
+        );
+        contained!(
+            "x_shm_map",
+            m.xShmMap.unwrap()(f, 0, 32768, 0, &raw mut region),
+            ffi::SQLITE_IOERR_SHMMAP
+        );
+        contained!(
+            "x_shm_lock",
+            m.xShmLock.unwrap()(f, 0, 1, 0),
+            ffi::SQLITE_IOERR_SHMLOCK
+        );
+        contained!("x_shm_barrier", m.xShmBarrier.unwrap()(f), ());
+        contained!("x_shm_unmap", m.xShmUnmap.unwrap()(f, 0), ffi::SQLITE_IOERR);
+        region = NonNull::dangling().as_ptr();
+        contained!(
+            "x_fetch",
+            m.xFetch.unwrap()(f, 0, 16, &raw mut region),
+            ffi::SQLITE_IOERR
+        );
+        assert!(region.is_null(), "a failed xFetch leaves no mapping");
+        contained!(
+            "x_unfetch",
+            m.xUnfetch.unwrap()(f, 0, null_mut()),
+            ffi::SQLITE_IOERR
+        );
+        set_panic_in_for_tests(Some("x_open"));
+        let mut out: c_int = 0;
+        // SAFETY: `c_open` panics before its body reads any argument.
+        let opened = unsafe { c_open(null_mut(), null(), f, 0, &raw mut out) };
+        assert_eq!(opened, ffi::SQLITE_CANTOPEN);
+        assert!(
+            file.base.pMethods.is_null(),
+            "a failed xOpen leaves no methods"
+        );
+        set_panic_in_for_tests(Some("x_close"));
+        // SAFETY: as in `contained`; `c_close` takes and frees the state `wal_file_of` made.
+        let closed = unsafe { m.xClose.unwrap()(f) };
+        set_panic_in_for_tests(None);
+        assert_eq!(closed, ffi::SQLITE_IOERR_CLOSE);
+        assert!(
+            lock(&db).poisoned.is_none(),
+            "xClose poisons nothing: its bookkeeping is done before the body"
+        );
+        assert!(file.ext.is_null());
+    }
+
+    // A panic in `xClose` still releases the file's open count: a file that stays counted could
+    // never be attached again in this process.
+    #[test]
+    fn a_panic_in_close_releases_the_open_count() {
+        let path = format!("/a-panic-in-close-{}", std::process::id());
+        registry().open.insert(path.clone(), 1);
+        let mut file = File {
+            base: ffi::sqlite3_file {
+                pMethods: &raw const METHODS,
+            },
+            ext: Box::into_raw(Box::new(Ext {
+                path: Some(path.clone()),
+                db: None,
+                wal: false,
+                exclusive: Cell::new(false),
+            })),
+            inner: ffi::sqlite3_file { pMethods: null() },
+        };
+        set_panic_in_for_tests(Some("x_close"));
+        // SAFETY: `c_close` takes and frees the state above, and panics before its body.
+        let closed = unsafe { METHODS.xClose.unwrap()((&raw mut file).cast()) };
+        set_panic_in_for_tests(None);
+        assert_eq!(closed, ffi::SQLITE_IOERR_CLOSE);
+        assert!(!registry().open.contains_key(&path));
+    }
+
+    // A panic poisons the database without dropping the overlay, which belongs to the connection
+    // that holds the WAL write lock (maybe another than the one that panicked): its reads of
+    // pages it spilled still find them, and its next write fails, which rolls its transaction
+    // back.
+    #[test]
+    fn a_panic_poisons_without_dropping_the_writers_overlay() {
+        let db = Arc::new(Mutex::new(Db::for_tests()));
+        lock(&db).overlay.insert(4096, vec![7u8; 16]);
+        let mut file = wal_file_of(&db);
+        let f = (&raw mut file).cast::<ffi::sqlite3_file>();
+        let mut buf = [0u8; 16];
+        set_panic_in_for_tests(Some("x_read"));
+        // SAFETY: `c_read` panics before its body touches `f`.
+        let read = unsafe { METHODS.xRead.unwrap()(f, buf.as_mut_ptr().cast(), 16, 0) };
+        set_panic_in_for_tests(None);
+        assert_eq!(read, ffi::SQLITE_IOERR_READ);
+        let d = lock(&db);
+        assert!(d.poisoned.is_some());
+        assert_eq!(d.overlay.get(&4096), Some(&vec![7u8; 16]));
+        drop(d);
+        // SAFETY: a WAL write to a poisoned database is refused before it reaches the file.
+        let write = unsafe { METHODS.xWrite.unwrap()(f, buf.as_ptr().cast(), 16, 32) };
+        assert_eq!(write, ffi::SQLITE_IOERR_WRITE);
+        // SAFETY: the `Box` `wal_file_of` made, which nothing freed.
+        drop(unsafe { Box::from_raw(file.ext) });
+    }
+
+    /// An open WAL handle of `db` for the entry points: this VFS's state alone, with no "unix" file
+    /// under it (`inner` has no methods). The caller frees `ext`.
+    fn wal_file_of(db: &Arc<Mutex<Db>>) -> File {
+        File {
+            base: ffi::sqlite3_file {
+                pMethods: &raw const METHODS,
+            },
+            ext: Box::into_raw(Box::new(Ext {
+                path: None,
+                db: Some(db.clone()),
+                wal: true,
+                exclusive: Cell::new(false),
+            })),
+            inner: ffi::sqlite3_file { pMethods: null() },
+        }
+    }
+
+    // An open that fails (here the "unix" VFS is missing, as in every unit test) releases the open
+    // count it took: a count left behind would refuse every later attach of the file in this
+    // process.
+    #[test]
+    fn a_failed_open_releases_its_open_count() {
+        let path = format!("/a-failed-open-{}", std::process::id());
+        let name = std::ffi::CString::new(path.clone()).unwrap();
+        let mut file = File {
+            base: ffi::sqlite3_file { pMethods: null() },
+            ext: null_mut(),
+            inner: ffi::sqlite3_file { pMethods: null() },
+        };
+        let mut out: c_int = 0;
+        // SAFETY: a `File` to open, and a name that outlives the call.
+        let opened = unsafe {
+            c_open(
+                null_mut(),
+                name.as_ptr(),
+                (&raw mut file).cast(),
+                ffi::SQLITE_OPEN_MAIN_DB | ffi::SQLITE_OPEN_READWRITE,
+                &raw mut out,
+            )
+        };
+        assert_eq!(opened, ffi::SQLITE_CANTOPEN);
+        assert!(file.base.pMethods.is_null());
+        assert!(!registry().open.contains_key(&path));
     }
 }

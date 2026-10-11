@@ -1135,4 +1135,37 @@ impl GroupEngineError {
     pub fn is_backpressure(&self) -> bool {
         self.infra().is_some_and(GroupInfraError::is_backpressure)
     }
+
+    /// The refusal this error reports when the engine raised it before it
+    /// proposed the write's command, so that nothing of the write can apply.
+    /// A forward OpenRaft reports after `client_write`, and every other error,
+    /// can follow a proposal or is no refusal to retry. The HTTP layer marks
+    /// exactly these answers as applying nothing.
+    pub fn refused_before_proposal(&self) -> Option<RefusedBeforeProposal> {
+        if self.is_forward_before_proposal() {
+            return Some(RefusedBeforeProposal::NotLeader);
+        }
+        match self.infra()? {
+            GroupInfraError::RaftUncommittedBackpressure { .. } => {
+                Some(RefusedBeforeProposal::RaftUncommittedBackpressure)
+            }
+            GroupInfraError::ColdBackpressure { .. } => {
+                Some(RefusedBeforeProposal::ColdBackpressure)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What the engine refused a write for before it proposed the write's command
+/// ([`GroupEngineError::refused_before_proposal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedBeforeProposal {
+    /// The engine's own leadership check found that the node does not lead
+    /// the group (RT1).
+    NotLeader,
+    /// The group's proposed but unapplied bytes would exceed their limit.
+    RaftUncommittedBackpressure,
+    /// The group's hot bytes would exceed the cold-tier limit.
+    ColdBackpressure,
 }

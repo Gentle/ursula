@@ -822,12 +822,12 @@ must say in its release notes to stop every owner of a stream before upgrading.
   sequence a refused commit left free it poisons, the first commit after a claim included. A 200
   there, a 204 at a sequence no refused commit used (a commit refused at an older epoch, or a
   refused snapshot publish, leaves none), and a 204 after an attempt whose outcome is unknown (no
-  answer, or a `307`, marked and vouched for or not) are acknowledged, the last with
-  `refused_commit_unchecked` at a refused commit's sequence. No request follows a redirect: a `307`
-  is sent again to the same URL with the same method, token and sequence (an append's or a `PUT`'s
-  outcome stays unknown to the end of the budget, and a `HEAD`, a read, a snapshot `GET` or a create
-  then fails with the redirect's status, never as a missing stream or snapshot), and any other
-  redirect, a `308` included, fails the request at once with its `Location`.
+  answer, or a `307`, marked and vouched for or not) are acknowledged. No request follows a
+  redirect: a `307` is sent again to the same URL with the same method, token and sequence (an
+  append's or a `PUT`'s outcome stays unknown to the end of the budget, and a `HEAD`, a read, a
+  snapshot `GET` or a create then fails with the redirect's status, never as a missing stream or
+  snapshot), and any other redirect, a `308` included, fails the request at once with its
+  `Location`.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is

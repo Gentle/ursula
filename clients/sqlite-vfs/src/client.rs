@@ -19,9 +19,11 @@ use ureq::tls::TlsConfig;
 use crate::auth;
 use crate::config::ca_file;
 use crate::config::idle_age;
+use crate::config::max_frame_bytes;
 use crate::config::retry_budget;
 use crate::error::Attempt;
 use crate::error::Error;
+use crate::error::FrameLimit;
 use crate::error::Gone;
 use crate::error::WriteRefusal;
 use crate::log;
@@ -267,16 +269,21 @@ pub(crate) enum Proof {
 }
 
 impl Proof {
+    /// The marker's token, empty for a proof by status.
+    fn token(self) -> String {
+        match self {
+            Proof::Marked(token) => token,
+            Proof::Status => String::new(),
+        }
+    }
+
     /// The refusal that an answer with `status` and `body`, proven this way, stands for: a 401,
     /// 402, 403 or 429 keeps its own kind, marked or not, and a vouched marker names any other
     /// (`NotApplied`, with the marker's token). A kind of its own carries the layer's explanation:
     /// its body, or the marker's token when the body is empty (Ursula's gateway answers its
     /// refusals without a body).
     pub(crate) fn refusal(self, status: u16, body: String) -> WriteRefusal {
-        let token = match self {
-            Proof::Marked(token) => token,
-            Proof::Status => String::new(),
-        };
+        let token = self.token();
         let explained = if body.trim().is_empty() {
             token.clone()
         } else {
@@ -512,6 +519,10 @@ pub(crate) enum Append {
     /// Refused before it reached the stream, and so was every earlier attempt of it (see
     /// `append`): nothing was appended, and the producer sequence is still free.
     Refused(WriteRefusal),
+    /// Refused by the extension itself and never sent: the frame is over the frame limit
+    /// (`max_frame_bytes`). No exchange took place, so unlike [`Append::Refused`] it says nothing
+    /// about the layers in front of the stream, and no exchange can have applied it.
+    Unsent(WriteRefusal),
     /// A definite rejection, or no answer within the retry budget.
     Failed(Error),
 }
@@ -564,6 +575,12 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// A 307 is an unknown outcome, sent again to the same URL with the same sequence
 /// (`redirect_retried`); any other redirect (a 308 among them) fails the append
 /// ([`Error::Redirected`]).
+///
+/// A frame over `max_frame_bytes()` is never sent: it ends as [`Append::Unsent`] at once, with
+/// [`WriteRefusal::TooLarge`]. A 413 that proves it applied nothing (`applied_nothing`: marked and
+/// vouched for) ends as [`Append::Refused`] with the same kind, while no attempt can have reached
+/// the stream (any other is a rejection, like any other 4xx that proves nothing). The same frame
+/// can never pass, so neither is retried.
 pub(crate) fn append(
     url: &str,
     incarnation: &str,
@@ -572,6 +589,13 @@ pub(crate) fn append(
     epoch: u64,
     seq: u64,
 ) -> Append {
+    // A frame the server cannot take is never sent, so nothing of it reaches the stream and the
+    // commit fails alone (design doc §7). Sent, it would be refused with a 413 that may be
+    // unmarked, or with the connection closed before the body was read, which is no answer.
+    let limit = max_frame_bytes();
+    if body.len() > limit {
+        return Append::Unsent(WriteRefusal::frame_over_limit(body.len(), limit));
+    }
     let started = Instant::now();
     let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(20);
@@ -672,6 +696,18 @@ pub(crate) fn append(
                             return Append::SeqConflict {
                                 body: body_text(&mut r),
                             };
+                        }
+                        // Proven (only a vouched marker proves a 413): refused for its size before
+                        // anything handled it, by a limit in front that is lower than the
+                        // extension's own. Final, like any proven 4xx, but named for what the
+                        // application can do about it: a smaller commit.
+                        413 if !reached && proof.is_some() => {
+                            return Append::Refused(WriteRefusal::TooLarge {
+                                bytes: body.len(),
+                                over: FrameLimit::InFront {
+                                    token: proof.map(Proof::token).unwrap_or_default(),
+                                },
+                            });
                         }
                         // A definite rejection (429 is retried, below), final: the append fails
                         // alone when the answer proves it applied nothing and no earlier attempt
@@ -1166,6 +1202,7 @@ mod tests {
     use crate::auth::set_token;
     use crate::error::Attempt;
     use crate::error::Error;
+    use crate::error::FrameLimit;
     use crate::error::WriteRefusal;
 
     /// Held by each test that sets the process-wide token (`set_token`): tests run in parallel.
@@ -1505,7 +1542,7 @@ mod tests {
             answer_with_body(&format!("429 Too Many Requests\r\n{LAST}"), "slow down"),
             // A marked 429 stays rate limiting, with the marker's token for the body it lacks.
             marked("429 Too Many Requests", "TenantRateLimited", LAST),
-            // A marked final answer: refused at once. Unmarked: rejected (poisons).
+            // A vouched 413: refused at once, as too large. Unmarked: rejected (poisons).
             answer(&format!(
                 "413 Payload Too Large\r\n{}",
                 vouched("RequestBodyTooLarge")
@@ -1544,7 +1581,7 @@ mod tests {
         let too_large = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
             &too_large,
-            Append::Refused(WriteRefusal::NotApplied { status: 413, reason }) if reason == "RequestBodyTooLarge"
+            Append::Refused(WriteRefusal::TooLarge { bytes: 1, over: FrameLimit::InFront { token } }) if token == "RequestBodyTooLarge"
         ));
         let rejected = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
@@ -1658,6 +1695,35 @@ mod tests {
             ..
         } if body == "QuotaExhausted"));
         assert_eq!(server.join().unwrap().len(), 10);
+    }
+
+    // A frame over the extension's limit is never sent: the append fails alone at once as too
+    // large, and nothing reaches the server (with no answer to give, it would refuse a connection).
+    // A frame at the limit is sent.
+    #[test]
+    fn a_frame_over_the_limit_is_never_sent() {
+        use crate::config::DEFAULT_MAX_FRAME_BYTES;
+
+        // A listener that never accepts: a connection would still be queued on it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", listener.local_addr().unwrap());
+        let over = vec![0_u8; DEFAULT_MAX_FRAME_BYTES + 1];
+        let refused = append(&url, "i1", "p", &over, 1, 1);
+        assert!(matches!(
+            refused,
+            Append::Unsent(WriteRefusal::TooLarge { bytes, over: FrameLimit::Extension { limit } })
+                if bytes == DEFAULT_MAX_FRAME_BYTES + 1 && limit == DEFAULT_MAX_FRAME_BYTES
+        ));
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "nothing connected");
+
+        let (url, server) = serve(vec![answer("200 OK")]);
+        let at = vec![0_u8; DEFAULT_MAX_FRAME_BYTES];
+        assert!(matches!(
+            append(&url, "i1", "p", &at, 1, 1),
+            Append::Acked { attempts: 1, .. }
+        ));
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     // One attempt whose outcome is unknown (no answer, an unmarked 5xx) and the append may be in

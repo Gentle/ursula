@@ -75,6 +75,61 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
     PANIC_IN_FOR_TESTS.set(entry);
 }
 
+/// The largest commit frame the extension sends by default: the server refuses a request body over
+/// 32 MiB, and so does a gateway by default (`--max-request-body-bytes`).
+pub(crate) const DEFAULT_MAX_FRAME_BYTES: usize = 32 << 20;
+
+/// The smallest frame limit `URSULA_VFS_MAX_FRAME_BYTES` may set: well above a claim frame (about
+/// 50 bytes), which every attach of an owner sends, and a commit of a few pages.
+pub(crate) const MIN_FRAME_BYTES: usize = 64 << 10;
+
+/// The largest commit frame the extension sends (`client::append`): `URSULA_VFS_MAX_FRAME_BYTES` in
+/// bytes, or [`DEFAULT_MAX_FRAME_BYTES`]. Lower it to a smaller limit in front of the server. A
+/// value outside [`MIN_FRAME_BYTES`] to [`DEFAULT_MAX_FRAME_BYTES`] is taken to the nearer bound,
+/// and one that is not a number of bytes (`16MiB`, say) is ignored, both logged once
+/// (`setting_adjusted`): 0 would refuse every claim, and a frame above the server's limit would be
+/// sent and refused in a way that can poison.
+pub(crate) fn max_frame_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        let Ok(value) = std::env::var("URSULA_VFS_MAX_FRAME_BYTES") else {
+            return DEFAULT_MAX_FRAME_BYTES;
+        };
+        match frame_limit_from(&value) {
+            Setting::Taken(limit) => limit,
+            Setting::Adjusted(used) => {
+                log::emit(Level::Warn, "setting_adjusted", &[
+                    ("setting", &"URSULA_VFS_MAX_FRAME_BYTES"),
+                    ("value", &value),
+                    ("used", &used),
+                ]);
+                used
+            }
+        }
+    })
+}
+
+/// What a setting's value sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Setting<T> {
+    /// The value, as given.
+    Taken(T),
+    /// Something else, because the value is out of range or not a number: logged once as
+    /// `setting_adjusted`.
+    Adjusted(T),
+}
+
+/// The frame limit `URSULA_VFS_MAX_FRAME_BYTES=value` sets (see [`max_frame_bytes`]).
+fn frame_limit_from(value: &str) -> Setting<usize> {
+    match value.trim().parse::<usize>() {
+        Ok(bytes) if (MIN_FRAME_BYTES..=DEFAULT_MAX_FRAME_BYTES).contains(&bytes) => {
+            Setting::Taken(bytes)
+        }
+        Ok(bytes) => Setting::Adjusted(bytes.clamp(MIN_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES)),
+        Err(_not_a_number) => Setting::Adjusted(DEFAULT_MAX_FRAME_BYTES),
+    }
+}
+
 pub(crate) fn snapshot_min_bytes() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
@@ -128,4 +183,33 @@ pub(crate) fn token_file() -> Option<&'static str> {
 
 fn non_empty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_MAX_FRAME_BYTES;
+    use super::MIN_FRAME_BYTES;
+    use super::Setting;
+    use super::frame_limit_from;
+
+    // The frame limit is a number of bytes from 64 KiB to 32 MiB, both included: below, an owner's
+    // claim could be refused, and above, a frame the server cannot take would be sent. A value
+    // outside is taken to the nearer bound, and one that is not a number keeps 32 MiB, both
+    // adjusted (logged as `setting_adjusted`).
+    #[test]
+    fn the_frame_limit_stays_between_64_kib_and_32_mib() {
+        assert_eq!(
+            (MIN_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES),
+            (65_536, 33_554_432)
+        );
+        assert_eq!(frame_limit_from("1048576"), Setting::Taken(1_048_576));
+        assert_eq!(frame_limit_from(" 524288 "), Setting::Taken(524_288));
+        assert_eq!(frame_limit_from("65536"), Setting::Taken(65_536));
+        assert_eq!(frame_limit_from("33554432"), Setting::Taken(33_554_432));
+        assert_eq!(frame_limit_from("65535"), Setting::Adjusted(65_536));
+        assert_eq!(frame_limit_from("33554433"), Setting::Adjusted(33_554_432));
+        assert_eq!(frame_limit_from("0"), Setting::Adjusted(65_536));
+        assert_eq!(frame_limit_from("16MiB"), Setting::Adjusted(33_554_432));
+        assert_eq!(frame_limit_from(""), Setting::Adjusted(33_554_432));
+    }
 }

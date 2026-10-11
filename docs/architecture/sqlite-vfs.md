@@ -118,14 +118,24 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   epoch, producer sequence and offset, so the next commit is sent as usual, with the sequence the
   refused append never used, and is acknowledged once the refusals stop, without a new attach.
   `ursula_status` reports `writes_refused`, with `refused_kind` (`payment_required`,
-  `unauthorized`, `forbidden`, `rate_limited` or `not_applied`, the last for any status but 401,
-  402, 403 and 429) and `refused_reason` (the refusing layer's response body, its first 256 bytes
-  followed by `...` when it is longer, or the marker's value when the body is empty, and always the
-  marker's value for `not_applied`), until a commit is acknowledged or the database is poisoned
-  (it then needs an attach whatever the layer does). A 402 also shows in `payment_required` and
-  `payment_reason`, its fields since 0.7.1. The extension logs `writes_refused`
-  (`payment_required` for a 402) when refusals of a kind start, and `writes_resumed` at the first
-  acknowledged commit after them.
+  `unauthorized`, `forbidden`, `rate_limited`, `not_applied` for any status but 401, 402, 403, 413
+  and 429, or `too_large` for a commit too large for one request, §7) and `refused_reason` (the
+  refusing layer's response body, its first 256 bytes followed by `...` when it is longer, or the
+  marker's value when the body is empty, and always the marker's value for `not_applied`, and for
+  `too_large` the frame's size and limit, or the marker's value of the 413), until a commit is
+  acknowledged or the database is poisoned (it then needs an attach whatever the layer does). A 402
+  also shows in `payment_required` and `payment_reason`, its fields since 0.7.1. The extension logs
+  `writes_refused` (`payment_required` for a 402) when refusals of a kind start, and
+  `writes_resumed` at the first acknowledged commit after them. A transaction that the extension
+  refuses itself, over its frame limit (`too_large`, §7), was never sent (`Append::Unsent`,
+  `Db::refuse_unsent`). It is the latest refusal, which `writes_refused`, `refused_kind` and
+  `refused_reason` report, but it leaves what a layer refused before it as it was (`layer_refused`):
+  `payment_required` stays, and so does the hold on snapshots. Nor does it set or clear the check
+  below that catches a false refusal at the next commit: the stream cannot hold a frame that was
+  never sent. A frame too large to encode at all is refused unsent too. A vouched `413` from a
+  lower limit in front (`too_large` as well) refuses that frame alone, so it leaves
+  `layer_refused`, and with it `payment_required` and the hold on snapshots, as it was too. It was
+  an exchange, so it sets the check like any refusal a layer answered.
 - This holds only while no attempt of the append can have reached the stream. After an attempt whose
   outcome is unknown (no answer, a `307`, or a 5xx without a vouched marker) the append may be in
   the stream, and the next commit, sent with the same sequence, would be answered as its duplicate,
@@ -753,8 +763,32 @@ The crate refuses to build with `panic = "abort"`.
 - One owner process per stream at a time; connections in other processes that load the extension
   cannot open the file (§1); processes without it are not replicated (and block recovery).
 - The local files must be on a local filesystem (§6).
-- Commit frames are at most the server's request limit (32 MiB), about 8000 changed pages per
-  transaction.
+- A transaction must fit one request. Its commit frame as sent, a 12-byte header and the
+  transaction's changed pages compressed with zstd, is at most `URSULA_VFS_MAX_FRAME_BYTES` (in
+  bytes, from 64 KiB to 32 MiB: a value outside is taken to the nearer bound, and one that is not
+  a number of bytes is ignored, both logged once as `setting_adjusted`): 32 MiB (33,554,432 bytes)
+  by default, the server's request body limit, which a gateway's `--max-request-body-bytes`
+  matches by default. That is about 8,000 changed pages of incompressible data (random, encrypted
+  or already compressed bytes, such as embeddings or media), and about three times as many of
+  typical text. A larger transaction is never sent. It fails alone with `SQLITE_IOERR_AUTH`,
+  `refused_kind` `too_large` and the frame's size and the limit in `refused_reason` (§2), the
+  database stays usable, and snapshots go on. Before it refuses, the extension holds the
+  transaction several times in memory: the changed pages, the record built from them, and its
+  compressed frame. Split bulk imports into smaller transactions. Statements that rewrite a whole
+  table or index run as one transaction too: `CREATE INDEX` on a large table, `REINDEX`, an `ALTER
+  TABLE` that rebuilds the table, and `VACUUM`, which rewrites every page. On a database whose
+  compressed size is above the limit, `VACUUM` fails the same way: delete rows before it, so that
+  what it writes compresses below the limit, or copy the rows into a new database in transactions
+  below the limit.
+- Behind a layer with a lower request limit, set `URSULA_VFS_MAX_FRAME_BYTES` at or below it (64
+  KiB at least). A `413` marked `x-ursula-not-applied` and vouched for (§2) fails the commit alone
+  as `too_large`. The gateway's per-bucket body limit reads the whole body before it answers, so
+  its 413 reaches the client. Its `--max-request-body-bytes` stops reading at the limit, answers a
+  vouched 413, and closes the connection with the rest of the body unread (#540). A commit a little
+  over the limit may still get the 413 and fail alone as `too_large`. One far over it usually meets
+  a failed write, an unknown outcome, and the commit poisons once the retry budget runs out. The
+  server's limit equals the default frame limit, which the setting cannot raise past, so no frame
+  the extension sends is over it. Any other `413` poisons at once.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
   by the server at 1 GiB compressed (32 MiB inline or through the gateway).
 - Producer expiry after 7 idle days; the owner reclaims only if nobody wrote meanwhile.
@@ -843,7 +877,8 @@ must say in its release notes to stop every owner of a stream before upgrading.
   the next commit goes out with the same sequence, and a re-claim refused this way refuses the
   commit too. An unmarked 403, the marker alone or the vouch alone, and one attempt marked alone
   among vouched refusals poison. A poison clears the refusal (and a refusal after a poison is not
-  recorded), no snapshot is taken while any refusal is recorded, `ursula_status` reports the kind
+  recorded), no snapshot is taken while a layer's refusal that refuses other writes is recorded,
+  `ursula_status` reports the kind
   and the reason (a 402 also in its 0.7.1 fields), a refused attach gets `SQLITE_AUTH` for a 402 and
   `SQLITE_IOERR_AUTH` otherwise, and the attach mode parses. A 204 to a commit while no earlier
   attempt of it can have reached the stream is told apart from an acknowledgement, and at the
@@ -862,6 +897,15 @@ must say in its release notes to stop every owner of a stream before upgrading.
   file's open count) and `xOpen` (which leaves the file without methods, and releases the open
   count of an open that failed). A panic poisons without dropping the writer's overlay, and the
   next WAL write fails.
+- Units also cover commit frames too large for one request. A frame over the frame limit is never
+  sent (the stand-in server receives nothing), and one at the limit is. A vouched 413 refuses a
+  commit as `too_large`, and a 413 with one of the two headers or none is a rejection. The limit
+  setting stays between 64 KiB and 32 MiB. A frame too large to encode at all is refused unsent too,
+  and any other failure to encode one poisons. A transaction refused unsent leaves a layer's
+  refusal, `payment_required` and the sequence check as they were: a duplicate's answer to the next
+  commit is acknowledged, unless a layer refused a commit at that sequence before. A vouched 413
+  leaves a layer's earlier refusal as it was too, and a due snapshot waits only while a layer's
+  refusal that refuses other writes is recorded.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -919,7 +963,11 @@ must say in its release notes to stop every owner of a stream before upgrading.
   unmarked one poisons. An attach the vouched 403 refuses throws `UrsulaWriteRefusedError`, one the
   unmarked 403 refuses fails with `SQLITE_ERROR`, and a read-only attach reads meanwhile. Through
   Pi, a refused commit rejects with `UrsulaWriteRefusedError` and the storage commits again once
-  allowed.
+  allowed. A 40 MiB transaction of random blobs is never sent: it fails alone as `too_large` with
+  its size and the limit in `refused_reason`, the gate forwards nothing meanwhile, the next commit
+  succeeds, a fresh attach of the stream holds the accepted rows alone, and the owner's own files,
+  attached again, pass `integrity_check` with the same rows. With `URSULA_VFS_MAX_FRAME_BYTES` set
+  to 1 MiB, a 2 MiB transaction fails the same way.
 - Panics (`test/panics.e2e.ts`, each case in its own Node process with `URSULA_VFS_PANIC_IN`). Every
   SQL function and the extension's init fail with "panicked inside the extension", and the process
   goes on without a signal. A panic in `xWrite` fails the commit with `SQLITE_IOERR_WRITE` and

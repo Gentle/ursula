@@ -84,8 +84,9 @@ pub(crate) fn claim_once(
                 url: url.to_owned(),
             });
         }
-        // Refused before it reached the stream: nothing was claimed.
-        Append::Refused(refusal) => {
+        // Refused before it reached the stream, or never sent (a claim's frame is far below the
+        // frame limit): nothing was claimed.
+        Append::Refused(refusal) | Append::Unsent(refusal) => {
             return Err(Error::Refused {
                 op: "claim",
                 url: url.to_owned(),

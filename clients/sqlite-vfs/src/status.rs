@@ -35,7 +35,7 @@ pub(crate) fn status(path: &str) -> Result<String, Error> {
 fn status_json(db: &Db) -> String {
     let null = || "null".to_owned();
     // A 402 shows in the fields 0.7.1 introduced for it too.
-    let payment = match &db.refused {
+    let payment = match &db.layer_refused {
         Some(WriteRefusal::PaymentRequired { body }) => Some(body.as_str()),
         _ => None,
     };
@@ -70,7 +70,7 @@ fn status_json(db: &Db) -> String {
             db.refused
                 .as_ref()
                 .and_then(WriteRefusal::reason)
-                .map_or_else(null, json_str),
+                .map_or_else(null, |reason| json_str(&reason)),
         ),
         ("snapshot", json_str(&db.snapshot)),
         ("retained", json_str(&db.retained)),
@@ -237,6 +237,13 @@ mod tests {
         shows(
             &d,
             r#""payment_required":true,"payment_reason":"{\"detail\":\"quota\"}","writes_refused":true,"refused_kind":"payment_required","refused_reason":"{\"detail\":\"quota\"}","#,
+        );
+        // A transaction the extension refuses itself is the latest refusal, while the 402 still
+        // stands for the layer.
+        d.refuse_unsent(WriteRefusal::frame_over_limit(40 << 20, 32 << 20));
+        shows(
+            &d,
+            r#""payment_required":true,"payment_reason":"{\"detail\":\"quota\"}","writes_refused":true,"refused_kind":"too_large","refused_reason":"41943040-byte frame over the 33554432-byte frame limit","#,
         );
         d.writes_accepted();
         shows(

@@ -84,8 +84,9 @@
 //!   db file's pages, fsyncs the WAL and the db file (a write-back error poisons the database, and
 //!   nothing is published), publishes the pages at the stream offset they reflect, reads the
 //!   snapshot back and only then advances the stream's retention to the *previous* snapshot's
-//!   offset. A publish or retention move refused with 402, like a commit refused before it reached
-//!   the stream, holds snapshots until the next acknowledged commit.
+//!   offset. A publish or retention move refused with 402 holds snapshots until the next
+//!   acknowledged commit, like a commit refused by a layer that refuses other writes too, and
+//!   unlike one refused as `too_large`.
 //!   Attach installs the latest snapshot when the local file is missing or behind it, then replays
 //!   the tail.
 //! * `SELECT ursula_status(path)` returns
@@ -96,10 +97,12 @@
 //!   first poison's, which a later one never replaces; `fenced`: a fence was seen since, first or
 //!   later, never reset; `writes_refused`: the latest write was refused before it reached the
 //!   stream, until a commit is acknowledged (never while poisoned), with what refused it in
-//!   `refused_kind` (`payment_required`, `unauthorized`, `forbidden`, `rate_limited` or
-//!   `not_applied`) and why in `refused_reason` (the layer's explanation, or the marker's token
-//!   when it sent no body, and always for `not_applied`);
-//!   `payment_required`, `payment_reason`: the same for a 402 alone; `local`: the stream offset of
+//!   `refused_kind` (`payment_required`, `unauthorized`, `forbidden`, `rate_limited`,
+//!   `not_applied` or `too_large`) and why in `refused_reason` (the layer's explanation, or the
+//!   marker's token when it sent no body, and always for `not_applied`, and for `too_large` the
+//!   frame's size and limit, or the token of the `413`'s marker);
+//!   `payment_required`, `payment_reason`: the latest refusal a layer answered, when it is a 402
+//!   (a transaction refused as `too_large`, never sent, leaves them); `local`: the stream offset of
 //!   the local state attach started from, `-1` when it rebuilt the file; `installed`: the offset of
 //!   the snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none; the rest
 //!   are the owner's health, see `status`);
@@ -113,7 +116,10 @@
 //! same URL, and any other redirect fails the request. `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the
 //! smallest log (bytes since the latest snapshot) that triggers a snapshot. `URSULA_VFS_IDLE_MS`
 //! sets how long a connection is kept for reuse after its last request (default 90000, at most
-//! 15000 for snapshot transfers).
+//! 15000 for snapshot transfers). `URSULA_VFS_MAX_FRAME_BYTES` sets the largest commit frame sent,
+//! in bytes (32 MiB by default, from 64 KiB to 32 MiB: a value outside is taken to the nearer
+//! bound, and one that is not a number of bytes is ignored, both logged once as
+//! `setting_adjusted`). A larger transaction is refused as `too_large` without being sent.
 //!
 //! Module map:
 //!

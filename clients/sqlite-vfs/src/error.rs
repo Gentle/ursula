@@ -9,6 +9,7 @@
 //! reports it as SQLITE_AUTH for a 402, SQLITE_IOERR_AUTH otherwise). Every other variant fails
 //! the operation, or poisons the database until it is attached again.
 
+use std::borrow::Cow;
 use std::ffi::CStr;
 use std::ffi::c_int;
 use std::sync::Arc;
@@ -384,9 +385,43 @@ pub(crate) enum WriteRefusal {
     /// the marker's token (`RaftLogPressure`, say), empty when it has none.
     #[error("{status} (not applied{})", with_token(.reason))]
     NotApplied { status: u16, reason: String },
+    /// The commit's frame, `bytes` long, is larger than one request may be (`over`). The same
+    /// transaction can never be sent: split it.
+    #[error("{}", too_large(*.bytes, .over))]
+    TooLarge { bytes: usize, over: FrameLimit },
+}
+
+/// The limit a commit frame too large for one request is over ([`WriteRefusal::TooLarge`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FrameLimit {
+    /// The extension's frame limit (`URSULA_VFS_MAX_FRAME_BYTES`), or what a frame can hold at
+    /// all: the frame was never sent ([`WriteRefusal::frame_over_limit`]).
+    Extension { limit: usize },
+    /// A lower request limit in front of the stream, which refused the frame with a 413 that
+    /// proves it applied nothing (marked `x-ursula-not-applied` and vouched for, see
+    /// `client::applied_nothing`). `token` is the marker's.
+    InFront { token: String },
 }
 
 impl WriteRefusal {
+    /// A commit frame of `bytes` that the extension never sends: over `limit`, its frame limit
+    /// (`URSULA_VFS_MAX_FRAME_BYTES`), or over what a frame can hold at all. Its reason, which
+    /// `ursula_status` reports, gives both numbers.
+    pub(crate) fn frame_over_limit(bytes: usize, limit: usize) -> WriteRefusal {
+        WriteRefusal::TooLarge {
+            bytes,
+            over: FrameLimit::Extension { limit },
+        }
+    }
+
+    /// Whether the layer that refused this write refuses other writes too, a snapshot publish among
+    /// them: `Db::writes_refused` records it as `layer_refused` then, which holds snapshots back. A
+    /// refused token, a denial, rate limiting, a payment or write pressure do. A frame too large
+    /// for one request says nothing about any other write.
+    pub(crate) fn refuses_other_writes(&self) -> bool {
+        !matches!(self, WriteRefusal::TooLarge { .. })
+    }
+
     /// What refused the write, as `ursula_status` reports it (`refused_kind`).
     pub(crate) fn kind(&self) -> &'static str {
         match self {
@@ -395,21 +430,37 @@ impl WriteRefusal {
             WriteRefusal::Forbidden { .. } => "forbidden",
             WriteRefusal::RateLimited { .. } => "rate_limited",
             WriteRefusal::NotApplied { .. } => "not_applied",
+            WriteRefusal::TooLarge { .. } => "too_large",
         }
     }
 
     /// Why, as `ursula_status` reports it (`refused_reason`): the layer's explanation (its body, or
-    /// the marker's token when the body is empty), and the marker's token for `NotApplied`,
-    /// trimmed; `None` when it sent neither.
-    pub(crate) fn reason(&self) -> Option<&str> {
+    /// the marker's token when the body is empty), the marker's token for `NotApplied` and for a
+    /// 413 in front, trimmed, `None` when the layer sent neither, and for a frame over the
+    /// extension's limit its size and the limit.
+    pub(crate) fn reason(&self) -> Option<Cow<'_, str>> {
         let reason = match self {
             WriteRefusal::PaymentRequired { body }
             | WriteRefusal::Unauthorized { body }
             | WriteRefusal::Forbidden { body }
             | WriteRefusal::RateLimited { body } => body,
             WriteRefusal::NotApplied { reason, .. } => reason,
+            WriteRefusal::TooLarge {
+                over: FrameLimit::InFront { token },
+                ..
+            } => token,
+            WriteRefusal::TooLarge {
+                bytes,
+                over: FrameLimit::Extension { limit },
+            } => {
+                return Some(Cow::Owned(format!(
+                    "{bytes}-byte frame over the {limit}-byte frame limit"
+                )));
+            }
         };
-        Some(reason.trim()).filter(|reason| !reason.is_empty())
+        Some(reason.trim())
+            .filter(|reason| !reason.is_empty())
+            .map(Cow::Borrowed)
     }
 }
 
@@ -468,6 +519,22 @@ fn with_body(body: &str) -> String {
     }
 }
 
+/// [`WriteRefusal::TooLarge`]'s message: the frame's size and the limit it is over, with the
+/// marker's token for a 413 from a layer in front.
+fn too_large(bytes: usize, over: &FrameLimit) -> String {
+    match over {
+        FrameLimit::Extension { limit } => format!(
+            "{bytes}-byte commit frame over the {limit}-byte frame limit \
+             (URSULA_VFS_MAX_FRAME_BYTES): split the transaction"
+        ),
+        FrameLimit::InFront { token } => format!(
+            "{bytes}-byte commit frame over a request body limit in front of the stream \
+             (413{}): split the transaction",
+            with_token(token)
+        ),
+    }
+}
+
 /// `: token` for a marker's token, nothing for an empty one.
 fn with_token(token: &str) -> String {
     let token = token.trim();
@@ -482,6 +549,7 @@ fn with_token(token: &str) -> String {
 mod tests {
     use super::Error;
     use super::Fence;
+    use super::FrameLimit;
     use super::Gone;
     use super::WriteRefusal;
 
@@ -644,9 +712,52 @@ mod tests {
                 "not_applied",
                 Some("WalDiskPressure"),
             ),
+            (
+                WriteRefusal::frame_over_limit(40 << 20, 32 << 20),
+                "too_large",
+                Some("41943040-byte frame over the 33554432-byte frame limit"),
+            ),
+            (
+                WriteRefusal::TooLarge {
+                    bytes: 9 << 20,
+                    over: FrameLimit::InFront {
+                        token: body("RequestBodyTooLarge"),
+                    },
+                },
+                "too_large",
+                Some("RequestBodyTooLarge"),
+            ),
+            (
+                WriteRefusal::TooLarge {
+                    bytes: 9 << 20,
+                    over: FrameLimit::InFront { token: body(" ") },
+                },
+                "too_large",
+                None,
+            ),
         ];
         for (refusal, kind, reason) in cases {
-            assert_eq!((refusal.kind(), refusal.reason()), (kind, reason));
+            assert_eq!(
+                (refusal.kind(), refusal.reason().as_deref()),
+                (kind, reason)
+            );
         }
+        // A frame too large says what it was over, and how to get past it.
+        assert_eq!(
+            WriteRefusal::frame_over_limit(40 << 20, 32 << 20).to_string(),
+            "41943040-byte commit frame over the 33554432-byte frame limit \
+             (URSULA_VFS_MAX_FRAME_BYTES): split the transaction"
+        );
+        let in_front = WriteRefusal::TooLarge {
+            bytes: 9 << 20,
+            over: FrameLimit::InFront {
+                token: "RequestBodyTooLarge".into(),
+            },
+        };
+        assert_eq!(
+            in_front.to_string(),
+            "9437184-byte commit frame over a request body limit in front of the stream (413: \
+             RequestBodyTooLarge): split the transaction"
+        );
     }
 }

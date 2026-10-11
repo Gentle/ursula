@@ -657,6 +657,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         log,
         poisoned: None,
         refused: None,
+        layer_refused: None,
         refused_at: None,
         overlay: BTreeMap::new(),
         wal_written: BTreeMap::new(),

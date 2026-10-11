@@ -18,14 +18,20 @@ compile_error!(
      and an aborting panic would kill the host process"
 );
 
-/// Runs `body`, the body of C entry point `entry`. A panic in it is logged (`event=panic`) and
-/// answered with `on_panic()` instead of unwinding into SQLite. `URSULA_VFS_PANIC_IN=<entry>`
-/// makes the entry point panic on purpose, for tests.
+/// Runs `body`, the body of C entry point `entry` (or of a step inside one, such as
+/// `attach_files`). A panic in it is logged (`event=panic`) and answered with `on_panic()` instead
+/// of unwinding into SQLite. `on_panic` itself must not panic: nothing would stop that one.
+/// `URSULA_VFS_PANIC_IN=<entry>` makes `entry` panic on purpose, for tests, before `body` runs.
 pub(crate) fn contain<R>(
     entry: &'static str,
     on_panic: impl FnOnce() -> R,
     body: impl FnOnce() -> R,
 ) -> R {
+    // Unwind safety is each caller's to ensure: a panic may leave state that `body` changed half
+    // changed, and the caller must not use that state as if it were whole. A file method poisons
+    // its database (`vfs::poison_after_panic`), so no commit builds on it; `attach` takes a
+    // panic as a failed attach, which drops the binding and the attach in progress; a SQL
+    // function and the extension's init change nothing a later call reads.
     let run = AssertUnwindSafe(|| {
         if panic_in().is_some_and(|name| name == entry) {
             panic_on_purpose(entry);

@@ -498,12 +498,6 @@ attached database is a no-op, the extension's private connections run `synchrono
 sidecar is replaced by temp file + rename without fsync. So the application's `PRAGMA synchronous`
 level affects neither correctness nor commit latency (leave it as the application sets it).
 
-A panic inside the extension stops at its C entry point (`guard::contain`), because unwinding out
-of an `extern "C"` function would abort the host process. The call fails: a file method with its
-I/O error, after which the database is poisoned since the panic may have left its state half
-changed, and a SQL function with an error. The process goes on, and the log names the entry point
-(`event=panic`). The crate refuses to build with `panic = "abort"`.
-
 But the files must never be *trusted* when they do not hold the state the sidecar names: with page
 images, the owner's next commits are built on whatever pages the files hold, so a stale page would
 be written into the stream. Trust is therefore verified against the files, not inferred:
@@ -725,6 +719,26 @@ filesystems for the local files (NFS/EFS, SMB, 9p, virtiofs: no page-cache coher
 POSIX locks, and a second host's attach would discard files the first is using). To force a
 rebuild, delete `<db>`.
 
+A panic inside the extension stops at its C entry point (`guard::contain`), because unwinding out
+of an `extern "C"` function would abort the host process. The process goes on, and the log names
+the entry point (`event=panic`, after the Rust runtime's own panic message). What fails:
+
+- A file method answers its I/O error, and its database is poisoned (attach it again), since the
+  panic may have left its state half changed. The poison keeps the write transaction's overlay,
+  which may belong to another connection: that connection's next write fails instead. `xOpen`
+  answers `SQLITE_CANTOPEN` and leaves the file without methods. `xClose` poisons nothing (the
+  file's state is gone), closes the "unix" file and still releases the file's open count, so the
+  file can be attached again in the process.
+- A SQL function fails with an error. A panic while `ursula_attach` binds the files is a failed
+  attach: it drops the binding and the attach in progress, and the file opens again only after an
+  attach succeeds, as after any failed attach.
+- A panic in the extension's init fails the load, with the message "sqlite3_extension_init
+  panicked inside the extension".
+- The snapshot thread is not contained: a panic there ends that thread alone, which the next attach
+  of the file reports (`snapshot_thread_panicked`). No snapshot is taken until then.
+
+The crate refuses to build with `panic = "abort"`.
+
 ## 7. Limits
 
 - 4 KiB pages; WAL mode only; `locking_mode=EXCLUSIVE` unsupported.
@@ -834,6 +848,11 @@ must say in its release notes to stop every owner of a stream before upgrading.
   snapshot `GET` or a create then fails with the redirect's status, never as a missing stream or
   snapshot), and any other redirect, a `308` included, fails the request at once with its
   `Location`.
+- Units also cover panics: `guard::contain` answers a panic with its fallback, and every file
+  method's C entry point, called through the methods table SQLite gets, answers its own error
+  code and poisons the file's database with the method's name, except `xClose` (which releases the
+  file's open count) and `xOpen` (which leaves the file without methods). A panic poisons without
+  dropping the writer's overlay, and the next WAL write fails.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -892,6 +911,13 @@ must say in its release notes to stop every owner of a stream before upgrading.
   unmarked 403 refuses fails with `SQLITE_ERROR`, and a read-only attach reads meanwhile. Through
   Pi, a refused commit rejects with `UrsulaWriteRefusedError` and the storage commits again once
   allowed.
+- Panics (`test/panics.e2e.ts`, each case in its own Node process with `URSULA_VFS_PANIC_IN`). Every
+  SQL function and the extension's init fail with "panicked inside the extension", and the process
+  goes on without a signal. A panic in `xWrite` fails the commit with `SQLITE_IOERR_WRITE` and
+  poisons that file alone: another file attached in the process stays readable and unpoisoned. A
+  panic while attaching is a failed attach (the file, which has a sidecar, is refused until an
+  attach succeeds, and the next attach runs), and a panic in `xClose` leaves the file attachable
+  again in the same process.
 - Same-minor compatibility (`test/compat.e2e.ts`, §7): the previous published patch of the minor
   and the build take over each other's streams on a new host and on the same one, both ways.
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + S3 (AWS S3 in CI,

@@ -1,7 +1,7 @@
 //! The loadable extension's entry point and its SQL functions.
 //!
-//! No panic may unwind out of these `extern "C"` functions (it would abort the host process): the
-//! code they reach is free of panicking constructs, which the crate's lints enforce.
+//! No panic may unwind out of these `extern "C"` functions (it would abort the host process): each
+//! runs its body through `guard::contain`, which answers a panic with the function's error.
 #![expect(
     unsafe_code,
     reason = "a SQLite loadable extension exports a C entry point and C callbacks"
@@ -241,12 +241,38 @@ pub unsafe extern "C" fn sqlite3_extension_init(
 ) -> c_int {
     contain(
         "sqlite3_extension_init",
-        || ffi::SQLITE_ERROR,
+        || {
+            // SAFETY: SQLite's arguments, as above.
+            unsafe { set_init_error(err, p_api) };
+            ffi::SQLITE_ERROR
+        },
         || {
             // SAFETY: SQLite's call of the entry point, forwarded with its arguments.
             unsafe { init(db, err, p_api) }
         },
     )
+}
+
+/// After a panic in [`init`]: the load's error message, which the host shows, allocated with the
+/// host's `sqlite3_mprintf` (SQLite frees it). Nothing when the host gave no routines or no place
+/// for the message.
+///
+/// # Safety
+///
+/// As [`sqlite3_extension_init`]: `err` is null or writable, `p_api` null or the host's routines.
+unsafe fn set_init_error(err: *mut *mut c_char, p_api: *const ffi::sqlite3_api_routines) {
+    // SAFETY: the caller's contract.
+    let Some(mprintf) = unsafe { p_api.as_ref() }.and_then(|api| api.mprintf) else {
+        return;
+    };
+    if err.is_null() {
+        return;
+    }
+    // SAFETY: a format without conversions, so `mprintf` reads no further argument.
+    let message =
+        unsafe { mprintf(c"sqlite3_extension_init panicked inside the extension".as_ptr()) };
+    // SAFETY: the caller's contract: `err` is writable.
+    unsafe { *err = message };
 }
 
 /// [`sqlite3_extension_init`]'s body.

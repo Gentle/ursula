@@ -32,6 +32,7 @@ use crate::frame;
 use crate::frame::Decoded;
 use crate::frame::PAGE;
 use crate::frame::Record;
+use crate::guard::contain;
 use crate::host::full_pathname;
 use crate::host::init_wal_format;
 use crate::local::SIDECAR_VERSION;
@@ -382,7 +383,9 @@ pub(crate) fn attach(path: &str, url: &str, mode: Mode) -> Result<String, Arc<Er
             reg.locks.insert(path.clone(), f);
         }
         // The path keeps its binding (refused to `x_open` meanwhile) until the outcome replaces
-        // it below. No panic gets past `fn_attach` (extern "C" aborts), so this always ends there.
+        // it below. A panic while attaching is contained there (`attach_files`) and taken as a
+        // failed attach, so this always ends there: otherwise every open of the file would answer
+        // SQLITE_BUSY until the process exits.
         reg.attaching.insert(path.clone());
         reg.snappers.remove(&path)
     };
@@ -393,7 +396,15 @@ pub(crate) fn attach(path: &str, url: &str, mode: Mode) -> Result<String, Arc<Er
             log::emit(Level::Error, "snapshot_thread_panicked", &[("file", &path)]);
         }
     }
-    let outcome = attach_files_rebuilding(&path, &url, mode);
+    let outcome = contain(
+        "attach_files",
+        || {
+            Err(Error::Panicked {
+                entry: "attach_files",
+            })
+        },
+        || attach_files_rebuilding(&path, &url, mode),
+    );
     let mut reg = registry();
     reg.attaching.remove(&path);
     match outcome {

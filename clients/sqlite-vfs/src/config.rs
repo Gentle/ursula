@@ -49,12 +49,30 @@ pub(crate) fn idle_age() -> Duration {
     })
 }
 
-/// `URSULA_VFS_PANIC_IN`: the C entry point (`x_write`, `ursula_status`, ...) that panics on purpose
-/// at every call, for tests of `guard::contain`. Unset outside tests.
+/// `URSULA_VFS_PANIC_IN`: what panics on purpose at every call, for tests of `guard::contain`: a
+/// file method by its name (`x_write`, `x_close`, ...), a SQL function (`ursula_status`, ...),
+/// `sqlite3_extension_init`, or the attach step `attach_files`. Unset outside tests. Unit tests set
+/// it per thread instead (`set_panic_in_for_tests`).
 pub(crate) fn panic_in() -> Option<&'static str> {
+    #[cfg(test)]
+    if let Some(entry) = PANIC_IN_FOR_TESTS.get() {
+        return Some(entry);
+    }
     static V: OnceLock<Option<String>> = OnceLock::new();
     V.get_or_init(|| std::env::var("URSULA_VFS_PANIC_IN").ok())
         .as_deref()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PANIC_IN_FOR_TESTS: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `panic_in()` on this thread, for unit tests: the environment is read once per process.
+#[cfg(test)]
+pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
+    PANIC_IN_FOR_TESTS.set(entry);
 }
 
 pub(crate) fn snapshot_min_bytes() -> u64 {

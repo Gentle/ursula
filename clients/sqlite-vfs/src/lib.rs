@@ -88,8 +88,10 @@
 //!   acknowledged commit, like a commit refused by a layer that refuses other writes too, and
 //!   unlike one refused as `too_large`. A failed attempt waits before the next, twice as long
 //!   after each failure, up to an hour while the body is too large and five minutes otherwise,
-//!   unless the database shrinks by more than a quarter (a body over a size limit fails the same
-//!   way until then).
+//!   give or take a fifth, unless the database shrinks by more than a quarter (a body over a size
+//!   limit fails the same way until then). A large body that fails while the stream still answers
+//!   a `HEAD` below 500 is too large, and otherwise it is an outage, after which the first
+//!   acknowledged commit brings the next attempt forward to within 30 s.
 //!   Attach installs the latest snapshot when the local file is missing or behind it, then replays
 //!   the tail.
 //! * `SELECT ursula_status(path)` returns

@@ -206,6 +206,15 @@ impl FailureKind {
             FailureKind::Outage | FailureKind::Other => RETRY_MAX,
         }
     }
+
+    /// What the `snapshot_failed` log calls it (`kind`).
+    fn name(self) -> &'static str {
+        match self {
+            FailureKind::Size => "size",
+            FailureKind::Outage => "outage",
+            FailureKind::Other => "other",
+        }
+    }
 }
 
 /// What a snapshot attempt took, as far as it got (`snapshot_once`): the image's size in pages,
@@ -372,7 +381,7 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
             let failing = d
                 .snapshot_failing
                 .as_ref()
-                .map(|f| (f.count, f.until.saturating_duration_since(now)));
+                .map(|f| (f.count, f.until.saturating_duration_since(now), f.kind));
             (d.path.clone(), d.url.clone(), failing, d.snapshot_due())
         };
         match attempt {
@@ -394,12 +403,17 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
                 | Outcome::Refused,
             ) => busy = Duration::from_millis(10),
             Err(e) => {
-                let (failures, wait) = failing.unwrap_or_default();
+                // A failed attempt always leaves a run of failures (`record_attempt`).
+                let (failures, wait, kind) = failing
+                    .map_or((0, Duration::ZERO, ""), |(count, wait, kind)| {
+                        (count, wait, kind.name())
+                    });
                 log::emit(Level::Warn, "snapshot_failed", &[
                     ("file", &path),
                     ("stream", &url),
                     ("failures", &failures),
                     ("retry_ms", &wait.as_millis()),
+                    ("kind", &kind),
                     ("reason", &e),
                 ]);
                 // Taken once the wait ends (above), if still due then.

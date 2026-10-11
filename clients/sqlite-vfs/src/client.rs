@@ -1268,6 +1268,7 @@ mod tests {
     use super::Append;
     use super::Proof;
     use super::agent;
+    use super::answers;
     use super::append;
     use super::applied_nothing;
     use super::bulk_agent;
@@ -1810,6 +1811,34 @@ mod tests {
             Append::Acked { attempts: 1, .. }
         ));
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    // The probe after a large snapshot body failed: the stream answers it only with a status below
+    // 500, on the first attempt. A 5xx (a gateway whose servers are down), no answer or nothing
+    // listening is none.
+    #[test]
+    fn the_stream_answers_a_probe_only_below_500() {
+        for (status, answered) in [
+            ("200 OK", true),
+            ("404 Not Found", true),
+            ("401 Unauthorized", true),
+            ("502 Bad Gateway", false),
+            ("503 Service Unavailable", false),
+            ("", false),
+        ] {
+            let (url, server) = serve(vec![if status.is_empty() {
+                String::new()
+            } else {
+                answer(status)
+            }]);
+            assert_eq!(answers(&url), answered, "{status:?}");
+            let requests = server.join().unwrap();
+            assert!(requests[0].starts_with("HEAD /b/s "), "{requests:?}");
+        }
+        let nothing = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", nothing.local_addr().unwrap());
+        drop(nothing);
+        assert!(!answers(&url), "nothing listening");
     }
 
     // A body over 1 MiB whose outcome stays unknown is sent twice at most: a large snapshot that a

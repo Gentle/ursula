@@ -226,9 +226,9 @@ backend = "none"
 # kms_key_id = "arn:aws:kms:..."       # customer managed key for "aws-kms"; optional
 # timeout = "10s"
 # max_retries = 3
-# probe_timeout = "5s"     # health probe deadline, room for one S3 client retry
-# unhealthy_ticks = 3      # bad health ticks before shedding leadership
-# heal_ticks = 2           # good health ticks in a row before leading again
+# probe_timeout = "5s"     # health probe deadline, retries included (non-zero)
+# unhealthy_ticks = 3      # bad health ticks before shedding leadership (non-zero)
+# heal_ticks = 2           # good health ticks in a row before leading again (non-zero)
 
 # ------------------------------------------------------------------------------
 # [storage.snapshot]  — Raft snapshot store

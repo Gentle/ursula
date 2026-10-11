@@ -66,10 +66,12 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   elsewhere for now. The gateway passes a server's redirect to a moved leader on to the client when
   it does not follow it itself: a second redirect after the one it follows, or one to an address
   that is not among its upstreams. The VFS sends the request again to the same URL, with the same
-  sequence and no sooner than `Retry-After`, like a `503`. After a second redirect the gateway knows
-  the leader from the first and sends the next attempt there. After one it could not map, the next
-  attempt goes wherever the gateway sends it, a follower again possibly, until one reaches the
-  leader or the budget runs out. For an append a `307` is an unknown outcome: a leader that loses
+  sequence and no sooner than `Retry-After`, like a `503`. After a second redirect, the gateway still
+  holds the node the first one pointed at (it caches the target of a redirect it follows, and
+  passes the second on without changing that): it sends the next attempt there, and follows that
+  node's redirect to the leader. After a redirect it could not map, the next attempt goes wherever
+  the gateway sends it, a follower again possibly, until one reaches the leader or the budget runs
+  out. For an append a `307` is an unknown outcome: a leader that loses
   its leadership answers so, and what it proposed may still be committed. Any other redirect fails
   the write as a definite rejection does (below), a `308` among them: neither the server nor the
   gateway sends one, while a proxy that redirects `http://` to `https://` does (ingress-nginx and
@@ -709,8 +711,8 @@ must say in its release notes to stop every owner of a stream before upgrading.
   to the client. A loop moves every group's leadership to the next node through the admin API,
   again and again with a 250 ms pause, from before an owner's attach through its commits and
   snapshot read-backs, a second host's attach from the snapshot, and the owner's attach of its own
-  files again. The test checks that leaderships moved while the owner committed and while it waited
-  for its snapshots. The gateway sends each request to a node picked at random, so read-only hosts
+  files again. The test checks that every group's leadership, the stream's included, moved while
+  the owner committed and while it waited for its snapshots. The gateway sends each request to a node picked at random, so read-only hosts
   install the snapshot again until a snapshot `GET` met a redirect. Nothing is poisoned, every
   commit goes through, every host reads the same rows, and the client saw redirects on commits
   (counted apart from claims) and on snapshot `GET`s.

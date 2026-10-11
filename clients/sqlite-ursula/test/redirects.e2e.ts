@@ -35,16 +35,16 @@ interface NodeView {
 
 /**
  * Hands every group to the next voter after its leader, once (the views are taken before any move),
- * through the leader's admin API: the moves the leaders accepted.
+ * through the leader's admin API: the groups whose leader accepted the move.
  */
-async function moveLeaderships(): Promise<number> {
+async function moveLeaderships(): Promise<number[]> {
 	const views = await Promise.all(
 		nodes.map(async (node) => {
 			const metrics = await fetch(`${node.admin}/__ursula/metrics`, { signal: AbortSignal.timeout(5000) });
 			return { node, view: (await metrics.json()) as NodeView };
 		}),
 	);
-	let moved = 0;
+	const moved: number[] = [];
 	for (const { node, view } of views) {
 		for (const group of view.raft_groups) {
 			if (group.current_leader !== node.id) continue;
@@ -56,7 +56,7 @@ async function moveLeaderships(): Promise<number> {
 				signal: AbortSignal.timeout(5000),
 			});
 			const answer = (await r.json().catch(() => ({}))) as { transferred?: boolean };
-			if (r.ok && answer.transferred === true) moved++;
+			if (r.ok && answer.transferred === true) moved.push(group.raft_group_id);
 		}
 	}
 	return moved;
@@ -64,25 +64,36 @@ async function moveLeaderships(): Promise<number> {
 
 /**
  * Moves every group's leadership, then waits `pauseMs`, until `stop`, which returns the moves made.
- * `moved` counts them so far.
+ * `moved` counts them so far, and `byGroup` per group.
  */
-function moveLeadershipsUntilStopped(pauseMs: number): { moved(): number; stop(): Promise<number> } {
+function moveLeadershipsUntilStopped(pauseMs: number): { moved(): number; byGroup(): Map<number, number>; stop(): Promise<number> } {
 	let running = true;
 	let moved = 0;
+	const byGroup = new Map<number, number>();
 	const loop = (async () => {
 		while (running) {
-			moved += await moveLeaderships().catch(() => 0);
+			for (const group of await moveLeaderships().catch(() => [])) {
+				moved++;
+				byGroup.set(group, (byGroup.get(group) ?? 0) + 1);
+			}
 			await sleep(pauseMs);
 		}
 	})();
 	return {
 		moved: () => moved,
+		byGroup: () => new Map(byGroup),
 		stop: async () => {
 			running = false;
 			await loop;
 			return moved;
 		},
 	};
+}
+
+/** The groups (of `E2E_GROUPS`) that did not move between two `byGroup` counts. */
+function unmoved(from: Map<number, number>, to: Map<number, number>): number[] {
+	const groups = Number(process.env.E2E_GROUPS ?? 4);
+	return Array.from({ length: groups }, (_, g) => g).filter((g) => (to.get(g) ?? 0) <= (from.get(g) ?? 0));
 }
 
 /** Waits until the loop has made `n` more moves than `from`. */
@@ -193,9 +204,9 @@ it.runIf(nodes.length === 3)(
 		// A snapshot whenever the log outgrows the database (about 80 KiB): every few commits, which
 		// are paced so that the snapshot thread keeps up.
 		const env = { URSULA_VFS_TOKEN_FILE: token, URSULA_VFS_SNAPSHOT_MIN_BYTES: "65536", CHILD_EXIT: "1" };
-		// Each pass moves every group (one of them the stream's) and takes about a second: with a
-		// short pause between passes, the stream's leadership moves while the owner attaches, commits
-		// and reads its snapshots back.
+		// Each pass moves every group once (one of them is the stream's) and takes a few
+		// milliseconds: with a 250 ms pause between passes, every group's leadership moves about four
+		// times a second while the owner attaches, commits and reads its snapshots back.
 		const loop = moveLeadershipsUntilStopped(250);
 		moving = loop;
 		let moved = 0;
@@ -209,15 +220,15 @@ it.runIf(nodes.length === 3)(
 			// Retry-After: 1 from a group between leaders): the owner waits for two before it exits.
 			steps.push("@snapshots:2", "@sleep:2000", ROWS);
 			const file = freshFile();
-			const started = loop.moved();
+			const started = loop.byGroup();
 			const child = runChild(file, url, steps, env);
 			await child.waitFor((l) => l.step === lastCommit && l.ok !== undefined, 180_000);
-			const committed = loop.moved();
+			const committed = loop.byGroup();
 			const owner = await finished(child, 180_000);
-			// Leaderships moved while the owner attached and committed, and while it waited for its
-			// snapshots, published and read back.
-			expect(committed - started, "moves during the commits").toBeGreaterThanOrEqual(2);
-			expect(loop.moved() - committed, "moves during the snapshots").toBeGreaterThanOrEqual(1);
+			// Every group's leadership, the stream's included, moved while the owner attached and
+			// committed, and while it waited for its snapshots, published and read back.
+			expect(unmoved(started, committed), "groups that did not move during the commits").toEqual([]);
+			expect(unmoved(committed, loop.byGroup()), "groups that did not move during the snapshots").toEqual([]);
 			snapshots = owner.done.snapshots ?? 0;
 			expect(snapshots).toBeGreaterThanOrEqual(2);
 			expect(owner.rows).toHaveLength(4);

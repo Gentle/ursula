@@ -1663,6 +1663,65 @@ fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
     }
 }
 
+/// Only the engine's own leadership check, which runs before anything is
+/// proposed, reports its forward as raised before proposal. A forward that
+/// OpenRaft reports for a write handed to `client_write` or
+/// `client_write_many` stays ambiguous. OpenRaft reports one when it refuses
+/// the write up front, as on this follower, and also when it drops an entry
+/// it appended before it lost leadership, which may still commit. The HTTP
+/// layer marks the first kind as applying nothing, so the second must never
+/// look like it.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn only_the_engines_own_leadership_check_is_before_proposal() {
+    let (_registry, engines, leader_id, _wal_roots) =
+        build_three_node_cluster("forward-before-proposal", None).await;
+    let leader_index = usize::try_from(leader_id)
+        .ok()
+        .and_then(|id| id.checked_sub(1))
+        .expect("node ids start at 1");
+    let follower = &engines[(leader_index + 1) % 3];
+    follower
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(leader_id, "the follower learns the leader")
+        .await
+        .expect("the follower learns the leader");
+    let stream_id = bsid("forward-before-proposal");
+    let names_the_leader = |error: &GroupEngineError| {
+        error.leader_hint().and_then(|hint| hint.node_id) == Some(leader_id)
+    };
+
+    let checked = follower
+        .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"a"))
+        .await
+        .expect_err("the engine's check refuses a write on a follower");
+    assert!(checked.is_forward_before_proposal(), "{checked:?}");
+    assert!(names_the_leader(&checked), "{checked:?}");
+
+    let written = follower
+        .write(append_command(stream_id.clone(), b"a"))
+        .await
+        .expect_err("OpenRaft refuses client_write on a follower");
+    assert!(!written.is_forward_before_proposal(), "{written:?}");
+    assert!(names_the_leader(&written), "{written:?}");
+
+    let batch = crate::forward::write_commands_on_raft(follower.raft_handle(), vec![
+        append_command(stream_id.clone(), b"a"),
+        append_command(stream_id, b"b"),
+    ])
+    .await
+    .expect("OpenRaft takes the batch");
+    assert_eq!(batch.len(), 2);
+    for entry in batch {
+        let error = entry.expect_err("OpenRaft refuses each batch entry on a follower");
+        assert!(!error.is_forward_before_proposal(), "{error:?}");
+        assert!(names_the_leader(&error), "{error:?}");
+    }
+
+    shutdown_all(&engines).await;
+}
+
 // NOTE: tokio-level fault-injection tests for partition/heal replication and
 // the "minority leader must not ack" invariant were removed; those scenarios
 // are covered by ursula-sim DST scenarios PartitionHeal, SnapshotCatchUp,

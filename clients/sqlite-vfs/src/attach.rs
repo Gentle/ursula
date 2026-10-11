@@ -383,19 +383,12 @@ pub(crate) fn attach(path: &str, url: &str, mode: Mode) -> Result<String, Arc<Er
             reg.locks.insert(path.clone(), f);
         }
         // The path keeps its binding (refused to `x_open` meanwhile) until the outcome replaces
-        // it below. A panic while attaching is contained there (`attach_files`) and taken as a
-        // failed attach, so this always ends there: otherwise every open of the file would answer
-        // SQLITE_BUSY until the process exits.
+        // it below. Everything in between, a panic included, is contained (`attach_files`) and
+        // taken as a failed attach, so this always ends there: otherwise every open of the file
+        // would answer SQLITE_BUSY until the process exits.
         reg.attaching.insert(path.clone());
         reg.snappers.remove(&path)
     };
-    // The previous attachment's snapshot thread may hold a private connection on the file.
-    if let Some((snapper, thread)) = previous {
-        snapper.stop();
-        if thread.join().is_err() {
-            log::emit(Level::Error, "snapshot_thread_panicked", &[("file", &path)]);
-        }
-    }
     let outcome = contain(
         "attach_files",
         || {
@@ -403,7 +396,17 @@ pub(crate) fn attach(path: &str, url: &str, mode: Mode) -> Result<String, Arc<Er
                 entry: "attach_files",
             })
         },
-        || attach_files_rebuilding(&path, &url, mode),
+        || {
+            // The previous attachment's snapshot thread may hold a private connection on the
+            // file.
+            if let Some((snapper, thread)) = previous {
+                snapper.stop();
+                if thread.join().is_err() {
+                    log::emit(Level::Error, "snapshot_thread_panicked", &[("file", &path)]);
+                }
+            }
+            attach_files_rebuilding(&path, &url, mode)
+        },
     );
     let mut reg = registry();
     reg.attaching.remove(&path);

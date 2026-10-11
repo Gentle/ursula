@@ -726,9 +726,11 @@ the entry point (`event=panic`, after the Rust runtime's own panic message). Wha
 - A file method answers its I/O error, and its database is poisoned (attach it again), since the
   panic may have left its state half changed. The poison keeps the write transaction's overlay,
   which may belong to another connection: that connection's next write fails instead. `xOpen`
-  answers `SQLITE_CANTOPEN` and leaves the file without methods. `xClose` poisons nothing (the
-  file's state is gone), closes the "unix" file and still releases the file's open count, so the
-  file can be attached again in the process.
+  answers `SQLITE_CANTOPEN`, leaves the file without methods and closes the "unix" file if its own
+  open succeeded. `xClose` takes the file's state and does its bookkeeping (the WAL handles open,
+  the handle with the EXCLUSIVE lock) before the contained body, so a panic poisons nothing, and it
+  closes the "unix" file and still releases the file's open count, so the file can be attached
+  again in the process.
 - A SQL function fails with an error. A panic while `ursula_attach` binds the files is a failed
   attach: it drops the binding and the attach in progress, and the file opens again only after an
   attach succeeds, as after any failed attach.
@@ -851,8 +853,9 @@ must say in its release notes to stop every owner of a stream before upgrading.
 - Units also cover panics: `guard::contain` answers a panic with its fallback, and every file
   method's C entry point, called through the methods table SQLite gets, answers its own error
   code and poisons the file's database with the method's name, except `xClose` (which releases the
-  file's open count) and `xOpen` (which leaves the file without methods). A panic poisons without
-  dropping the writer's overlay, and the next WAL write fails.
+  file's open count) and `xOpen` (which leaves the file without methods, and releases the open
+  count of an open that failed). A panic poisons without dropping the writer's overlay, and the
+  next WAL write fails.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is

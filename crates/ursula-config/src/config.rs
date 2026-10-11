@@ -599,7 +599,10 @@ pub struct LeadershipBalanceConfig {
     pub interval: HumanDuration,
     /// Max leader handoffs to attempt per tick.
     pub max_per_tick: usize,
-    /// Timeout when querying peer shed state.
+    /// How long the leadership balancer and the leadership health gates wait
+    /// for a peer's leadership-shed state. A peer that does not answer in
+    /// time is treated as unable to campaign, except by the cluster-egress
+    /// gate, which leaves it to the Raft handoff check. Must be non-zero.
     pub peer_timeout: HumanDuration,
 }
 

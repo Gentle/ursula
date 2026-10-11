@@ -29,6 +29,10 @@ pub enum ValidationError {
     WalSegmentTooSmall { segment_size: u64, minimum: u64 },
     #[error("storage.cold.s3.{setting} must be non-zero")]
     ZeroS3HealthSetting { setting: S3HealthSetting },
+    /// A zero deadline fails every request for a peer's leadership-shed
+    /// state, so every peer would look unable to campaign.
+    #[error("governance.leadership_balance.peer_timeout must be non-zero")]
+    ZeroPeerTimeout,
     #[error("{0}")]
     Other(String),
 }
@@ -97,6 +101,15 @@ impl UrsulaConfig {
             }
         }
         self.validate_s3_health_gate()?;
+        if self
+            .governance
+            .leadership_balance
+            .peer_timeout
+            .as_duration()
+            .is_zero()
+        {
+            return Err(ValidationError::ZeroPeerTimeout);
+        }
         self.validate_peers()?;
         if !self.raft.groups.is_empty() {
             let peer_ids: BTreeSet<u64> = self.raft.peers.iter().map(|p| p.node_id).collect();
@@ -314,6 +327,22 @@ mod tests {
                 format!("storage.cold.s3.{setting} must be non-zero")
             );
         }
+    }
+
+    #[test]
+    fn the_leadership_balance_peer_timeout_must_be_non_zero() {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.validate().expect("the defaults are valid");
+        config.governance.leadership_balance.peer_timeout = HumanDuration::milli(0);
+        let err = config
+            .validate()
+            .expect_err("a zero peer timeout is rejected");
+        assert!(matches!(err, ValidationError::ZeroPeerTimeout), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "governance.leadership_balance.peer_timeout must be non-zero"
+        );
     }
 
     #[test]

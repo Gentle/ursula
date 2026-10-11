@@ -887,6 +887,27 @@ heal_ticks = 4
     }
 
     #[test]
+    fn a_zero_leadership_balance_peer_timeout_fails_to_load() {
+        use crate::validate::ValidationError;
+
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[governance.leadership_balance]
+peer_timeout = "0s"
+"#,
+        );
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Validation(ValidationError::ZeroPeerTimeout)
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_zero_s3_health_gate_setting_fails_to_load() {
         use crate::validate::S3HealthSetting;
         use crate::validate::ValidationError;

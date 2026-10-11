@@ -3,30 +3,9 @@
 // attach time; `instrument()` turns them into OpenTelemetry-shaped metrics; and the extension logs
 // one logfmt line per event on stderr.
 import { expect, it } from "vitest";
-import { attach, instrument, type MeterLike, type MetricAttributes, status } from "../src/index.ts";
+import { attach, instrument, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
-import { openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
-
-/** A meter that keeps what it is given. */
-function recordingMeter() {
-	const records = new Map<string, number[]>();
-	const callbacks = new Map<string, (result: { observe(value: number, attributes?: MetricAttributes): void }) => void>();
-	const keep = (name: string, value: number) => records.set(name, [...(records.get(name) ?? []), value]);
-	const meter: MeterLike = {
-		createHistogram: (name) => ({ record: (value) => keep(name, value) }),
-		createCounter: (name) => ({ add: (value) => keep(name, value) }),
-		createObservableGauge: (name) => ({
-			addCallback: (callback) => callbacks.set(name, callback),
-			removeCallback: () => callbacks.delete(name),
-		}),
-	};
-	const observe = (name: string): number | undefined => {
-		let seen: number | undefined;
-		callbacks.get(name)?.({ observe: (value) => (seen = value) });
-		return seen;
-	};
-	return { meter, records, callbacks, observe };
-}
+import { openPlain, recordingMeter, runChild, streamPath, ursulaUrl } from "./kit.ts";
 
 it("status reports an owner's health, and instrument() reports it as metrics", () => {
 	const file = freshFile();

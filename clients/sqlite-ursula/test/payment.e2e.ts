@@ -208,7 +208,7 @@ it("an attach the layer refuses throws UrsulaPaymentRequiredError, and a read-on
 	}
 	expect(error).toBeInstanceOf(UrsulaPaymentRequiredError);
 	expect(error).toBeInstanceOf(UrsulaWriteRefusedError);
-	expect(error).toMatchObject({ kind: "payment_required", reason: null });
+	expect(error).toMatchObject({ name: "UrsulaPaymentRequiredError", kind: "payment_required", reason: null });
 	expect((error as Error).message).toMatch(/claim \S+: 402 Payment Required/);
 	expect((error as Error).message).toContain(REASON);
 	// The failed attach leaves the file refused, as any failed attach does.
@@ -294,7 +294,7 @@ it("Pi: a refused commit rejects with UrsulaPaymentRequiredError, and the storag
 	await gate.refuse(null);
 	expect(error).toBeInstanceOf(UrsulaPaymentRequiredError);
 	expect(error).not.toBeInstanceOf(UrsulaReplicationError);
-	expect(error).toMatchObject({ kind: "payment_required", reason: REASON });
+	expect(error).toMatchObject({ name: "UrsulaPaymentRequiredError", kind: "payment_required", reason: REASON });
 	const { harness, root } = await openHarness(storage);
 	await textTurn(root, 1);
 	await harness.close(ctx);

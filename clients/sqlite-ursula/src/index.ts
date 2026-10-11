@@ -115,14 +115,14 @@ export interface AttachStatus {
 	readonly read_only: boolean;
 	/** A layer in front of the stream refused the latest write with `402 Payment Required` (a commit failed with {@link UrsulaPaymentRequiredError}, or a snapshot waits). It does not poison the file, and the next acknowledged commit clears it. Always `false` while `poisoned`, since a poisoned file needs a re-attach whatever the layer does. */
 	readonly payment_required: boolean;
-	/** The layer's explanation: the `402` response's body, cut to 256 bytes (`null` when it was empty, or without a refusal). */
+	/** The layer's explanation: the `402` response's body (its first 256 bytes, then `...` when it is longer), or the token of `x-ursula-not-applied` when the body is empty (`null` when it sent neither, or without a refusal). */
 	readonly payment_reason: string | null;
-	/** The latest write was refused before it reached the stream, so nothing of it was applied (a commit failed with {@link UrsulaWriteRefusedError}, or a snapshot waits). It does not poison the file, and the next acknowledged commit clears it. Always `false` while `poisoned`. A `402` shows here and in `payment_required`. */
-	readonly writes_refused: boolean;
-	/** What refused the latest write (see {@link WriteRefusedKind}); `null` without a refusal. */
-	readonly refused_kind: WriteRefusedKind | null;
-	/** Why: the token of `x-ursula-not-applied` (such as `RaftLogPressure`), or the refusing layer's response body cut to 256 bytes; `null` when it sent neither, or without a refusal. */
-	readonly refused_reason: string | null;
+	/** The latest write was refused before it reached the stream, so nothing of it was applied (a commit failed with {@link UrsulaWriteRefusedError}, or a snapshot waits). It does not poison the file, and the next acknowledged commit clears it. Always `false` while `poisoned`. A `402` shows here and in `payment_required`. Absent with an extension before 0.7.3 (an older library named by `SQLITE_URSULA_VFS`), like the two fields below. */
+	readonly writes_refused?: boolean;
+	/** What refused the latest write (see {@link WriteRefusedKind}); `null` without a refusal. Absent with an extension before 0.7.3. */
+	readonly refused_kind?: WriteRefusedKind | null;
+	/** Why: the refusing layer's response body (its first 256 bytes, then `...` when it is longer), or the token of `x-ursula-not-applied` (such as `RaftLogPressure`) when the body is empty, and always for `not_applied`; `null` when it sent neither, or without a refusal. Absent with an extension before 0.7.3. */
+	readonly refused_reason?: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
 	readonly snapshot: StreamOffset;
 	/** Retention this owner advanced the stream to (`"-1"`: none yet). */
@@ -218,7 +218,7 @@ export class UrsulaReplicationError extends Error {
  * - `forbidden`: an authorizer denied the write with a `403` marked `x-ursula-not-applied`, which a
  *   gateway vouched for with `x-ursula-not-applied-checked` (any other `403` fails the commit and
  *   poisons the file, since a filtering proxy can send one after the stream applied the write);
- * - `rate_limited`: `429` until the retry budget ran out;
+ * - `rate_limited`: `429` until the retry budget ran out, marked or not;
  * - `not_applied`: other answers marked `x-ursula-not-applied` and vouched for by a gateway (the server
  *   under write pressure, or a gateway that could not authorize the request) until the retry budget
  *   ran out, or a marked final answer such as a `413`.
@@ -258,9 +258,9 @@ export class UrsulaWriteRefusedError extends Error {
 /**
  * A write refused with `402 Payment Required` by a layer in front of the stream, such as an authorizer
  * or a quota or billing service: the {@link UrsulaWriteRefusedError} of kind `payment_required`.
- * Nothing of it reached the stream, and the file stays usable. Its `reason` is the layer's explanation,
- * the `402` response's body cut to 256 bytes, for a refused commit (`null` when it was empty). It is
- * always `null` for a refused attach, whose message carries it.
+ * Nothing of it reached the stream, and the file stays usable. Its `reason` is the layer's explanation
+ * for a refused commit, as `payment_reason` reports it (`null` when the layer sent none). It is always
+ * `null` for a refused attach, whose message carries it.
  */
 export class UrsulaPaymentRequiredError extends UrsulaWriteRefusedError {
 	constructor(message: string, reason: string | null, cause: unknown) {
@@ -295,6 +295,13 @@ export async function openUrsulaPiStorage(file: string, streamUrl: string, optio
 		transaction(callback).catch((error: unknown) => {
 			const cause = error instanceof AggregateError ? error.errors[0] : error;
 			const s = status(file);
+			// Read-only: SQLite's own error, without the driver's failed ROLLBACK. The transaction is
+			// rolled back either way: by SQLite when COMMIT failed, by the driver's ROLLBACK when a
+			// statement failed before it.
+			if (s.read_only && errcode(cause) === SQLITE_READONLY) throw cause;
+			// Poisoned (by this commit, or by the snapshot thread since a refusal): the storage needs a
+			// new attach whatever the error, a refusal's code included.
+			if (s.poisoned) throw new UrsulaReplicationError(`commit not replicated: ${s.reason ?? "unknown"}`, s.fenced, cause);
 			if (errcode(cause) === SQLITE_IOERR_AUTH) {
 				if (s.payment_required) {
 					const why = s.payment_reason === null ? "" : `: ${s.payment_reason}`;
@@ -306,12 +313,7 @@ export async function openUrsulaPiStorage(file: string, streamUrl: string, optio
 				const why = `${kind === null ? "" : `: ${kind}`}${reason === null ? "" : ` (${reason})`}`;
 				throw new UrsulaWriteRefusedError(`commit refused before it reached the stream${why}`, kind, reason, cause);
 			}
-			// Read-only: SQLite's own error, without the driver's failed ROLLBACK. The transaction is
-			// rolled back either way: by SQLite when COMMIT failed, by the driver's ROLLBACK when a
-			// statement failed before it.
-			if (s.read_only && errcode(cause) === SQLITE_READONLY) throw cause;
-			if (!s.poisoned) throw error;
-			throw new UrsulaReplicationError(`commit not replicated: ${s.reason ?? "unknown"}`, s.fenced, cause);
+			throw error;
 		});
 	return SqliteStorage.open(db);
 }
@@ -343,7 +345,8 @@ export interface MeterLike {
  * - counters `sqlite_ursula.append.retries` and `sqlite_ursula.stream.bytes`;
  * - gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`
  *   (ms), `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned`, `sqlite_ursula.fenced`,
- *   `sqlite_ursula.payment_required` and `sqlite_ursula.writes_refused` (0 or 1).
+ *   `sqlite_ursula.payment_required` and `sqlite_ursula.writes_refused` (0 or 1; the latter is not
+ *   measured with an extension before 0.7.3, which does not report it).
  *
  * Every measurement carries `sqlite.file` and `attributes`. The per-commit numbers come from
  * {@link drainStats} every `intervalMs` (10 s by default), so do not call `drainStats` on the same
@@ -377,7 +380,8 @@ export function instrument(file: string, meter: MeterLike, options: { intervalMs
 		["sqlite_ursula.poisoned", undefined, (s) => (s.poisoned ? 1 : 0)],
 		["sqlite_ursula.fenced", undefined, (s) => (s.fenced ? 1 : 0)],
 		["sqlite_ursula.payment_required", undefined, (s) => (s.payment_required ? 1 : 0)],
-		["sqlite_ursula.writes_refused", undefined, (s) => (s.writes_refused ? 1 : 0)],
+		// An extension before 0.7.3 does not report it: no measurement rather than a false 0.
+		["sqlite_ursula.writes_refused", undefined, (s) => (s.writes_refused === undefined ? null : s.writes_refused ? 1 : 0)],
 	];
 	const observed = gauges.map(([name, unit, value]) => {
 		const gauge = meter.createObservableGauge(name, unit === undefined ? {} : { unit });

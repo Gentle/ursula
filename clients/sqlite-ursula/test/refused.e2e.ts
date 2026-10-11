@@ -9,10 +9,10 @@
 // commit the stream applied. The refusing layer is `gate.mjs`.
 import { writeFileSync } from "node:fs";
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
-import { attach, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
+import { attach, instrument, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
 import { openHarness, textTurn } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
-import { type Child, type ChildLine, Gate, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
+import { type Child, type ChildLine, Gate, openPlain, recordingMeter, runChild, streamPath, ursulaUrl } from "./kit.ts";
 
 /** SQLITE_IOERR_AUTH: a commit refused before it reached the stream. */
 const COMMIT_REFUSED = 7178;
@@ -204,6 +204,7 @@ it("a refusal marked without a gateway's vouch proves nothing: the commit poison
 
 	await gate.refuse("write access denied", { status: 403, headers: { "x-ursula-not-applied": "Forbidden" } });
 	const reader = freshFile();
+	const before = await gate.counts();
 	let error: unknown;
 	try {
 		attach(reader, gate.url + path);
@@ -212,6 +213,9 @@ it("a refusal marked without a gateway's vouch proves nothing: the commit poison
 	}
 	expect(error).not.toBeInstanceOf(UrsulaWriteRefusedError);
 	expect(errcode(error)).toBe(SQLITE_ERROR);
+	// The claim was the request refused: its append failed as unauthorized, and it was the one write.
+	expect((error as Error).message).toMatch(/append \S+: 403: the endpoint refused this client's credentials/);
+	expect((await gate.counts()).refused - before.refused).toBe(1);
 	// The gate refused every attempt of the commit: the stream holds the table alone.
 	attach(reader, gate.url + path, { readOnly: true });
 	expect(xs(reader)).toEqual([]);
@@ -258,7 +262,7 @@ it("an authorizer's marked 403 fails a commit alone at once, and an attach it re
 	}
 	expect(error).toBeInstanceOf(UrsulaWriteRefusedError);
 	expect(error).not.toBeInstanceOf(UrsulaPaymentRequiredError);
-	expect(error).toMatchObject({ kind: null, reason: null });
+	expect(error).toMatchObject({ name: "UrsulaWriteRefusedError", kind: null, reason: null });
 	expect((error as Error).message).toMatch(/claim \S+: 403 write access denied: an authorizer denied it/);
 	expect(errcode((error as Error).cause)).toBe(COMMIT_REFUSED);
 	expect(() => openPlain(reader)).toThrow(/unable to open database file/);
@@ -275,20 +279,29 @@ it("an authorizer's marked 403 fails a commit alone at once, and an attach it re
 	expect(xs(reader)).toEqual(["d2"]);
 });
 
+// The refusal also shows in `instrument()`'s `sqlite_ursula.writes_refused` gauge: 1 while writes are
+// refused, 0 once a commit succeeds.
 it("Pi: a commit an authorizer refuses with a marked 403 rejects with UrsulaWriteRefusedError, and the storage commits again once it is allowed", async () => {
-	const storage = await openUrsulaPiStorage(freshFile(), gate.url + streamPath());
+	const file = freshFile();
+	const storage = await openUrsulaPiStorage(file, gate.url + streamPath());
+	const { meter, observe } = recordingMeter();
+	const stop = instrument(file, meter, { intervalMs: 60_000 });
+	expect(observe("sqlite_ursula.writes_refused")).toBe(0);
 	await gate.refuse("write access denied", DENIED);
 	const error = await openHarness(storage).then(
 		() => undefined,
 		(e: unknown) => e,
 	);
+	expect(observe("sqlite_ursula.writes_refused")).toBe(1);
 	await gate.refuse(null);
 	expect(error).toBeInstanceOf(UrsulaWriteRefusedError);
 	expect(error).not.toBeInstanceOf(UrsulaPaymentRequiredError);
 	expect(error).not.toBeInstanceOf(UrsulaReplicationError);
-	expect(error).toMatchObject({ kind: "forbidden", reason: "write access denied" });
+	expect(error).toMatchObject({ name: "UrsulaWriteRefusedError", kind: "forbidden", reason: "write access denied" });
 	const { harness, root } = await openHarness(storage);
 	await textTurn(root, 1);
+	expect(observe("sqlite_ursula.writes_refused")).toBe(0);
+	stop();
 	await harness.close(ctx);
 	await storage.close(ctx);
 });

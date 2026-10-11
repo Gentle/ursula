@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { expect, inject } from "vitest";
-import type { AttachStatus } from "../src/index.ts";
+import type { AttachStatus, MeterLike, MetricAttributes } from "../src/index.ts";
 
 let counter = 0;
 /** A fresh stream URL on the spawned node (bucket created by the global setup). */
@@ -34,6 +34,27 @@ export function openPlain(file: string): DatabaseSync {
 }
 
 export const integrity = (db: DatabaseSync): string => (db.prepare("PRAGMA integrity_check").get() as { integrity_check: string }).integrity_check;
+
+/** A meter for `instrument()` that keeps what it is given; `observe` runs a gauge's callback and returns what it observed. */
+export function recordingMeter() {
+	const records = new Map<string, number[]>();
+	const callbacks = new Map<string, (result: { observe(value: number, attributes?: MetricAttributes): void }) => void>();
+	const keep = (name: string, value: number) => records.set(name, [...(records.get(name) ?? []), value]);
+	const meter: MeterLike = {
+		createHistogram: (name) => ({ record: (value) => keep(name, value) }),
+		createCounter: (name) => ({ add: (value) => keep(name, value) }),
+		createObservableGauge: (name) => ({
+			addCallback: (callback) => callbacks.set(name, callback),
+			removeCallback: () => callbacks.delete(name),
+		}),
+	};
+	const observe = (name: string): number | undefined => {
+		let seen: number | undefined;
+		callbacks.get(name)?.({ observe: (value) => (seen = value) });
+		return seen;
+	};
+	return { meter, records, callbacks, observe };
+}
 
 /** Every table (FTS shadow tables included) and the schema, rows sorted. */
 export function dump(db: DatabaseSync): Record<string, string[]> {

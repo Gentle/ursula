@@ -27,6 +27,7 @@ use crate::bootstrap::commit_stall;
 use crate::bootstrap::egress;
 use crate::bootstrap::leadership;
 use crate::bootstrap::snapshot;
+use crate::bootstrap::snapshot::StoreGateInputs;
 use crate::bootstrap::topology::Persistence;
 use crate::bootstrap::topology::Topology;
 
@@ -208,7 +209,10 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             &registry,
             *node_id,
             snapshot_store,
-            config.storage.cold.s3.as_ref(),
+            StoreGateInputs {
+                s3: config.storage.cold.s3.as_ref(),
+                cold_flush_interval: config.storage.cold.flush_interval.as_duration(),
+            },
             snapshot_drive_interval_ms,
             ursula_raft::snapshot_cadence::SnapshotCadence::new(
                 config.raft.snapshot_log_budget.as_bytes(),

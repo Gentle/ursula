@@ -11,6 +11,7 @@ use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_shard::RaftGroupId;
 
+use crate::bootstrap::store_health::StoreGateConfig;
 use crate::bootstrap::store_health::spawn_store_health_gate;
 
 /// Longest the driver waits for a build permit (the previous build to finish)
@@ -87,8 +88,9 @@ async fn trigger_snapshot_build(
 /// Whether this tick triggers snapshot builds.
 ///
 /// While the store health gate's latest tick was bad (the probe failed, or
-/// more than one cold-flush write failed), routine snapshots are held back so
-/// the driver does not push uploads into a failing store. Not once the log is
+/// cold-flush writes failed and none succeeded over the gate's flush window),
+/// routine snapshots are held back so the driver does not push uploads into a
+/// failing store. Not once the log is
 /// over the pressure watermark: a build whose upload, verification or
 /// reference publication fails falls back to an inline snapshot, which still
 /// truncates the log, so nothing a snapshot needs depends on the store.
@@ -126,8 +128,9 @@ fn spawn_log_pressure_monitor(coordinator: SnapshotBuildCoordinator, cadence: &S
 }
 
 /// Default driver interval: 5 s with an external snapshot store, whose
-/// health the driver probes every tick, and 1 s inline. `Some(0)` disables
-/// the driver, and OpenRaft's entry-count policy runs instead.
+/// health gate ticks on the same interval, and 1 s inline. `Some(0)`
+/// disables the driver and the store health gate, and OpenRaft's entry-count
+/// policy runs instead.
 pub(crate) fn resolve_snapshot_drive_interval_ms(
     configured: Option<usize>,
     snapshot_store_configured: bool,
@@ -183,18 +186,29 @@ pub(crate) fn plan_snapshot_drive<'a>(
     (plan, selected)
 }
 
+/// What the snapshot driver hands its snapshot-store health gate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreGateInputs<'a> {
+    /// `[storage.cold.s3]`, or `None` for its defaults.
+    pub s3: Option<&'a ursula_config::S3Config>,
+    /// `storage.cold.flush_interval`, the flush worker's pause between
+    /// passes, which the gate's flush window spans.
+    pub cold_flush_interval: Duration,
+}
+
 /// Config-driven snapshot driver. Reads parameters from typed config.
 ///
 /// With an external snapshot store it also spawns the store health gate
 /// ([`spawn_store_health_gate`]) on the same interval. Only an external store
 /// is probed: inline snapshots depend on nothing outside the node, so the
-/// inline driver never sheds leadership.
+/// inline driver never sheds leadership. A drive interval of 0 turns both
+/// off.
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     node_id: u64,
     snapshot_store: Option<SharedSnapshotStore>,
-    s3_cfg: Option<&ursula_config::S3Config>,
+    store_gate: StoreGateInputs<'_>,
     interval_ms: usize,
     cadence: SnapshotCadence,
     wal_lagging: Option<std::sync::Arc<ursula_raft::LaggingGroups>>,
@@ -204,15 +218,18 @@ pub fn spawn_snapshot_driver(
         return;
     }
     let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
-    let store_gate = snapshot_store.map(|store| {
+    let gate = snapshot_store.map(|store| {
         let default_s3 = ursula_config::S3Config::default();
         spawn_store_health_gate(
             runtime,
             registry,
             store,
             node_id,
-            s3_cfg.unwrap_or(&default_s3),
-            interval,
+            StoreGateConfig::new(
+                store_gate.s3.unwrap_or(&default_s3),
+                store_gate.cold_flush_interval,
+                interval,
+            ),
         )
     });
     let runtime = runtime.clone();
@@ -222,9 +239,7 @@ pub fn spawn_snapshot_driver(
     tokio::spawn(async move {
         loop {
             let snaps = registry.metrics_snapshot();
-            let store_trouble = store_gate
-                .as_ref()
-                .is_some_and(|latest_bad| *latest_bad.borrow());
+            let store_trouble = gate.as_ref().is_some_and(|latest_bad| *latest_bad.borrow());
             let mut pause = interval;
             let lagging = wal_lagging
                 .as_ref()

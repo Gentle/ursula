@@ -468,12 +468,17 @@ pub struct S3Config {
     /// Max retries per S3 operation.
     pub max_retries: usize,
     /// Deadline of one snapshot-store health probe, retries of the S3 client
-    /// included. The default leaves room for one retry: the client's first
-    /// backoff is 1 to 2 seconds.
+    /// included. The default leaves room for one retry of a probe whose first
+    /// attempt fails fast, since the client's first backoff is 1 to 2
+    /// seconds. An attempt that hangs runs into this deadline instead.
     pub probe_timeout: HumanDuration,
     /// Bad health ticks, with no good tick between them, before the node
     /// sheds its leadership. A tick is bad when the probe fails or times out,
-    /// or when more than one cold-flush write failed since the previous tick.
+    /// or when cold-flush writes failed and none succeeded over the flush
+    /// window, which spans as long as the S3 client can take to give up on a
+    /// write (`timeout` and `max_retries`). A tick whose window holds failed
+    /// and successful writes is inconclusive: it never ends a bad streak and
+    /// never lengthens one, as in the cold-health gate.
     pub unhealthy_ticks: usize,
     /// Good health ticks in a row before a node that shed may lead again.
     pub heal_ticks: usize,

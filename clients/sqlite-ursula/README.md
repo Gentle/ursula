@@ -2,9 +2,9 @@
 
 SQLite databases replicated through [Ursula](https://ursula.tonbo.io) streams, for Node.js.
 
-Experimental: its formats and API may change in a minor release. What it still needs for production use is tracked in [#468](https://github.com/tonbo-io/ursula/issues/468).
-
 The package loads the `sqlite-ursula-vfs` SQLite extension into `node:sqlite`. Once a file is attached to a stream, every commit is appended to the stream before it reaches the local file, and any host can rebuild the database from the stream. Your code keeps using SQLite as before. `openUrsulaPiStorage` opens Pi Durable's official `SqliteStorage` on a replicated file.
+
+Within a minor release (0.7.x), the formats the extension writes to the stream and to the local files do not change. Any 0.7.x extension can attach a stream that another 0.7.x extension wrote, resume from the local files that extension left on the host, and fence the stream's owner, so you can upgrade owners one at a time. The package and its prebuilt extension share a version. If you load your own build with `SQLITE_URSULA_VFS`, upgrade it together with the package. A new minor release may change the formats and the API, and its release notes say how to upgrade. The [design doc](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md#7-limits) lists the known limits.
 
 ## Install
 

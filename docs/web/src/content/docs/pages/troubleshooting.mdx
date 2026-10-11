@@ -247,7 +247,9 @@ The node refuses both before it proposes the append, so from 0.7.3 their
 responses also carry the name in `x-ursula-not-applied`, like the admission
 refusals above. A `503` while the group has no known leader, for example
 during an election, carries `NotLeader` when the node found that before it
-proposed the append.
+proposed the append. A `503` from a node that does not host the stream's
+group and knows no node that does carries `GroupNotHosted`: the node refuses
+before any engine runs.
 
 ### `409 Conflict` with `producer-expected-seq` / `producer-received-seq`
 
@@ -358,8 +360,8 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 | `IngressBodyBytesLimitReached` | The server holds as many request bytes in flight as it admits |
 | `RaftUncommittedBackpressure` | The stream's Raft group holds more proposed but unapplied write bytes than `raft.max_uncommitted_size_per_group` allows |
 | `ColdBackpressure` | The stream's Raft group holds more hot bytes than `storage.cold.max_hot_size_per_group` allows, because cold flush is behind or the cold backend is slow |
-| `NotLeader` | The server does not lead the stream's Raft group and knows no leader yet, for example during an election. Writes resume once the group has a leader |
-| `GroupNotHosted` | The server does not host the stream's Raft group and knows no server that does |
+| `NotLeader` | A `503`: the server does not lead the stream's Raft group and knows no leader yet, for example during an election. For the same reason, the redirects it sends before it proposes a write carry the same marker, and the gateway follows them. Writes resume once the group has a leader |
+| `GroupNotHosted` | A `503`: the server does not host the stream's Raft group and knows no server that does. Its redirects to a server that does carry the same marker, and the gateway follows them |
 | `RequestBodyUnreadable` | The gateway could not read the request body, so it sent nothing on |
 | `NotFound` | The gateway's access policy does not serve the stream to these credentials: no token, or one the policy does not allow. The cause is the credentials or the policy, not load |
 | `AuthenticationUnavailable`, `AuthorizationUnavailable` | The gateway could not verify the token or reach a decision, for example while its token issuer is down |
@@ -374,7 +376,7 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 
 Attach the file again. The attach replays whichever commit the stream holds. Check which of the two transactions the database then holds before you run either again. When it holds the refused one, although its commit failed, a layer broke the rule in [Writes refused before they reach the stream](/docs/examples/sqlite-vfs#writes-refused-before-they-reach-the-stream). Find it:
 
-- A proxy or service mesh that retries writes. Istio retries a `503` twice by default, POSTs included. Set `retries: attempts: 0` on the routes that carry stream writes, to the gateway and from the gateway to the servers.
+- A proxy or service mesh that retries writes. Istio before 1.24 retries a `503` twice by default, POSTs included, and Istio 1.24 to 1.26 does the same when istiod runs with `EXCLUDE_UNSAFE_503_FROM_DEFAULT_RETRY=false`, which `compatibilityVersion=1.23` sets. Any version retries on a route whose `retryOn` includes `503`, `5xx`, `gateway-error` or `reset`. Set `retries: attempts: 0` on the routes that carry stream writes, to the gateway and from the gateway to the servers.
 - A proxy that follows redirects for writes.
 - A layer between `ursula gateway` and the servers that answers `401`, `402` or `429`.
 - A layer that refuses a write after it passed the write on, such as metering that answers `402` after the stream answered.

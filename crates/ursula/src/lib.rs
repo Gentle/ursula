@@ -117,7 +117,6 @@ use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::GroupEngineError;
-use ursula_runtime::GroupInfraError;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ImportGroupStateRequest;
 use ursula_runtime::LiveReadOwner;
@@ -126,6 +125,7 @@ use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RefusedBeforeProposal;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamErrorCode;
@@ -4034,24 +4034,30 @@ enum PreProposalRefusal {
     ColdBackpressure,
 }
 
+impl From<RefusedBeforeProposal> for PreProposalRefusal {
+    fn from(refusal: RefusedBeforeProposal) -> Self {
+        match refusal {
+            RefusedBeforeProposal::NotLeader => Self::NotLeader,
+            RefusedBeforeProposal::RaftUncommittedBackpressure => Self::RaftUncommittedBackpressure,
+            RefusedBeforeProposal::ColdBackpressure => Self::ColdBackpressure,
+        }
+    }
+}
+
 impl PreProposalRefusal {
     /// The refusal `err` reports, if the runtime raised it before it proposed
-    /// the failed command. Every other failure can follow a proposal (a
-    /// forward or a lost response after `client_write`, a group that stopped
-    /// applying, a storage error) or is no refusal to retry.
+    /// the failed command: a group this node does not host, or what the
+    /// engine refused before proposing
+    /// ([`GroupEngineError::refused_before_proposal`]). Every other failure
+    /// can follow a proposal (a forward or a lost response after
+    /// `client_write`, a group that stopped applying, a storage error) or is
+    /// no refusal to retry.
     fn of(err: &RuntimeError) -> Option<Self> {
         match err {
             RuntimeError::GroupNotHosted { .. } => Some(Self::GroupNotHosted),
-            RuntimeError::GroupEngine { error, .. } if error.is_forward_before_proposal() => {
-                Some(Self::NotLeader)
+            RuntimeError::GroupEngine { error, .. } => {
+                error.refused_before_proposal().map(Self::from)
             }
-            RuntimeError::GroupEngine { error, .. } => match error.infra() {
-                Some(GroupInfraError::RaftUncommittedBackpressure { .. }) => {
-                    Some(Self::RaftUncommittedBackpressure)
-                }
-                Some(GroupInfraError::ColdBackpressure { .. }) => Some(Self::ColdBackpressure),
-                _ => None,
-            },
             RuntimeError::InvalidConfig(_)
             | RuntimeError::InvalidRaftGroup { .. }
             | RuntimeError::SnapshotPlacementMismatch { .. }

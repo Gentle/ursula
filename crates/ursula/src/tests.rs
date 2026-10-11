@@ -483,6 +483,9 @@ struct StaticGrpcTestNodeStorage {
     /// every run on a fresh, empty WAL.
     raft_log_dir: Option<PathBuf>,
     cold_store: Option<ColdStoreHandle>,
+    /// Cold admission: the group hot-byte limit it checks inline creates and
+    /// appends against (`None`: off, the runtime's default).
+    cold_max_hot_bytes_per_group: Option<u64>,
     engine_config: Option<ursula_raft::RaftEngineConfig>,
     per_group_initializers: bool,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
@@ -504,7 +507,8 @@ async fn spawn_static_grpc_test_node(
     if storage.start_maintenance_drained {
         registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
     }
-    let mut config = RuntimeConfig::new(1, raft_group_count);
+    let mut config = RuntimeConfig::new(1, raft_group_count)
+        .with_cold_max_hot_bytes_per_group(storage.cold_max_hot_bytes_per_group);
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
     let (log_stores, wal_root) = match storage.raft_log_dir {
         Some(raft_log_dir) => (
@@ -2616,6 +2620,118 @@ async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
         .await
         .expect("head on the leader");
     assert_eq!(head.status(), StatusCode::NOT_FOUND);
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+/// With cold admission on, the engine checks leadership before it proposes an
+/// inline create, so a follower's redirect of one applied nothing and carries
+/// `x-ursula-not-applied`. A create whose body goes to the cold tier is an
+/// external create, which the engine hands straight to `client_write`. A
+/// forward that OpenRaft reports from there can follow a committed entry, so
+/// that redirect carries no marker, although here too nothing was proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_follower_leaves_an_external_create_redirect_unmarked() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+    let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                node_id == 1,
+                1,
+                StaticGrpcTestNodeStorage {
+                    cold_store: Some(cold_store.clone()),
+                    cold_max_hot_bytes_per_group: Some(64 << 20),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for (index, node) in nodes.iter().enumerate().skip(1) {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .unwrap_or_else(|_| panic!("warm follower node {} groups timed out", index + 1))
+            .expect("warm follower groups");
+    }
+    tokio::time::timeout(Duration::from_secs(10), nodes[0].runtime.warm_all_groups())
+        .await
+        .expect("warm initializing leader groups timed out")
+        .expect("warm initializing leader groups");
+    for node in &nodes {
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "static gRPC Raft cluster should elect node 1")
+            .await
+            .expect("wait for shared leader");
+    }
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build no-redirect reqwest client");
+    let (leader, follower) = (&peers[0].1, &peers[1].1);
+    // At or above the 1 MiB external payload minimum, a create's body goes to
+    // the cold tier.
+    for (name, body, marker) in [
+        ("inline", vec![7u8; 16], Some("NotLeader")),
+        ("external", vec![7u8; 1 << 20], None),
+    ] {
+        let response = client
+            .put(format!("{follower}/benchcmp/{name}"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .expect("create on a follower");
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{name}");
+        assert_eq!(
+            response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("{leader}/benchcmp/{name}").as_str()),
+            "{name}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(NOT_APPLIED_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            marker,
+            "{name}"
+        );
+        assert!(
+            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
+            "{name}"
+        );
+        let head = client
+            .head(format!("{leader}/benchcmp/{name}"))
+            .send()
+            .await
+            .expect("head on the leader");
+        assert_eq!(head.status(), StatusCode::NOT_FOUND, "{name}");
+    }
 
     for node in nodes {
         node.shutdown().await;

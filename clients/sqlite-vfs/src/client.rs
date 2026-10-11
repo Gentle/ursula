@@ -288,11 +288,11 @@ fn refused(r: &ureq::http::Response<ureq::Body>) -> Option<Refused> {
     }
 }
 
-/// The response header with which a layer (the server's ingress admission, a gateway, a proxy in
-/// front of either) marks its refusal (a 4xx or 5xx) of a request it refused before passing it on:
-/// the stream applied nothing of it. The value is a short token naming why (`RaftLogPressure`,
-/// say). Older layers never send it. It counts only on a refusal status and with a gateway's vouch
-/// (`NOT_APPLIED_CHECKED`): see `applied_nothing`.
+/// The response header with which a layer (the server, at its ingress admission or before it
+/// proposes a write, a gateway, a proxy in front of either) marks its refusal (a 4xx or 5xx) of a
+/// request it refused before passing it on: the stream applied nothing of it. The value is a short
+/// token naming why (`RaftLogPressure`, say). Older layers never send it. It counts only on a
+/// refusal status and with a gateway's vouch (`NOT_APPLIED_CHECKED`): see `applied_nothing`.
 const NOT_APPLIED: &str = "x-ursula-not-applied";
 
 /// The response header with which a gateway vouches for `NOT_APPLIED`. Ursula's gateway sets it

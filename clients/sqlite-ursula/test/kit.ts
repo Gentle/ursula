@@ -41,7 +41,11 @@ export const integrity = (db: DatabaseSync): string => (db.prepare("PRAGMA integ
 export function recordingMeter() {
 	const records = new Map<string, number[]>();
 	const callbacks = new Map<string, (result: { observe(value: number, attributes?: MetricAttributes): void }) => void>();
-	const keep = (name: string, value: number) => records.set(name, [...(records.get(name) ?? []), value]);
+	const keep = (name: string, value: number): void => {
+		const kept = records.get(name);
+		if (kept === undefined) records.set(name, [value]);
+		else kept.push(value);
+	};
 	const meter: MeterLike = {
 		createHistogram: (name) => ({ record: (value) => keep(name, value) }),
 		createCounter: (name) => ({ add: (value) => keep(name, value) }),

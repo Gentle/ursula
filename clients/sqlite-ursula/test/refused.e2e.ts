@@ -6,13 +6,14 @@
 // the file is not poisoned, reads go on, and the next commit goes out as usual and succeeds once the
 // refusals stop. An attempt whose outcome is unknown among the refusals still poisons: the commit may
 // be in the stream. So does a marker without the vouch, and so does the commit after a refusal for a
-// commit the stream applied. The refusing layer is `gate.mjs`.
+// commit the stream applied. The refusing layer is `gate.mjs`, except for a commit frame over the
+// extension's frame limit, which the extension refuses itself without sending it.
 import { writeFileSync } from "node:fs";
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
 import { attach, instrument, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
 import { openHarness, textTurn } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
-import { type Child, type ChildLine, Gate, openPlain, recordingMeter, runChild, streamPath, ursulaUrl } from "./kit.ts";
+import { type Child, type ChildLine, Gate, integrity, openPlain, recordingMeter, runChild, streamPath, ursulaUrl } from "./kit.ts";
 
 /** SQLITE_IOERR_AUTH: a commit refused before it reached the stream. */
 const COMMIT_REFUSED = 7178;
@@ -384,7 +385,7 @@ it("a transaction too large for one request fails alone without being sent, and 
 		fenced: false,
 		writes_refused: true,
 		refused_kind: "too_large",
-		refused_reason: null,
+		refused_reason: expect.stringMatching(/^\d+ bytes over the 33554432-byte frame limit$/),
 		offset: accepted?.offset,
 		epoch: accepted?.epoch,
 	});
@@ -404,4 +405,50 @@ it("a transaction too large for one request fails alone without being sent, and 
 	} finally {
 		db.close();
 	}
+	// The refused transaction spilled into the WAL before COMMIT (40 MiB, far over SQLite's page
+	// cache), and its rollback dropped those frames: the owner's own files are whole, attach resumes
+	// from them, and they hold the same rows.
+	attach(file, ursulaUrl() + path);
+	expect(status(file)).toMatchObject({ poisoned: false, writes_refused: false, local: done.offset });
+	const own = openPlain(file);
+	try {
+		expect(integrity(own)).toBe("ok");
+		expect(own.prepare("SELECT count(*) AS n FROM b").get()).toEqual({ n: 0 });
+	} finally {
+		own.close();
+	}
+	expect(xs(file)).toEqual(["a1", "a2"]);
+});
+
+it("URSULA_VFS_MAX_FRAME_BYTES lowers the frame limit for a smaller limit in front of the stream", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const [ready, checked] = [`${file}.ready`, `${file}.checked`];
+	// 2 MiB of random bytes in one transaction, over a 1 MiB limit.
+	const steps = [
+		"CREATE TABLE b(x BLOB)",
+		`@wait:${ready}`,
+		"BEGIN; INSERT INTO b VALUES (randomblob(1048576)); INSERT INTO b VALUES (randomblob(1048576)); COMMIT",
+		"@status",
+		`@wait:${checked}`,
+		"INSERT INTO b VALUES (randomblob(1024))",
+	];
+	const child = runChild(file, gate.url + path, steps, { URSULA_VFS_MAX_FRAME_BYTES: "1048576", CHILD_EXIT: "1" });
+	await child.waitFor((l) => l.step === 1 && l.phase === "start");
+	const before = await gate.counts();
+	writeFileSync(ready, "");
+	await child.waitFor((l) => l.step === 4 && l.phase === "start");
+	// Nothing went out while the transaction was refused.
+	expect(await gate.counts()).toEqual(before);
+	writeFileSync(checked, "");
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code, child.stderr()).toBe(0);
+	expect(step(child, 2)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
+	expect(step(child, 3)?.status).toMatchObject({
+		poisoned: false,
+		refused_kind: "too_large",
+		refused_reason: expect.stringMatching(/^\d+ bytes over the 1048576-byte frame limit$/),
+	});
+	expect(step(child, 5)?.ok).toBe(true);
+	expect(done).toMatchObject({ poisoned: false, writes_refused: false });
 });

@@ -30,6 +30,7 @@ use crate::client::append;
 use crate::client::recreated;
 use crate::client::stream_seq;
 use crate::config::abort_after_ack;
+use crate::config::max_frame_bytes;
 use crate::db::Db;
 use crate::db::Mode;
 use crate::db::lock;
@@ -38,7 +39,9 @@ use crate::db::refused;
 use crate::db::registry;
 use crate::error::Error;
 use crate::error::Fence;
+use crate::error::WriteRefusal;
 use crate::frame;
+use crate::frame::FrameError;
 use crate::frame::PAGE;
 use crate::guard::contain;
 use crate::host::OK;
@@ -843,6 +846,11 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     }
     let (body, raw) = match frame::encode_commit(size, &pages) {
         Ok(encoded) => encoded,
+        // More than a frame can hold at all: never sent, so the commit fails alone, as one over the
+        // frame limit does (`client::append`).
+        Err(FrameError::TooLarge(bytes)) => {
+            return db.refuse(WriteRefusal::frame_over_limit(bytes, max_frame_bytes()));
+        }
         Err(e) => return db.poison(Error::EncodeFrame(e)),
     };
     let t = Instant::now();

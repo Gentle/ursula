@@ -588,11 +588,7 @@ pub(crate) fn append(
     // unmarked, or with the connection closed before the body was read, which is no answer.
     let limit = max_frame_bytes();
     if body.len() > limit {
-        return Append::Refused(WriteRefusal::TooLarge {
-            bytes: body.len(),
-            limit: Some(limit),
-            reason: String::new(),
-        });
+        return Append::Refused(WriteRefusal::frame_over_limit(body.len(), limit));
     }
     let started = Instant::now();
     let deadline = retry_deadline();
@@ -1700,7 +1696,9 @@ mod tests {
     fn a_frame_over_the_limit_is_never_sent() {
         use crate::config::DEFAULT_MAX_FRAME_BYTES;
 
-        let (url, server) = serve(vec![]);
+        // A listener that never accepts: a connection would still be queued on it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", listener.local_addr().unwrap());
         let over = vec![0_u8; DEFAULT_MAX_FRAME_BYTES + 1];
         let refused = append(&url, "i1", "p", &over, 1, 1);
         assert!(matches!(
@@ -1708,7 +1706,8 @@ mod tests {
             Append::Refused(WriteRefusal::TooLarge { bytes, limit: Some(limit), .. })
                 if bytes == DEFAULT_MAX_FRAME_BYTES + 1 && limit == DEFAULT_MAX_FRAME_BYTES
         ));
-        assert!(server.join().unwrap().is_empty());
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "nothing connected");
 
         let (url, server) = serve(vec![answer("200 OK")]);
         let at = vec![0_u8; DEFAULT_MAX_FRAME_BYTES];

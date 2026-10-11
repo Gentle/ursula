@@ -163,11 +163,18 @@ impl Db {
     }
 
     /// A snapshot is due and may be taken now: never while the database is poisoned, nor while
-    /// writes are refused before they reach the stream, whatever refused them (`refused`): its
-    /// publish would be refused too. The next acknowledged commit clears the refusal and requests
-    /// one if it is still due.
+    /// writes are refused before they reach the stream by a layer that refuses other writes too
+    /// (`refused`, `WriteRefusal::refuses_other_writes`): its publish would be refused too. The
+    /// next acknowledged commit clears the refusal and requests one if it is still due. A commit
+    /// frame too large to send holds no snapshot back: an owner that stops committing after one
+    /// still publishes, and retention still moves.
     pub(crate) fn snapshot_wanted(&self) -> bool {
-        self.snapshot_due() && self.poisoned.is_none() && self.refused.is_none()
+        self.snapshot_due()
+            && self.poisoned.is_none()
+            && self
+                .refused
+                .as_ref()
+                .is_none_or(|refusal| !refusal.refuses_other_writes())
     }
 
     /// The log size past which a snapshot is due: the database's size, or the configured minimum
@@ -511,8 +518,9 @@ mod tests {
         assert!(d.refused.is_none() && d.fenced());
     }
 
-    // A due snapshot waits while writes are refused, whatever refused them (its publish would be
-    // refused too), and while the database is poisoned. An acknowledged commit lets it go again.
+    // A due snapshot waits while writes are refused by a layer that refuses other writes too (its
+    // publish would be refused too), and while the database is poisoned. An acknowledged commit lets
+    // it go again. A commit frame too large to send holds it back for no reason, so it does not.
     #[test]
     fn no_snapshot_while_writes_are_refused() {
         let mut d = Db::for_tests();
@@ -543,6 +551,8 @@ mod tests {
             d.writes_accepted();
             assert!(d.snapshot_wanted(), "{kind}");
         }
+        d.refuse(WriteRefusal::frame_over_limit(40 << 20, 32 << 20));
+        assert!(d.refused.is_some() && d.snapshot_wanted(), "too_large");
         d.poison(Error::ProducerExpiredAgain);
         assert!(!d.snapshot_wanted());
     }

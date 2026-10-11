@@ -79,16 +79,42 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
 /// 32 MiB, and so does a gateway by default (`--max-request-body-bytes`).
 pub(crate) const DEFAULT_MAX_FRAME_BYTES: usize = 32 << 20;
 
-/// The largest commit frame the extension sends (`client::append`): `URSULA_VFS_MAX_FRAME_BYTES`, or
-/// [`DEFAULT_MAX_FRAME_BYTES`]. Lower it to a smaller limit in front of the server.
+/// The smallest frame limit `URSULA_VFS_MAX_FRAME_BYTES` may set: well above a claim frame (about
+/// 50 bytes), which every attach of an owner sends, and a commit of a few pages.
+pub(crate) const MIN_FRAME_BYTES: usize = 64 << 10;
+
+/// The largest commit frame the extension sends (`client::append`): `URSULA_VFS_MAX_FRAME_BYTES` in
+/// bytes, or [`DEFAULT_MAX_FRAME_BYTES`]. Lower it to a smaller limit in front of the server. A
+/// value outside [`MIN_FRAME_BYTES`] to [`DEFAULT_MAX_FRAME_BYTES`] is taken to the nearer bound,
+/// and one that is not a number of bytes (`16MiB`, say) is ignored, both logged once
+/// (`setting_adjusted`): 0 would refuse every claim, and a frame above the server's limit would be
+/// sent and refused in a way that can poison.
 pub(crate) fn max_frame_bytes() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("URSULA_VFS_MAX_FRAME_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_MAX_FRAME_BYTES)
+        let Ok(value) = std::env::var("URSULA_VFS_MAX_FRAME_BYTES") else {
+            return DEFAULT_MAX_FRAME_BYTES;
+        };
+        let used = frame_limit_from(&value);
+        if value.trim().parse() != Ok(used) {
+            log::emit(Level::Warn, "setting_adjusted", &[
+                ("setting", &"URSULA_VFS_MAX_FRAME_BYTES"),
+                ("value", &value),
+                ("used", &used),
+            ]);
+        }
+        used
     })
+}
+
+/// The frame limit `URSULA_VFS_MAX_FRAME_BYTES=value` sets (see [`max_frame_bytes`]).
+fn frame_limit_from(value: &str) -> usize {
+    value
+        .trim()
+        .parse::<usize>()
+        .map_or(DEFAULT_MAX_FRAME_BYTES, |bytes| {
+            bytes.clamp(MIN_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES)
+        })
 }
 
 pub(crate) fn snapshot_min_bytes() -> u64 {
@@ -144,4 +170,24 @@ pub(crate) fn token_file() -> Option<&'static str> {
 
 fn non_empty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_MAX_FRAME_BYTES;
+    use super::MIN_FRAME_BYTES;
+    use super::frame_limit_from;
+
+    // The frame limit is a number of bytes between 64 KiB and 32 MiB: below, an owner's claim could
+    // be refused; above, a frame the server cannot take would be sent. Anything else keeps 32 MiB.
+    #[test]
+    fn the_frame_limit_stays_between_64_kib_and_32_mib() {
+        assert_eq!(frame_limit_from("1048576"), 1 << 20);
+        assert_eq!(frame_limit_from(" 524288 "), 512 << 10);
+        assert_eq!(frame_limit_from("0"), MIN_FRAME_BYTES);
+        assert_eq!(frame_limit_from("40"), MIN_FRAME_BYTES);
+        assert_eq!(frame_limit_from("67108864"), DEFAULT_MAX_FRAME_BYTES);
+        assert_eq!(frame_limit_from("16MiB"), DEFAULT_MAX_FRAME_BYTES);
+        assert_eq!(frame_limit_from(""), DEFAULT_MAX_FRAME_BYTES);
+    }
 }

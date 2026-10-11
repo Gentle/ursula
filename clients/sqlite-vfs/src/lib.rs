@@ -114,7 +114,9 @@
 //! same URL, and any other redirect fails the request. `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the
 //! smallest log (bytes since the latest snapshot) that triggers a snapshot. `URSULA_VFS_IDLE_MS`
 //! sets how long a connection is kept for reuse after its last request (default 90000, at most
-//! 15000 for snapshot transfers).
+//! 15000 for snapshot transfers). `URSULA_VFS_MAX_FRAME_BYTES` sets the largest commit frame sent,
+//! in bytes (32 MiB by default, at least 64 KiB): a larger transaction is refused as `too_large`
+//! without being sent.
 //!
 //! Module map:
 //!

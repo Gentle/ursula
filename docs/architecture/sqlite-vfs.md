@@ -756,17 +756,29 @@ The crate refuses to build with `panic = "abort"`.
   cannot open the file (§1); processes without it are not replicated (and block recovery).
 - The local files must be on a local filesystem (§6).
 - A transaction must fit one request. Its commit frame as sent, a 12-byte header and the
-  transaction's changed pages compressed with zstd, is at most `URSULA_VFS_MAX_FRAME_BYTES`: 32 MiB
-  (33,554,432 bytes) by default, the server's request body limit, which a gateway's
-  `--max-request-body-bytes` matches by default. That is about 8,000 changed pages of incompressible
-  data (random, encrypted or already compressed bytes, such as embeddings or media), and about three
-  times as many of typical text. A larger transaction is never sent. It fails alone with
-  `SQLITE_IOERR_AUTH` and `refused_kind` `too_large` (§2), and the database stays usable. Split bulk
-  imports into smaller transactions. `VACUUM` rewrites every page in one transaction, so on a
-  database whose compressed size is above the limit it fails the same way: copy its rows into a new
-  database in smaller transactions instead. Behind a layer with a lower limit, lower
-  `URSULA_VFS_MAX_FRAME_BYTES` to match it: a marked `413` also fails the commit alone, but an
-  unmarked one poisons.
+  transaction's changed pages compressed with zstd, is at most `URSULA_VFS_MAX_FRAME_BYTES` (in
+  bytes, from 64 KiB to 32 MiB: a value outside is taken to the nearer bound, and one that is not
+  a number of bytes is ignored, both logged once as `setting_adjusted`): 32 MiB (33,554,432 bytes)
+  by default, the server's request body limit, which a gateway's `--max-request-body-bytes`
+  matches by default. That is about 8,000 changed pages of incompressible data (random, encrypted
+  or already compressed bytes, such as embeddings or media), and about three times as many of
+  typical text. A larger transaction is never sent. It fails alone with `SQLITE_IOERR_AUTH`,
+  `refused_kind` `too_large` and the frame's size and the limit in `refused_reason` (§2), the
+  database stays usable, and snapshots go on. Before it refuses, the extension holds the
+  transaction several times in memory: the changed pages, the record built from them, and its
+  compressed frame. Split bulk imports into smaller transactions. Statements that rewrite a whole
+  table or index run as one transaction too: `CREATE INDEX` on a large table, `REINDEX`, an `ALTER
+  TABLE` that rebuilds the table, and `VACUUM`, which rewrites every page. On a database whose
+  compressed size is above the limit, `VACUUM` fails the same way: delete rows before it, so that
+  what it writes compresses below the limit, or copy the rows into a new database in transactions
+  below the limit.
+- Behind a layer with a lower request limit, lower `URSULA_VFS_MAX_FRAME_BYTES` below it. A `413`
+  marked `x-ursula-not-applied` and vouched for (§2) fails the commit alone, but it reaches the
+  client only from a layer that reads the whole body before it answers (the gateway's per-bucket
+  limit does). The gateway's `--max-request-body-bytes` and the server answer once the body passes
+  the limit and close the connection with the rest unread, so the client sees a failed write, an
+  unknown outcome, and the commit poisons once the retry budget runs out. Any other `413` poisons
+  at once.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
   by the server at 1 GiB compressed (32 MiB inline or through the gateway).
 - Producer expiry after 7 idle days; the owner reclaims only if nobody wrote meanwhile.

@@ -6626,7 +6626,6 @@ mod leadership_shed {
     use std::collections::BTreeSet;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -6760,14 +6759,20 @@ mod leadership_shed {
                 .collect()
         }
 
-        /// Checks that node 1 hands off nothing for 8 s while no peer may
-        /// campaign. A handoff to a peer that may not campaign is refused
-        /// without a word, and Raft abandons it after its 6 s transfer
-        /// deadline: node 1 then leads the group in a newer term.
+        /// Checks that node 1 hands off nothing for 8 s while no peer
+        /// qualifies. A handoff to a peer that may campaign moves the
+        /// leadership. A handoff to a peer that may not is refused without
+        /// a word, and Raft abandons it after its 6 s transfer deadline:
+        /// node 1 then leads the group in a newer term.
         async fn assert_node_1_hands_nothing_off(&self) {
             let terms = self.terms();
             tokio::time::sleep(Duration::from_secs(8)).await;
-            assert_eq!(self.led_by(1), usize::try_from(GROUPS).unwrap());
+            assert_eq!(
+                self.led_by(1),
+                usize::try_from(GROUPS).unwrap(),
+                "a leadership left node 1: leaders {:?}",
+                self.leaders()
+            );
             assert_eq!(
                 self.terms(),
                 terms,
@@ -6945,12 +6950,32 @@ mod leadership_shed {
     #[derive(Debug)]
     struct FailingProbeStore {
         registry: RaftGroupHandleRegistry,
-        probes: Mutex<Vec<(usize, bool)>>,
+        probes: watch::Sender<Vec<(usize, bool)>>,
     }
 
     impl FailingProbeStore {
+        fn new(registry: &RaftGroupHandleRegistry) -> Self {
+            Self {
+                registry: registry.clone(),
+                probes: watch::Sender::new(Vec::new()),
+            }
+        }
+
         fn probes(&self) -> Vec<(usize, bool)> {
-            self.probes.lock().unwrap().clone()
+            self.probes.borrow().clone()
+        }
+
+        /// Waits until the store has been probed more than `count` times.
+        async fn wait_for_more_probes_than(&self, count: usize) {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                self.probes
+                    .subscribe()
+                    .wait_for(|probes| probes.len() > count),
+            )
+            .await
+            .expect("the gate probes the store again")
+            .expect("the store keeps its probes");
         }
     }
 
@@ -6979,10 +7004,9 @@ mod leadership_shed {
                 .registry
                 .leadership_shed_state()
                 .contains(LeadershipShedReason::SnapshotDriverS3.into());
+            let led = led_by(&self.registry, 1);
             self.probes
-                .lock()
-                .unwrap()
-                .push((led_by(&self.registry, 1), shedding));
+                .send_modify(|probes| probes.push((led, shedding)));
             Box::pin(async { Err(SnapshotStoreError::Backend("the store is down".into())) })
         }
     }
@@ -6993,18 +7017,27 @@ mod leadership_shed {
     async fn the_store_gate_sheds_after_three_failed_probes_and_drains_four_per_tick() {
         let cluster = Cluster::led_by_node_1().await;
         let node_1 = cluster.node_1();
-        let store = Arc::new(FailingProbeStore {
-            registry: node_1.registry.clone(),
-            probes: Mutex::new(Vec::new()),
-        });
-        // Both peers drain, so neither may campaign.
-        for node_id in [2, 3] {
-            cluster
-                .node(node_id)
-                .registry
-                .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
-        }
-        let participation = cluster.participation();
+        let store = Arc::new(FailingProbeStore::new(&node_1.registry));
+        // Node 3 drains, so it may not campaign. Node 2 may campaign, but
+        // node 1's questions to it get no answer, so the store gate, which
+        // asks over a healthy path, must not hand it a leadership.
+        cluster
+            .node(3)
+            .registry
+            .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+        let (silent_2, _silent_2) = silent_url().await;
+        let participation = PeerParticipation::new(
+            1,
+            &[
+                cluster.peers[0].clone(),
+                (2, silent_2),
+                cluster.peers[2].clone(),
+            ],
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .expect("peer client"),
+        );
         crate::bootstrap::spawn_snapshot_driver(
             &node_1.runtime,
             &node_1.registry,
@@ -7028,27 +7061,40 @@ mod leadership_shed {
             .node(3)
             .registry
             .clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+        let cleared = store.probes().len();
         cluster
             .wait_until_node_1_leads_nothing(Duration::from_secs(60))
             .await;
+        // The next probe follows the step that handed off the last
+        // leadership.
+        store.wait_for_more_probes_than(store.probes().len()).await;
 
         let probes = store.probes();
         let all = usize::try_from(GROUPS).unwrap();
-        assert!(probes.len() > 3, "{probes:?}");
+        assert!(probes.len() > cleared, "{probes:?}");
         assert_eq!(
             probes[..3],
             [(all, false); 3],
             "nothing moves before the third failed probe"
         );
-        for (index, (led, shedding)) in probes.iter().enumerate().skip(3) {
+        for (index, (_, shedding)) in probes.iter().enumerate().skip(3) {
             assert!(shedding, "probe {index}: {probes:?}");
-            let shed_ticks = index.checked_sub(2).unwrap();
+        }
+        // Each probe from `cleared` on follows the step of the tick that was
+        // under way when node 3 cleared its drain, and one step per tick
+        // after it. Each step hands off at most four leaderships.
+        for (index, (led, _)) in probes.iter().enumerate().skip(cleared) {
+            let steps = index.checked_add(1).unwrap().checked_sub(cleared).unwrap();
             assert!(
-                all.checked_sub(*led).unwrap() <= PER_TICK.saturating_mul(shed_ticks),
-                "more than {PER_TICK} leaderships left per tick: {probes:?}"
+                all.checked_sub(*led).unwrap() <= PER_TICK.saturating_mul(steps),
+                "more than {PER_TICK} leaderships left per tick since probe {cleared}: {probes:?}"
             );
         }
-        assert_eq!(cluster.led_by(3), all, "only node 3 may campaign");
+        assert_eq!(
+            cluster.led_by(3),
+            all,
+            "node 3 is the only peer that answered that it may campaign"
+        );
         cluster.shutdown().await;
     }
 

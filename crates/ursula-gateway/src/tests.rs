@@ -1355,18 +1355,6 @@ async fn a_followed_redirect_keeps_the_leader_marker_only_when_the_redirect_carr
             leader: refused(&["RaftLogPressure"]),
             expected: &[],
         },
-        Case {
-            name: "unmarked redirect, the leader redirects",
-            redirect: marked(&[]),
-            leader: raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])),
-            expected: &[],
-        },
-        Case {
-            name: "marked redirect, the leader redirects",
-            redirect: marked(&["NotLeader"]),
-            leader: raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])),
-            expected: &["NotLeader"],
-        },
     ];
     for Case {
         name,
@@ -1387,56 +1375,47 @@ async fn a_followed_redirect_keeps_the_leader_marker_only_when_the_redirect_carr
         assert_eq!(gateway.metrics_snapshot().leader_redirects, 1, "{name}");
         assert_eq!(markers(&response), expected, "{name}");
         assert_eq!(vouch(&response), Some("1"), "{name}");
-        if leader_status == StatusCode::TEMPORARY_REDIRECT {
-            // The leader's own redirect is not followed again. It reaches the
-            // client reduced to its path, without the Raft leader id.
-            assert_eq!(
-                response.headers().get(LOCATION).expect("location"),
-                "/bucket/stream",
-                "{name}"
-            );
-            assert!(
-                response
-                    .headers()
-                    .get(HEADER_URSULA_RAFT_LEADER_ID)
-                    .is_none(),
-                "{name}"
-            );
-        }
     }
 }
 
-/// A redirect the gateway does not follow, here because its leader is not an
-/// upstream, is the only exchange of the attempt. Its marker reaches the
-/// client unchanged, with the vouch. Following it is a new attempt.
+/// A redirect the gateway cannot follow, here because its leader is not an
+/// upstream and no other upstream is left to try, never reaches the client.
+/// It gets a retryable `503` instead, without a `Location`, marked only when
+/// the redirect was: the node raised a marked one before it proposed anything.
 #[tokio::test]
-async fn a_redirect_the_gateway_passes_through_keeps_its_marker() {
-    let cases: [(&str, &[&'static str]); 2] = [("marked", &["NotLeader"]), ("unmarked", &[])];
-    for (case, values) in cases {
+async fn a_redirect_the_gateway_cannot_follow_ends_in_a_503_marked_only_when_it_was() {
+    let cases: [(&str, &[&'static str], &[&'static str]); 2] = [
+        ("marked", &["NotLeader"], &["LeaderNotFound"]),
+        ("unmarked", &[], &[]),
+    ];
+    for (case, values, expected) in cases {
         let (status, headers) = raft_redirect(UNKNOWN_LEADER, marked(values));
         let node = spawn_answering(status, headers).await;
         let gateway = gateway_for_url(node.url.clone());
 
         let response = gateway.handle(post_path("/bucket/stream")).await;
 
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{case}");
-        assert_eq!(gateway.metrics_snapshot().leader_redirects, 0, "{case}");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
         assert_eq!(
-            response.headers().get(LOCATION).expect("location"),
-            "/bucket/stream",
+            response.headers().get(RETRY_AFTER).expect("retry-after"),
+            "1",
             "{case}"
         );
-        assert_eq!(markers(&response), values, "{case}");
+        assert!(response.headers().get(LOCATION).is_none(), "{case}");
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(metrics.leader_redirects, 0, "{case}");
+        assert_eq!(metrics.leader_not_found, 1, "{case}");
+        assert_eq!(markers(&response), expected, "{case}");
         assert_eq!(vouch(&response), Some("1"), "{case}");
     }
 }
 
 /// A connect failure on the first hop means that no node received the
-/// request, so its `503` is marked. On the leader hop of a followed redirect
-/// it is not, whether or not the redirect was marked: the gateway does not
-/// combine a redirect's marker with a failed second exchange.
+/// request, so its `503` is marked. On the hop after a redirect it is marked
+/// only when the redirect was: a node raises a marked redirect before it
+/// proposes anything, and may have proposed the write before an unmarked one.
 #[tokio::test]
-async fn a_first_hop_connect_failure_is_marked_and_a_leader_hop_one_is_not() {
+async fn a_connect_failure_is_marked_only_when_no_node_can_have_proposed_the_request() {
     let gone = refusing_upstream().await;
 
     let first_hop = gateway_for_url(gone.clone())
@@ -1447,11 +1426,15 @@ async fn a_first_hop_connect_failure_is_marked_and_a_leader_hop_one_is_not() {
     assert_eq!(not_applied(&first_hop), Some("UpstreamUnreachable"));
     assert_eq!(vouch(&first_hop), Some("1"));
 
-    let cases: [(&str, &[&'static str]); 2] = [
-        ("unmarked redirect", &[]),
-        ("marked redirect", &["NotLeader"]),
+    let cases: [(&str, &[&'static str], Option<&str>); 2] = [
+        ("unmarked redirect", &[], None),
+        (
+            "marked redirect",
+            &["NotLeader"],
+            Some("UpstreamUnreachable"),
+        ),
     ];
-    for (case, values) in cases {
+    for (case, values, expected) in cases {
         let (status, headers) = raft_redirect(&format!("{gone}/bucket/stream"), marked(values));
         let follower = spawn_answering(status, headers).await;
         let gateway = Gateway::new(test_config(vec![follower.url.clone(), gone.clone()]));
@@ -1465,9 +1448,657 @@ async fn a_first_hop_connect_failure_is_marked_and_a_leader_hop_one_is_not() {
             "{case}"
         );
         assert_eq!(gateway.metrics_snapshot().leader_redirects, 1, "{case}");
-        assert_eq!(not_applied(&leader_hop), None, "{case}");
+        assert_eq!(not_applied(&leader_hop), expected, "{case}");
         assert_eq!(vouch(&leader_hop), Some("1"), "{case}");
     }
+}
+
+/// A node's answer on `/bucket/stream`, as a test scripts it: a status,
+/// headers, and how long the node waits before it answers.
+#[derive(Clone)]
+struct Script {
+    status: StatusCode,
+    headers: HeaderMap,
+    delay: Duration,
+}
+
+/// An upstream that answers every request on `/bucket/stream` as its script
+/// says, and counts them. The script is set once every upstream of a test is
+/// bound, so that redirects can name each other. Each request's arrival is
+/// also signalled ([`Scripted::arrived`]), for tests that move a paused clock.
+struct Scripted {
+    upstream: TestUpstream,
+    script: Arc<Mutex<Script>>,
+    hits: Arc<AtomicUsize>,
+    arrivals: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+}
+
+impl Scripted {
+    async fn spawn() -> Self {
+        let script = Arc::new(Mutex::new(Script {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            delay: Duration::ZERO,
+        }));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, counts) = (Arc::clone(&script), Arc::clone(&hits));
+        let upstream = spawn_upstream(Router::new().route(
+            "/bucket/stream",
+            any(move || {
+                let (script, hits, arrived) =
+                    (Arc::clone(&answers), Arc::clone(&counts), arrived.clone());
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let Script {
+                        status,
+                        headers,
+                        delay,
+                    } = script.lock().unwrap().clone();
+                    // The test may have stopped waiting for arrivals.
+                    let _ignored = arrived.send(());
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    (status, headers, "scripted")
+                }
+            }),
+        ))
+        .await;
+        Self {
+            upstream,
+            script,
+            hits,
+            arrivals: tokio::sync::Mutex::new(arrivals),
+        }
+    }
+
+    /// Waits until a request reaches this upstream.
+    async fn arrived(&self) {
+        self.arrivals
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("the upstream is up");
+    }
+
+    fn url(&self) -> String {
+        self.upstream.url.clone()
+    }
+
+    fn answers(&self, (status, headers): (StatusCode, HeaderMap)) {
+        self.answers_after(Duration::ZERO, (status, headers));
+    }
+
+    fn answers_after(&self, delay: Duration, (status, headers): (StatusCode, HeaderMap)) {
+        *self.script.lock().unwrap() = Script {
+            status,
+            headers,
+            delay,
+        };
+    }
+
+    /// A Raft redirect to this upstream, marked with `values`.
+    fn redirect_here(&self, values: &[&'static str]) -> (StatusCode, HeaderMap) {
+        raft_redirect(&format!("{}/bucket/stream", self.url()), marked(values))
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+/// A gateway over `upstreams` whose first hop goes to the first of them, the
+/// cached route of `/bucket/stream`.
+fn gateway_starting_at(upstreams: &[&Scripted]) -> Gateway {
+    gateway_with(
+        test_config(upstreams.iter().map(|upstream| upstream.url()).collect()),
+        upstreams[0],
+    )
+}
+
+/// A gateway with `config` whose first hop goes to `first`, the cached route
+/// of `/bucket/stream`.
+fn gateway_with(config: GatewayConfig, first: &Scripted) -> Gateway {
+    let gateway = Gateway::new(config);
+    gateway.remember_leader("/bucket/stream".to_owned(), first.url());
+    gateway
+}
+
+/// Sends `request` through `gateway` on a task of its own, so that a test
+/// can move a paused clock while it is under way.
+fn send(gateway: &Arc<Gateway>, request: Request<Body>) -> tokio::task::JoinHandle<AxumResponse> {
+    let gateway = Arc::clone(gateway);
+    tokio::spawn(async move { gateway.handle(request).await })
+}
+
+/// Waits until `arrival` happens, an upstream getting the request under way.
+/// The request ending first fails the test, instead of a wait on a paused
+/// clock that never ends.
+async fn until_reached(
+    arrival: impl Future<Output = ()>,
+    request: &mut tokio::task::JoinHandle<AxumResponse>,
+) {
+    tokio::select! {
+        () = arrival => {}
+        ended = request => panic!(
+            "the request ended before it reached the upstream: {:?}",
+            ended.map(|response| response.status())
+        ),
+    }
+}
+
+/// The route the gateway caches for `/bucket/stream`.
+fn cached_route(gateway: &Gateway) -> Option<String> {
+    gateway
+        .leader_affinity
+        .lock()
+        .unwrap()
+        .get("/bucket/stream")
+        .cloned()
+}
+
+/// A refusal marked with `values`.
+fn refusal(values: &[&'static str]) -> (StatusCode, HeaderMap) {
+    (StatusCode::SERVICE_UNAVAILABLE, marked(values))
+}
+
+/// The gateway follows a chain of redirects, and the final answer keeps its
+/// marker only when every redirect on the way carried one: a node raises a
+/// marked redirect before it proposes anything, but may have proposed the
+/// write before an unmarked one. The route it caches is the node that
+/// answered without redirecting, unless it answered `503`. The redirecting
+/// nodes' routes are dropped. Every answer carries the vouch.
+#[tokio::test]
+async fn a_chain_of_redirects_keeps_the_marker_only_when_every_redirect_carried_one() {
+    struct Case {
+        name: &'static str,
+        first: &'static [&'static str],
+        second: &'static [&'static str],
+        leader: (StatusCode, HeaderMap),
+        expected: &'static [&'static str],
+    }
+    let vouched_only = || {
+        let mut headers = marked(&["RaftLogPressure"]);
+        headers.insert(NOT_APPLIED_CHECKED_HEADER, HeaderValue::from_static("1"));
+        (StatusCode::SERVICE_UNAVAILABLE, headers)
+    };
+    let cases = [
+        Case {
+            name: "marked, marked, marked 503",
+            first: &["NotLeader"],
+            second: &["NotLeader"],
+            leader: refusal(&["RaftLogPressure"]),
+            expected: &["RaftLogPressure"],
+        },
+        Case {
+            name: "marked, unmarked, marked 503",
+            first: &["NotLeader"],
+            second: &[],
+            leader: refusal(&["RaftLogPressure"]),
+            expected: &[],
+        },
+        Case {
+            name: "unmarked, marked, marked 503",
+            first: &[],
+            second: &["NotLeader"],
+            leader: refusal(&["RaftLogPressure"]),
+            expected: &[],
+        },
+        Case {
+            name: "marked, marked, unmarked 503",
+            first: &["NotLeader"],
+            second: &["NotLeader"],
+            leader: refusal(&[]),
+            expected: &[],
+        },
+        Case {
+            name: "marked, marked, 200",
+            first: &["NotLeader"],
+            second: &["NotLeader"],
+            leader: (StatusCode::OK, HeaderMap::new()),
+            expected: &[],
+        },
+        Case {
+            name: "marked, marked, 404",
+            first: &["NotLeader"],
+            second: &["NotLeader"],
+            leader: (StatusCode::NOT_FOUND, HeaderMap::new()),
+            expected: &[],
+        },
+        Case {
+            name: "marked, marked, marked 503 with an upstream's vouch",
+            first: &["NotLeader"],
+            second: &["NotLeader"],
+            leader: vouched_only(),
+            expected: &["RaftLogPressure"],
+        },
+    ];
+    for Case {
+        name,
+        first,
+        second,
+        leader: answer,
+        expected,
+    } in cases
+    {
+        let (a, b, leader) = (
+            Scripted::spawn().await,
+            Scripted::spawn().await,
+            Scripted::spawn().await,
+        );
+        a.answers(b.redirect_here(first));
+        b.answers(leader.redirect_here(second));
+        let status = answer.0;
+        leader.answers(answer);
+        let gateway = gateway_starting_at(&[&a, &b, &leader]);
+
+        let response = gateway.handle(post_path("/bucket/stream")).await;
+
+        assert_eq!(response.status(), status, "{name}");
+        assert_eq!(markers(&response), expected, "{name}");
+        assert_eq!(vouch(&response), Some("1"), "{name}");
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(metrics.leader_redirects, 2, "{name}");
+        assert_eq!(metrics.leader_searches, 0, "{name}");
+        assert_eq!((a.hits(), b.hits(), leader.hits()), (1, 1, 1), "{name}");
+        let learned = status.is_success().then(|| leader.url());
+        assert_eq!(cached_route(&gateway), learned, "{name}");
+    }
+}
+
+/// A redirect whose `Location` is not one of the upstreams (`--upstream`
+/// names the nodes otherwise than their peer URLs) sends the request to the
+/// next upstream it has not reached, in the configured order, skipping
+/// ejected ones. Those hops count for the marker like any other. When none is
+/// left, the client gets a `503`, marked only when every redirect was.
+#[tokio::test]
+async fn a_redirect_to_an_unknown_address_searches_the_upstreams_not_yet_reached() {
+    let unknown = |values: &[&'static str]| raft_redirect(UNKNOWN_LEADER, marked(values));
+
+    // Found: the third upstream answers, and the route to it is learned.
+    let (a, b, leader) = (
+        Scripted::spawn().await,
+        Scripted::spawn().await,
+        Scripted::spawn().await,
+    );
+    a.answers(unknown(&["NotLeader"]));
+    b.answers(unknown(&["NotLeader"]));
+    leader.answers(refusal(&["RaftLogPressure"]));
+    let gateway = gateway_starting_at(&[&a, &b, &leader]);
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(markers(&response), ["RaftLogPressure"]);
+    assert_eq!(vouch(&response), Some("1"));
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!((metrics.leader_redirects, metrics.leader_searches), (2, 2));
+    leader.answers((StatusCode::OK, HeaderMap::new()));
+    gateway.remember_leader("/bucket/stream".to_owned(), a.url());
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(cached_route(&gateway), Some(leader.url()));
+
+    // An unmarked answer on the way unmarks the final one.
+    b.answers(unknown(&[]));
+    leader.answers(refusal(&["RaftLogPressure"]));
+    gateway.remember_leader("/bucket/stream".to_owned(), a.url());
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(markers(&response), Vec::<&str>::new());
+    assert_eq!(vouch(&response), Some("1"));
+
+    // An ejected upstream is skipped.
+    b.answers(unknown(&["NotLeader"]));
+    leader.answers((StatusCode::OK, HeaderMap::new()));
+    let gateway = gateway_starting_at(&[&a, &b, &leader]);
+    gateway.ejections.failed(&b.url(), Instant::now());
+    let before = b.hits();
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(b.hits(), before);
+    assert_eq!(gateway.metrics_snapshot().leader_searches, 1);
+
+    // Not found: every upstream redirects to an unknown address. One unmarked
+    // redirect, first or last, unmarks the 503.
+    for (case, first, second, expected) in [
+        (
+            "marked, marked",
+            &["NotLeader"][..],
+            &["NotLeader"][..],
+            &["LeaderNotFound"][..],
+        ),
+        ("marked, unmarked", &["NotLeader"][..], &[][..], &[][..]),
+        ("unmarked, marked", &[][..], &["NotLeader"][..], &[][..]),
+    ] {
+        let (a, b) = (Scripted::spawn().await, Scripted::spawn().await);
+        a.answers(unknown(first));
+        b.answers(unknown(second));
+        let gateway = gateway_starting_at(&[&a, &b]);
+        let response = gateway.handle(post_path("/bucket/stream")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+        assert!(response.headers().get(LOCATION).is_none(), "{case}");
+        assert_eq!(markers(&response), expected, "{case}");
+        assert_eq!(vouch(&response), Some("1"), "{case}");
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(metrics.leader_searches, 1, "{case}");
+        assert_eq!(metrics.leader_not_found, 1, "{case}");
+        assert_eq!(cached_route(&gateway), None, "{case}");
+    }
+}
+
+/// The gateway follows three redirects at most. Two nodes that each name
+/// the other as the leader get the request twice each, and the client a
+/// `503`, marked only when every redirect was.
+#[tokio::test]
+async fn the_gateway_follows_three_redirects_at_most() {
+    for (case, from_a, from_b, expected) in [
+        (
+            "marked",
+            &["NotLeader"][..],
+            &["NotLeader"][..],
+            &["LeaderNotFound"][..],
+        ),
+        ("b unmarked", &["NotLeader"][..], &[][..], &[][..]),
+        ("a unmarked", &[][..], &["NotLeader"][..], &[][..]),
+    ] {
+        let (a, b) = (Scripted::spawn().await, Scripted::spawn().await);
+        a.answers(b.redirect_here(from_a));
+        b.answers(a.redirect_here(from_b));
+        let gateway = gateway_starting_at(&[&a, &b]);
+
+        let response = gateway.handle(post_path("/bucket/stream")).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+        assert_eq!(
+            response.headers().get(RETRY_AFTER).expect("retry-after"),
+            "1",
+            "{case}"
+        );
+        assert_eq!(markers(&response), expected, "{case}");
+        assert_eq!(vouch(&response), Some("1"), "{case}");
+        assert_eq!((a.hits(), b.hits()), (2, 2), "{case}");
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(metrics.leader_redirects, 3, "{case}");
+        assert_eq!(metrics.leader_not_found, 1, "{case}");
+        assert_eq!(cached_route(&gateway), None, "{case}");
+    }
+}
+
+/// The deadline counts from the first redirect, on a paused clock. A slow
+/// first hop does not use it up: its redirect is followed. Once the deadline
+/// has passed since the first redirect, no further hop starts: after two hops
+/// of more than half of it each, the second node's redirect is not followed,
+/// and the client gets a `503`, marked only when every redirect was. A hop
+/// under way runs to its answer, which the client gets.
+#[tokio::test(start_paused = true)]
+async fn the_redirect_deadline_counts_from_the_first_redirect() {
+    let _frozen = FrozenClock::hold();
+    let patient = |upstreams: &[&Scripted]| {
+        let mut config = test_config(upstreams.iter().map(|upstream| upstream.url()).collect());
+        config.response_header_timeout = Duration::from_secs(60);
+        Arc::new(gateway_with(config, upstreams[0]))
+    };
+    let over = LEADER_REDIRECT_DEADLINE.saturating_add(Duration::from_secs(1));
+    let more_than_half = LEADER_REDIRECT_DEADLINE
+        .checked_div(2)
+        .unwrap()
+        .saturating_add(Duration::from_millis(500));
+
+    // A slow first hop: its redirect is followed.
+    let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
+    a.answers_after(over, leader.redirect_here(&["NotLeader"]));
+    let gateway = patient(&[&a, &leader]);
+    let mut request = send(&gateway, post_path("/bucket/stream"));
+    until_reached(a.arrived(), &mut request).await;
+    tokio::time::advance(over).await;
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(leader.hits(), 1);
+    assert_eq!(cached_route(&gateway), Some(leader.url()));
+
+    // Two hops of more than half the deadline each: the third redirect is
+    // not followed.
+    for (case, first, expected) in [
+        ("marked", &["NotLeader"][..], &["LeaderNotFound"][..]),
+        ("unmarked", &[][..], &[][..]),
+    ] {
+        let (a, b, c, d) = (
+            Scripted::spawn().await,
+            Scripted::spawn().await,
+            Scripted::spawn().await,
+            Scripted::spawn().await,
+        );
+        a.answers(b.redirect_here(first));
+        b.answers_after(more_than_half, c.redirect_here(&["NotLeader"]));
+        c.answers_after(more_than_half, d.redirect_here(&["NotLeader"]));
+        let gateway = patient(&[&a, &b, &c, &d]);
+        let mut request = send(&gateway, post_path("/bucket/stream"));
+        until_reached(b.arrived(), &mut request).await;
+        tokio::time::advance(more_than_half).await;
+        until_reached(c.arrived(), &mut request).await;
+        tokio::time::advance(more_than_half).await;
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+        assert_eq!(markers(&response), expected, "{case}");
+        assert_eq!(vouch(&response), Some("1"), "{case}");
+        assert_eq!((c.hits(), d.hits()), (1, 0), "{case}");
+        assert_eq!(gateway.metrics_snapshot().leader_redirects, 2, "{case}");
+    }
+
+    // A hop under way when the deadline passes answers.
+    let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
+    a.answers(leader.redirect_here(&["NotLeader"]));
+    leader.answers_after(over, (StatusCode::OK, HeaderMap::new()));
+    let gateway = patient(&[&a, &leader]);
+    let mut request = send(&gateway, post_path("/bucket/stream"));
+    until_reached(leader.arrived(), &mut request).await;
+    tokio::time::advance(over).await;
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(cached_route(&gateway), Some(leader.url()));
+}
+
+/// A connect failure after redirects is marked only when every redirect
+/// before it was: then no node proposed the request, and the last hop never
+/// sent it. The upstream is ejected, and no route is learned.
+#[tokio::test]
+async fn a_connect_failure_after_redirects_is_marked_only_when_every_redirect_was() {
+    let gone = refusing_upstream().await;
+    for (case, first, second, expected) in [
+        (
+            "marked, marked",
+            &["NotLeader"][..],
+            &["NotLeader"][..],
+            Some("UpstreamUnreachable"),
+        ),
+        ("unmarked, marked", &[][..], &["NotLeader"][..], None),
+        ("marked, unmarked", &["NotLeader"][..], &[][..], None),
+    ] {
+        let (a, b) = (Scripted::spawn().await, Scripted::spawn().await);
+        a.answers(b.redirect_here(first));
+        b.answers(raft_redirect(
+            &format!("{gone}/bucket/stream"),
+            marked(second),
+        ));
+        let gateway = Gateway::new(test_config(vec![a.url(), b.url(), gone.clone()]));
+        gateway.remember_leader("/bucket/stream".to_owned(), a.url());
+
+        let response = gateway.handle(post_path("/bucket/stream")).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+        assert_eq!(not_applied(&response), expected, "{case}");
+        assert_eq!(vouch(&response), Some("1"), "{case}");
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(metrics.leader_redirects, 2, "{case}");
+        assert_eq!(metrics.upstream_ejections, 1, "{case}");
+        assert_eq!(cached_route(&gateway), None, "{case}");
+    }
+}
+
+/// A leader hop that sends no response headers in time is a `504` without a
+/// marker, whatever the redirects: the node may have received the request.
+/// No route is learned.
+#[tokio::test(start_paused = true)]
+async fn a_leader_hop_that_times_out_is_unmarked_and_teaches_no_route() {
+    let _frozen = FrozenClock::hold();
+    let a = Scripted::spawn().await;
+    let (silent, mut arrivals) = silent_upstream().await;
+    a.answers(raft_redirect(
+        &format!("{}/bucket/stream", silent.url),
+        marked(&["NotLeader"]),
+    ));
+    let gateway = Arc::new(gateway_with(
+        test_config(vec![a.url(), silent.url.clone()]),
+        &a,
+    ));
+
+    let mut request = send(&gateway, post_path("/bucket/stream"));
+    until_reached(
+        async {
+            arrivals.recv().await.expect("the upstream is up");
+        },
+        &mut request,
+    )
+    .await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let response = request.await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(not_applied(&response), None);
+    assert_eq!(vouch(&response), Some("1"));
+    assert_eq!(gateway.metrics_snapshot().leader_redirects, 1);
+    assert_eq!(cached_route(&gateway), None);
+    assert!(arrivals.try_recv().is_err());
+}
+
+/// A search hop that cannot connect sent nothing, so the search goes on to
+/// the next upstream the request has not reached, and the one it could not
+/// connect to is ejected. With none left, the client gets the `503` of that
+/// connect failure, marked only when every redirect was. A search hop whose
+/// upstream read the whole request and closed the connection is a `502`
+/// without a marker, whatever the redirects before it: that node may have
+/// proposed the write.
+#[tokio::test]
+async fn a_search_hop_that_cannot_connect_searches_on_and_one_that_was_sent_stays_unmarked() {
+    let unknown = |values: &[&'static str]| raft_redirect(UNKNOWN_LEADER, marked(values));
+    let gone = refusing_upstream().await;
+
+    let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
+    a.answers(unknown(&["NotLeader"]));
+    let gateway = gateway_with(test_config(vec![a.url(), gone.clone(), leader.url()]), &a);
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(
+        (metrics.leader_searches, metrics.upstream_ejections),
+        (2, 1)
+    );
+    assert_eq!(cached_route(&gateway), Some(leader.url()));
+
+    for (case, values, expected) in [
+        ("marked", &["NotLeader"][..], Some("UpstreamUnreachable")),
+        ("unmarked", &[][..], None),
+    ] {
+        let a = Scripted::spawn().await;
+        a.answers(unknown(values));
+        let gateway = gateway_with(test_config(vec![a.url(), gone.clone()]), &a);
+        let response = gateway.handle(post_path("/bucket/stream")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+        assert_eq!(not_applied(&response), expected, "{case}");
+        assert_eq!(vouch(&response), Some("1"), "{case}");
+        assert_eq!(cached_route(&gateway), None, "{case}");
+    }
+
+    let (node, request) = hanging_up_upstream().await;
+    let a = Scripted::spawn().await;
+    a.answers(unknown(&["NotLeader"]));
+    let gateway = gateway_with(test_config(vec![a.url(), node.url.clone()]), &a);
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(not_applied(&response), None);
+    assert_eq!(vouch(&response), Some("1"));
+    assert_eq!(gateway.metrics_snapshot().leader_searches, 1);
+    let request = request.await.expect("the upstream read a request");
+    let request = String::from_utf8(request).expect("an ASCII request");
+    assert!(request.ends_with("\r\n\r\nabc"), "{request}");
+}
+
+/// A search starts at the upstream after the one that redirected, in the
+/// configured order and around, so that the first search hop of every miss
+/// does not go to the same upstream.
+#[tokio::test]
+async fn a_search_starts_after_the_upstream_that_redirected() {
+    let (x, a, leader) = (
+        Scripted::spawn().await,
+        Scripted::spawn().await,
+        Scripted::spawn().await,
+    );
+    x.answers(raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])));
+    a.answers(raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])));
+    let gateway = gateway_with(test_config(vec![x.url(), a.url(), leader.url()]), &a);
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!((x.hits(), a.hits(), leader.hits()), (0, 1, 1));
+}
+
+/// A redirect that names an upstream the request reached already sends it
+/// to one it has not reached instead, so that two nodes with stale views do
+/// not use the hops up between them.
+#[tokio::test]
+async fn a_redirect_back_to_an_upstream_already_reached_searches_instead() {
+    let (a, b, leader) = (
+        Scripted::spawn().await,
+        Scripted::spawn().await,
+        Scripted::spawn().await,
+    );
+    a.answers(b.redirect_here(&["NotLeader"]));
+    b.answers(a.redirect_here(&["NotLeader"]));
+    let gateway = gateway_starting_at(&[&a, &b, &leader]);
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!((a.hits(), b.hits(), leader.hits()), (1, 1, 1));
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!((metrics.leader_redirects, metrics.leader_searches), (2, 1));
+}
+
+/// A `Location` names an upstream only at a boundary: the upstream's address
+/// followed by a path, a query or nothing, whether or not `--upstream` ends
+/// in a slash.
+#[test]
+fn a_location_names_an_upstream_only_at_a_boundary() {
+    let gateway = Gateway::new(test_config(vec![
+        "http://127.0.0.1:1234".to_owned(),
+        "http://node.test/".to_owned(),
+    ]));
+    let named = |location: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, HeaderValue::from_str(location).unwrap());
+        gateway.resolve_leader_upstream(&headers).map(str::to_owned)
+    };
+    assert_eq!(named("http://127.0.0.1:12345/bucket/stream"), None);
+    assert_eq!(named("http://127.0.0.1:1234.evil/bucket/stream"), None);
+    assert_eq!(
+        named("http://127.0.0.1:1234/bucket/stream").as_deref(),
+        Some("http://127.0.0.1:1234")
+    );
+    assert_eq!(
+        named("http://127.0.0.1:1234?x=1").as_deref(),
+        Some("http://127.0.0.1:1234")
+    );
+    assert_eq!(
+        named("http://127.0.0.1:1234").as_deref(),
+        Some("http://127.0.0.1:1234")
+    );
+    assert_eq!(
+        named("http://node.test/bucket/stream").as_deref(),
+        Some("http://node.test/")
+    );
+    assert_eq!(named("http://node.testing/bucket/stream"), None);
 }
 
 /// Accepts one connection, reads one whole request from it, the head and the
@@ -1530,6 +2161,35 @@ async fn a_first_hop_failure_after_the_request_was_sent_is_not_marked() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(not_applied(&response), None);
     assert_eq!(vouch(&response), Some("1"));
+    let request = request.await.expect("the upstream read a request");
+    let request = String::from_utf8(request).expect("an ASCII request");
+    assert!(request.starts_with("POST /bucket/stream "), "{request}");
+    assert!(request.ends_with("\r\n\r\nabc"), "{request}");
+}
+
+/// The same after redirects that were all marked: a hop whose upstream read
+/// the whole request and closed the connection without answering is a `502`
+/// without a marker. The request was sent, so that node may have proposed
+/// it, whatever the redirects before it said. No route is learned.
+#[tokio::test]
+async fn a_failure_after_the_request_was_sent_is_not_marked_after_marked_redirects() {
+    let (node, request) = hanging_up_upstream().await;
+    let (a, b) = (Scripted::spawn().await, Scripted::spawn().await);
+    a.answers(b.redirect_here(&["NotLeader"]));
+    b.answers(raft_redirect(
+        &format!("{}/bucket/stream", node.url),
+        marked(&["NotLeader"]),
+    ));
+    let gateway = Gateway::new(test_config(vec![a.url(), b.url(), node.url.clone()]));
+    gateway.remember_leader("/bucket/stream".to_owned(), a.url());
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(not_applied(&response), None);
+    assert_eq!(vouch(&response), Some("1"));
+    assert_eq!(gateway.metrics_snapshot().leader_redirects, 2);
+    assert_eq!(cached_route(&gateway), None);
     let request = request.await.expect("the upstream read a request");
     let request = String::from_utf8(request).expect("an ASCII request");
     assert!(request.starts_with("POST /bucket/stream "), "{request}");
@@ -1706,8 +2366,11 @@ async fn gateway_follows_leader_redirect_for_put_request() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// A redirect to a leader that is not an upstream, from the only upstream,
+/// leaves nowhere to look: the client gets a retryable `503`, never the
+/// redirect, so the leader's address does not leak.
 #[tokio::test]
-async fn gateway_returns_raft_redirect_when_leader_not_in_upstreams() {
+async fn gateway_answers_503_when_a_redirect_names_no_upstream_and_none_is_left() {
     let leader =
         spawn_upstream(Router::new().route("/bucket/stream", get(|| async { StatusCode::OK })))
             .await;
@@ -1742,13 +2405,15 @@ async fn gateway_returns_raft_redirect_when_leader_not_in_upstreams() {
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
         .forward(&follower.url, &parts, body_bytes, ResponseTail::default())
-        .await
-        .unwrap();
+        .await;
 
-    // Cannot resolve leader → return 307 to client with stripped host.
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(resp.headers().get(LOCATION).unwrap(), "/bucket/stream");
-    assert!(resp.headers().get(HEADER_URSULA_RAFT_LEADER_ID).is_none());
+    assert!(matches!(
+        resp,
+        Err(GatewayError::LeaderNotFound {
+            followed: 0,
+            applied_nothing: false
+        })
+    ));
 }
 
 #[tokio::test]

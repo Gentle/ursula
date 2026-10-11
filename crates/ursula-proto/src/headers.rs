@@ -13,10 +13,12 @@
 /// ingress admission, which refuses a write before it reaches a handler, a
 /// node that refused a create, append, close or delete before it proposed
 /// the write's one command, a leader redirect included, and the gateway, for
-/// the requests it refuses before forwarding them and for a request whose
-/// first upstream it could not connect to. The value is a short token naming
-/// the refusal, such as `RaftLogPressure`, for logs and diagnostics. The
-/// header's presence is the signal.
+/// the requests it refuses before forwarding them, for a request whose first
+/// upstream it could not connect to, and, after redirects that all carried
+/// the marker, for a hop it could not connect to or a request whose
+/// redirects it stopped following. The value is a short token naming the
+/// refusal, such as `RaftLogPressure`, for logs and diagnostics. The header's
+/// presence is the signal.
 ///
 /// The marker speaks for one exchange. A layer that answers one request with
 /// several upstream exchanges, as a gateway following a leader redirect does,

@@ -63,15 +63,14 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
 - **Redirects** are never followed, by any request. Followed, a request would go out without the
   token (the HTTP client drops it on every redirect), and a `301`, `302` or `303` would turn an
   append into a `GET`. A `307` keeps the method and the body, and says that the request belongs
-  elsewhere for now. The gateway passes a server's redirect to a moved leader on to the client when
-  it does not follow it itself: a second redirect after the one it follows, or one to an address
-  that is not among its upstreams. The VFS sends the request again to the same URL, with the same
-  sequence and no sooner than `Retry-After`, like a `503`. After a second redirect, the gateway still
-  holds the node the first one pointed at (it caches the target of a redirect it follows, and
-  passes the second on without changing that): it sends the next attempt there, and follows that
-  node's redirect to the leader. After a redirect it could not map, the next attempt goes wherever
-  the gateway sends it, a follower again possibly, until one reaches the leader or the budget runs
-  out. For an append a `307` is an unknown outcome: a leader that loses
+  elsewhere for now. From 0.7.3 Ursula's gateway follows a server's redirect to a moved leader
+  itself, through its other upstreams when the redirect names an address that is not among them,
+  and answers `503` with `Retry-After: 1` when it finds no leader within three redirects and 5 s.
+  So a `307` comes from a gateway before 0.7.3, which passes on a second redirect after the one it
+  follows and one to an address that is not among its upstreams, or from a node that the URL names
+  directly. The VFS sends the request again to the same URL, with the same sequence and no sooner
+  than `Retry-After`, like a `503`, until an answer settles it or the budget runs out. For an append
+  a `307` is an unknown outcome: a leader that loses
   its leadership answers so, and what it proposed may still be committed. Any other redirect fails
   the write as a definite rejection does (below), a `308` among them: neither the server nor the
   gateway sends one, while a proxy that redirects `http://` to `https://` does (ingress-nginx and
@@ -179,11 +178,12 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   is then taken for that attempt's own duplicate, as every retry's is, so the commit is acknowledged
   without its pages and the database diverges from the stream with no error. The VFS logs
   `refused_commit_unchecked`, with the commit and its receipt, when it acknowledges a commit that
-  way at the sequence a refused commit left free, so this case leaves a trace. Such attempts are
-  frequent behind a gateway whose upstreams name the servers otherwise than their peer URLs (the
-  Helm chart names them alike unless `gateway.upstreams` is set). It cannot follow their leader
-  redirects, so it passes each one on and keeps no route, and a commit's first attempt meets a `307`
-  whenever the gateway picks a follower.
+  way at the sequence a refused commit left free, so this case leaves a trace. Such attempts were
+  frequent behind a gateway before 0.7.3 whose upstreams name the servers otherwise than their peer
+  URLs (the Helm chart names them alike unless `gateway.upstreams` is set). It could not follow
+  their leader redirects, so it passed each one on, and a commit's first attempt met a `307`
+  whenever the gateway picked a follower. From 0.7.3 such a gateway looks for the leader among its
+  upstreams instead, and its `503` when it finds none is marked only when every redirect was.
 - The check also misses a false refusal when the owner attaches again between it and its next
   commit: a restart, or a process whose last commit was the refused one. The attach replays the
   refused commit into the database with no error, and no later commit meets its sequence, so
@@ -195,8 +195,8 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   epoch, and its next commit meets the epoch the refused claim took (`superseded`). Both poison, and
   `ursula_status` reports `fenced` with no second owner behind it.
 - An unexplained 204 can be the commit's own: a gateway follows a leader redirect that a server can
-  send after it proposed the write, and the new leader answers the gateway's second exchange as the
-  duplicate of the first. At a sequence no refused commit used, that is the only explanation, so the
+  send after it proposed the write, and the new leader answers a later exchange of the gateway as
+  the duplicate of the first. At a sequence no refused commit used, that is the only explanation, so the
   commit is acknowledged. At the sequence a refused commit left free, that case poisons too, which
   costs an attach but loses nothing.
 - A 403 without `Producer-Epoch` counts only when it carries both headers. A filtering proxy, such
@@ -205,9 +205,11 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   every such 403 did before 0.7.3.
 - Ursula meets the requirement whatever versions of the gateway and the server run together. The
   gateway answers 401, 403 and 429 before it forwards a request, and from 0.7.3 it marks every
-  refusal it makes before forwarding and vouches for every answer it returns. It follows a leader
-  redirect, which a server can send after it proposed the write, and from 0.7.3 it keeps the
-  leader's marker after one only if the redirect carried the marker too. A gateway before 0.7.3
+  refusal it makes before forwarding and vouches for every answer it returns. It follows leader
+  redirects, which a server can send after it proposed the write, and from 0.7.3 it keeps the final
+  answer's marker only if every redirect carried the marker too. On the same condition it marks
+  its `503` for a node it then could not connect to, which received nothing, and its `503` when it
+  finds no leader. A gateway before 0.7.3
   passes the leader's marker on, but it never vouches, and neither does the server, so the VFS
   ignores that marker. The server never answers 401 or 402. It answers 403 only as the fence, which
   applies nothing and carries `Producer-Epoch`, and 429 only to a new producer over the stream's
@@ -982,15 +984,15 @@ must say in its release notes to stop every owner of a stream before upgrading.
   12 MiB snapshot body that exercises the multipart path, with a 64 KiB snapshot minimum so the
   benchmark's Pi workload snapshots and trims at its database size.
 - Leader redirects on 3 nodes (`test/redirects.e2e.ts`), through a gateway that checks tokens and
-  reaches the nodes under other names than their peer URLs, so it passes every leader redirect on
-  to the client. A loop moves every group's leadership to the next node through the admin API,
-  again and again with a 250 ms pause, from before an owner's attach through its commits and
-  snapshot read-backs, a second host's attach from the snapshot, and the owner's attach of its own
-  files again. The test checks that every group's leadership, the stream's included, moved while
-  the owner committed and while it waited for its snapshots. The gateway sends each request to a node picked at random, so read-only hosts
-  install the snapshot again until a snapshot `GET` met a redirect. Nothing is poisoned, every
-  commit goes through, every host reads the same rows, and the client saw redirects on commits
-  (counted apart from claims) and on snapshot `GET`s.
+  reaches the nodes under other names than their peer URLs, so that no redirect names one of its
+  upstreams and it searches its upstreams for the leader. A loop moves every group's leadership to
+  the next node through the admin API, again and again with a 250 ms pause, from before an owner's
+  attach through its commits and snapshot read-backs, a second host's attach from the snapshot, a
+  read-only host's attach, and the owner's attach of its own files again. The test checks that
+  every group's leadership, the stream's included, moved while the owner committed and while it
+  waited for its snapshots. Nothing is poisoned, every commit goes through, every host reads the
+  same rows, the gateway's `leader_searches` is above 0, and a proxy in front of the gateway sees
+  no `307`. The VFS's retries of a `307` from other layers are covered by its unit tests.
 - Pi Durable versions: `package.json` declares the range of `@earendil-works/pi-durable` versions
   the package supports, and the e2e suites above run the version in the lockfile. The single-node
   job then installs the oldest version in the range without saving it, and runs the typecheck, Pi

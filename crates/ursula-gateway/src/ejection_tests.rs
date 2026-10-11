@@ -326,3 +326,26 @@ fn concurrent_callers_send_one_probe() {
         1
     );
 }
+
+/// A search for the leader goes only to an upstream that requests do not
+/// skip. One whose window has expired becomes the probe of the first request
+/// that claims it, and the next one skips it until that probe ends.
+#[test]
+fn a_claim_takes_the_probe_of_an_expired_window_once() {
+    let now = Instant::now();
+    let mut table = ejected_at("a", now);
+    assert!(table.claim("b", now, PROBE_DEADLINE));
+    assert!(!table.claim("a", now, PROBE_DEADLINE));
+    let later = after(now, secs(10));
+    assert!(table.claim("a", later, PROBE_DEADLINE));
+    assert_eq!(
+        table.0.get("a"),
+        Some(&Ejection::Probing {
+            failures: 1,
+            since: later,
+        })
+    );
+    assert!(!table.claim("a", later, PROBE_DEADLINE));
+    assert!(table.answered("a"));
+    assert!(table.claim("a", later, PROBE_DEADLINE));
+}

@@ -1,19 +1,27 @@
 //! Ursula Gateway core.
 //!
-//! Routes client HTTP requests to upstream Ursula nodes. Redirect responses stay
-//! visible to clients, but upstream node addresses are stripped from Location so
-//! redirect-following clients keep talking to the gateway.
+//! Routes client HTTP requests to upstream Ursula nodes.
 //!
 //! Raft leadership redirects (marked by `x-ursula-raft-leader-id`) are followed
-//! internally by the gateway after buffering the request body. This avoids
-//! leaking internal node addresses to clients and prevents SSE live reads from
-//! looping when the initial random upstream lands on a follower.
+//! internally by the gateway after buffering the request body, so a client
+//! never gets one: up to three in a row, within 5 s of the request's first
+//! hop. A redirect to an address that is not one of the upstreams sends the
+//! request to an upstream it has not reached yet instead. When no upstream
+//! answers without redirecting within those limits, the client gets a
+//! retryable `503`. This keeps internal node addresses from clients, and SSE
+//! live reads from looping when the first upstream is a follower. Other
+//! redirects stay visible to clients, with the upstream's address stripped
+//! from `Location` so that redirect-following clients keep talking to the
+//! gateway.
 //!
 //! Every request the gateway refuses before forwarding it (access control,
 //! tenant admission, an oversized body), and a request whose first upstream
 //! it could not connect to, is answered with `x-ursula-not-applied`: no node
-//! received it. A node's `x-ursula-not-applied` passes through, unless the
-//! gateway followed a leader redirect that did not carry it. Every response
+//! received it. After redirects that all carried the marker, so that no node
+//! proposed the request, so is its `503` for an upstream it then could not
+//! connect to, or when it stops following the redirects. A node's
+//! `x-ursula-not-applied` passes through, unless the gateway followed a leader
+//! redirect that did not carry it. Every response
 //! carries `x-ursula-not-applied-checked: 1`, the gateway's vouch that it
 //! applied that rule. A client trusts the marker only together with the vouch
 //! (see [`ursula_proto::headers`]).
@@ -96,6 +104,18 @@ const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
 const LONG_POLL_RESPONSE_HEADER_GRACE: Duration = Duration::from_secs(2);
 const GATEWAY_METRICS_PATH: &str = "/__ursula/gateway/metrics";
 const LEADER_AFFINITY_MAX_STREAMS: usize = 16_384;
+/// The most hops the gateway sends one request on after Raft leader
+/// redirects, search hops included (see [`Gateway::forward`]). With three
+/// voters, two reach every node.
+const MAX_LEADER_REDIRECTS: usize = 3;
+/// How long after a request's first redirect the gateway may still start a
+/// hop: it chases a moving leader for this long at most, then answers `503`
+/// ([`GatewayError::LeaderNotFound`]). It counts from the first redirect, not
+/// the first hop, so a slow first hop, such as a follower that stages a large
+/// body in object storage before its leadership check, does not use it up. A
+/// hop under way runs to its answer: a long-poll or a large upload that
+/// reached the leader is not cut short.
+const LEADER_REDIRECT_DEADLINE: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Default)]
@@ -107,6 +127,8 @@ struct GatewayMetrics {
     leader_cache_evictions: AtomicU64,
     leader_redirects: AtomicU64,
     leader_redirect_ns: AtomicU64,
+    leader_searches: AtomicU64,
+    leader_not_found: AtomicU64,
     upstream_ejections: AtomicU64,
 }
 
@@ -117,8 +139,15 @@ struct GatewayMetricsSnapshot {
     leader_cache_misses: u64,
     leader_cache_updates: u64,
     leader_cache_evictions: u64,
+    /// Raft leader redirects followed, each hop counted.
     leader_redirects: u64,
     leader_redirect_ns: u64,
+    /// Hops to an upstream the request had not reached, after a redirect
+    /// whose `Location` is not one of the upstreams.
+    leader_searches: u64,
+    /// Requests answered `503` because no upstream answered without
+    /// redirecting within the redirect limits.
+    leader_not_found: u64,
     leader_cache_entries: usize,
     /// Times an upstream was left out of selection after a transport failure.
     upstream_ejections: u64,
@@ -493,6 +522,28 @@ impl Gateway {
         Some(pick.upstream.to_owned())
     }
 
+    /// Forwards a request to `upstream` and follows the Raft leader redirects
+    /// of its answers (see [`Chain`]), so that a client never gets one.
+    ///
+    /// - A redirect sends the request to the upstream its `Location` names,
+    ///   unless the request reached that upstream already in this chain.
+    /// - Otherwise, and when the `Location` names no upstream (`--upstream`
+    ///   names the nodes otherwise than their peer URLs), the request goes to
+    ///   an upstream it has not reached yet, the next after the one that
+    ///   redirected in the configured order. Such a search hop that cannot
+    ///   connect sent nothing, so the search goes on to the next one.
+    /// - At most [`MAX_LEADER_REDIRECTS`] hops follow redirects, and none
+    ///   starts later than [`LEADER_REDIRECT_DEADLINE`] after the first
+    ///   redirect. When no upstream answers without redirecting within those
+    ///   limits, the client gets a retryable `503`
+    ///   ([`GatewayError::LeaderNotFound`]).
+    ///
+    /// Each hop sends the request again. Every stream write but a plain append
+    /// tolerates that, as the README's Redirects section explains. A plain
+    /// append, without a producer or `Stream-Seq`, can apply once for each
+    /// node that proposed it and then redirected: at-least-once delivery, as
+    /// on any retry of it, and as through a gateway before 0.7.3, which
+    /// followed one redirect.
     async fn forward(
         &self,
         upstream: &str,
@@ -505,83 +556,170 @@ impl Gateway {
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
-        let target_url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
         let pin_key = upstream_pin_key(&parts.uri, self.shard_map.as_ref());
+        let started = Instant::now();
+        let mut chain = Chain::new(upstream);
+        loop {
+            let target = chain.target.clone();
+            let target_url = format!("{}{}", target.trim_end_matches('/'), path_and_query);
+            let sent = self
+                .send_request(chain.hop(), &target, &target_url, parts, body.clone())
+                .await;
+            let response = match sent {
+                Ok(response) => response,
+                Err(error) => {
+                    self.upstream_failed(pin_key.as_deref(), &target, &error);
+                    // A search hop that could not connect sent nothing: look
+                    // on among the upstreams the request has not reached.
+                    if chain.searching
+                        && matches!(error, GatewayError::LeaderUnreachable { .. })
+                        && let Some(next) = chain
+                            .may_follow(Instant::now())
+                            .then(|| self.untried_upstream(&chain))
+                            .flatten()
+                    {
+                        self.followed(&target, &next, true);
+                        chain.follow(next, true);
+                        continue;
+                    }
+                    self.chain_ended(&chain, started);
+                    return Err(error);
+                }
+            };
+            self.upstream_answered(&target);
+            if !is_raft_redirect(&response) {
+                self.chain_ended(&chain, started);
+                return self.answer(response, tail, &chain, pin_key.as_deref());
+            }
 
-        let redirect_started_at = Instant::now();
-        let upstream_resp = self
-            .send_request(Hop::First, upstream, &target_url, parts, body.clone())
-            .await
-            .inspect_err(|error| self.upstream_failed(pin_key.as_deref(), upstream, error))?;
-        self.upstream_answered(upstream);
-
-        // Raft leadership redirect: follow internally for all methods because
-        // the body has been buffered and the client cannot do better than
-        // another random hop through the gateway.
-        if upstream_resp.status() == StatusCode::TEMPORARY_REDIRECT
-            && upstream_resp
-                .headers()
-                .contains_key(HEADER_URSULA_RAFT_LEADER_ID)
-        {
-            let response_headers = copy_forwarded_headers(upstream_resp.headers(), false);
-            if let Some(leader_upstream) = self.resolve_leader_upstream(&response_headers) {
+            // The node does not lead the request's group, so a route to it
+            // is stale.
+            if let Some(key) = &pin_key {
+                self.forget_leader_if_matches(key, &target);
+            }
+            chain.redirected(
+                response.headers().contains_key(NOT_APPLIED_HEADER),
+                Instant::now(),
+            );
+            let named = self
+                .resolve_leader_upstream(response.headers())
+                .map(str::to_owned);
+            // Drop the redirect; it has no meaningful body.
+            drop(response);
+            let next = chain
+                .may_follow(Instant::now())
+                .then(|| self.next_hop(&chain, named))
+                .flatten();
+            let Some((next, searching)) = next else {
                 self.metrics
-                    .leader_redirects
+                    .leader_not_found
                     .fetch_add(1, Ordering::Relaxed);
-                if let Some(key) = pin_key.clone() {
-                    self.remember_leader(key, leader_upstream.to_owned());
-                }
-                // A node can redirect after it proposed the write, so the
-                // leader's answer speaks for the whole request only when the
-                // redirect also applied nothing.
-                let redirect_applied_nothing = response_headers.contains_key(NOT_APPLIED_HEADER);
-                // Drop the follower response; it has no meaningful body.
-                drop(upstream_resp);
+                self.chain_ended(&chain, started);
+                return Err(GatewayError::LeaderNotFound {
+                    followed: chain.redirects,
+                    applied_nothing: chain.applied_nothing,
+                });
+            };
+            self.followed(&target, &next, searching);
+            chain.follow(next, searching);
+        }
+    }
 
-                let leader_target = format!(
-                    "{}{}",
-                    leader_upstream.trim_end_matches('/'),
-                    path_and_query
-                );
-                let leader_resp = self
-                    .send_request(
-                        Hop::RedirectedLeader,
-                        leader_upstream,
-                        &leader_target,
-                        parts,
-                        body,
-                    )
-                    .await
-                    .inspect_err(|error| {
-                        self.upstream_failed(pin_key.as_deref(), leader_upstream, error);
-                    })?;
-                self.upstream_answered(leader_upstream);
-                self.metrics.leader_redirect_ns.fetch_add(
-                    u64::try_from(redirect_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-                let mut response = Self::build_response(leader_resp, tail)?;
-                if !redirect_applied_nothing {
-                    response.headers_mut().remove(NOT_APPLIED_HEADER);
-                }
-                return Ok(response);
+    /// Where a request goes after a redirect from the hop under way, and
+    /// whether that is a search hop. `named` is the upstream the redirect's
+    /// `Location` names. It goes there unless the request reached it already,
+    /// else to an upstream it has not reached ([`Gateway::untried_upstream`]),
+    /// else back to `named`. `None` when there is nowhere to go.
+    fn next_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, bool)> {
+        match named {
+            Some(leader) if !chain.tried.contains(&leader) => Some((leader, false)),
+            named => self
+                .untried_upstream(chain)
+                .map(|upstream| (upstream, true))
+                .or_else(|| named.map(|leader| (leader, false))),
+        }
+    }
+
+    /// Counts a hop that follows a redirect, a search hop among them.
+    fn followed(&self, from: &str, to: &str, searching: bool) {
+        debug!(from, to, searching, "following a leader redirect");
+        self.metrics
+            .leader_redirects
+            .fetch_add(1, Ordering::Relaxed);
+        if searching {
+            self.metrics.leader_searches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The client's answer from the upstream that ended the chain, which did
+    /// not redirect. Its marker stays only when every redirect before it was
+    /// marked too ([`Chain::applied_nothing`]): a node can redirect after it
+    /// proposed the request. A redirect's own marker never moves onto it.
+    fn answer(
+        &self,
+        response: reqwest::Response,
+        tail: ResponseTail,
+        chain: &Chain,
+        pin_key: Option<&str>,
+    ) -> Result<Response<Body>, GatewayError> {
+        let status = response.status();
+        if let Some(key) = pin_key {
+            if status == StatusCode::SERVICE_UNAVAILABLE
+                && response.headers().contains_key(RETRY_AFTER)
+            {
+                // A cached leader can become a follower after an election.
+                // When that follower does not know the new leader yet, Ursula
+                // returns the explicit retryable 503 form instead of a 307. Do
+                // not replay the current request here: a generic write may not
+                // be idempotent. Evict only the matching cached route so the
+                // caller's next retry gets a fresh random/redirect lookup.
+                self.forget_leader_if_matches(key, &chain.target);
+            } else if chain.redirects > 0 && status.is_success() {
+                // A node a redirect led to served the request: it leads the
+                // group, as far as the gateway can tell. Any other answer,
+                // which a node can give before its leadership check, teaches
+                // nothing.
+                self.remember_leader(key.to_owned(), chain.target.clone());
             }
         }
-
-        // A cached leader can become a follower after an election. When that
-        // follower does not know the new leader yet, Ursula returns the
-        // explicit retryable 503 form instead of a 307. Do not replay the
-        // current request here: a generic write may not be idempotent. Evict
-        // only the matching cached route so the caller's next retry gets a
-        // fresh random/redirect lookup.
-        if upstream_resp.status() == StatusCode::SERVICE_UNAVAILABLE
-            && upstream_resp.headers().contains_key(RETRY_AFTER)
-            && let Some(key) = &pin_key
-        {
-            self.forget_leader_if_matches(key, upstream);
+        let mut response = Self::build_response(response, tail)?;
+        if !chain.applied_nothing {
+            response.headers_mut().remove(NOT_APPLIED_HEADER);
         }
+        Ok(response)
+    }
 
-        Self::build_response(upstream_resp, tail)
+    /// Counts the time a request spent on its hops, when it followed a
+    /// redirect.
+    fn chain_ended(&self, chain: &Chain, started: Instant) {
+        if chain.redirects > 0 {
+            self.metrics.leader_redirect_ns.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// The next upstream after the hop under way, in the configured order and
+    /// around, that the request has not reached yet and that selection does
+    /// not skip (see `ejection`). One whose ejection window has expired becomes
+    /// this request's probe. Where the gateway looks for the leader after a
+    /// redirect it cannot follow. Starting after the redirecting upstream
+    /// spreads the search over the upstreams.
+    fn untried_upstream(&self, chain: &Chain) -> Option<String> {
+        let upstreams = &self.config.upstreams;
+        let after = upstreams
+            .iter()
+            .position(|upstream| *upstream == chain.target)
+            .map_or(0, |at| at.saturating_add(1));
+        let now = Instant::now();
+        upstreams
+            .iter()
+            .cycle()
+            .skip(after)
+            .take(upstreams.len())
+            .find(|upstream| !chain.tried.contains(upstream) && self.ejections.claim(upstream, now))
+            .cloned()
     }
 
     /// Covers only response headers so SSE bodies stay open.
@@ -622,9 +760,11 @@ impl Gateway {
             // unprocessed (`REFUSED_STREAM`, or a graceful `GOAWAY`).
             match (source.is_connect(), hop) {
                 (true, Hop::First) => GatewayError::UpstreamUnreachable { upstream, source },
-                (true, Hop::RedirectedLeader) => {
-                    GatewayError::LeaderUnreachable { upstream, source }
-                }
+                (true, Hop::Followed { applied_nothing }) => GatewayError::LeaderUnreachable {
+                    upstream,
+                    source,
+                    applied_nothing,
+                },
                 (false, _) => GatewayError::Upstream { upstream, source },
             }
         })
@@ -695,8 +835,10 @@ impl Gateway {
         let mut headers = copy_forwarded_headers(upstream_resp.headers(), false);
 
         if status == StatusCode::TEMPORARY_REDIRECT {
-            // Keep redirects client-facing: strip internal host so the client
-            // reconnects through the gateway, not directly to the Ursula node.
+            // A redirect other than a Raft leader redirect, which the gateway
+            // follows itself, stays client-facing: strip the internal host so
+            // the client reconnects through the gateway, not directly to the
+            // Ursula node.
             headers.remove(HEADER_URSULA_RAFT_LEADER_ID);
             if let Some(location) = headers
                 .get(LOCATION)
@@ -746,12 +888,21 @@ impl Gateway {
             .map_err(|e| GatewayError::ResponseBuild(e.to_string()))
     }
 
+    /// The upstream a redirect's `Location` names: the one it starts with,
+    /// followed by a path, a query or nothing. `http://10.0.0.1:443` does not
+    /// name `http://10.0.0.1:4437/...`.
     fn resolve_leader_upstream(&self, response_headers: &HeaderMap) -> Option<&str> {
         let location = response_headers.get(LOCATION)?.to_str().ok()?;
         self.config
             .upstreams
             .iter()
-            .find(|u| location.starts_with(*u))
+            .find(|upstream| {
+                location
+                    .strip_prefix(upstream.trim_end_matches('/'))
+                    .is_some_and(|rest| {
+                        rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
+                    })
+            })
             .map(String::as_str)
     }
 
@@ -796,6 +947,8 @@ impl Gateway {
             leader_cache_evictions: self.metrics.leader_cache_evictions.load(Ordering::Relaxed),
             leader_redirects: self.metrics.leader_redirects.load(Ordering::Relaxed),
             leader_redirect_ns: self.metrics.leader_redirect_ns.load(Ordering::Relaxed),
+            leader_searches: self.metrics.leader_searches.load(Ordering::Relaxed),
+            leader_not_found: self.metrics.leader_not_found.load(Ordering::Relaxed),
             leader_cache_entries,
             upstream_ejections: self.metrics.upstream_ejections.load(Ordering::Relaxed),
             upstream_ejected: self.ejections.active(Instant::now()),
@@ -891,11 +1044,89 @@ enum Hop {
     /// The upstream picked for the request. No node received the request
     /// before it.
     First,
-    /// The leader that a node's Raft redirect named. Every failure of this
-    /// exchange stays unmarked, whether or not the redirect carried the
-    /// marker: the gateway does not combine a redirect's marker with a failed
-    /// second exchange.
-    RedirectedLeader,
+    /// An upstream after a Raft redirect: the leader the redirect named, or
+    /// an upstream the request has not reached yet. `applied_nothing`: every
+    /// earlier hop was answered with a redirect marked
+    /// `x-ursula-not-applied`, so no node proposed the request before this
+    /// hop. Otherwise one may have, before it redirected.
+    Followed { applied_nothing: bool },
+}
+
+/// The hops of one forwarded request ([`Gateway::forward`]).
+struct Chain {
+    /// The upstream of the hop under way.
+    target: String,
+    /// Every upstream the request went to, `target` included.
+    tried: Vec<String>,
+    /// Hops that followed a redirect so far, search hops included.
+    redirects: usize,
+    /// Whether the hop under way goes to an upstream that no redirect named.
+    searching: bool,
+    /// Whether every answer so far was a Raft redirect marked
+    /// `x-ursula-not-applied`, which a node raises only before it proposes
+    /// anything of the request. Then no node has applied anything of it, and
+    /// none can later. Only [`Chain::redirected`] changes it.
+    applied_nothing: bool,
+    /// When the first redirect arrived: [`LEADER_REDIRECT_DEADLINE`] counts
+    /// from it.
+    first_redirect: Option<Instant>,
+}
+
+impl Chain {
+    fn new(first: &str) -> Self {
+        Self {
+            target: first.to_owned(),
+            tried: vec![first.to_owned()],
+            redirects: 0,
+            searching: false,
+            applied_nothing: true,
+            first_redirect: None,
+        }
+    }
+
+    fn hop(&self) -> Hop {
+        if self.redirects == 0 {
+            Hop::First
+        } else {
+            Hop::Followed {
+                applied_nothing: self.applied_nothing,
+            }
+        }
+    }
+
+    /// Records a redirect, `marked` with `x-ursula-not-applied` or not, that
+    /// the hop under way got at `now`.
+    fn redirected(&mut self, marked: bool, now: Instant) {
+        self.applied_nothing &= marked;
+        self.first_redirect.get_or_insert(now);
+    }
+
+    /// Whether another hop may start at `now`: fewer than
+    /// [`MAX_LEADER_REDIRECTS`] followed, and less than
+    /// [`LEADER_REDIRECT_DEADLINE`] since the first redirect.
+    fn may_follow(&self, now: Instant) -> bool {
+        self.redirects < MAX_LEADER_REDIRECTS
+            && self
+                .first_redirect
+                .is_none_or(|first| now.saturating_duration_since(first) < LEADER_REDIRECT_DEADLINE)
+    }
+
+    /// Sends the next hop to `next`, a search hop when no redirect named it.
+    fn follow(&mut self, next: String, searching: bool) {
+        self.redirects = self.redirects.saturating_add(1);
+        self.searching = searching;
+        self.tried.push(next.clone());
+        self.target = next;
+    }
+}
+
+/// A Raft leader redirect: a `307` that names the leader, which the gateway
+/// follows itself (an upstream's other redirects reach the client).
+fn is_raft_redirect(response: &reqwest::Response) -> bool {
+    response.status() == StatusCode::TEMPORARY_REDIRECT
+        && response
+            .headers()
+            .contains_key(HEADER_URSULA_RAFT_LEADER_ID)
 }
 
 /// Per-request context available once access control has classified and
@@ -1015,10 +1246,10 @@ impl IntoResponse for Refusal {
     }
 }
 
-/// Marks `response` as answering a request that no node received, with
-/// `token` naming why. The only place the gateway sets [`NOT_APPLIED_HEADER`]
-/// itself. A node's marker reaches the client only through the redirect rule
-/// in [`Gateway::forward`].
+/// Marks `response` as answering a request that no node can have applied,
+/// because none proposed anything of it, with `token` naming why. The only
+/// place the gateway sets [`NOT_APPLIED_HEADER`] itself. A node's marker
+/// reaches the client only through the redirect rule in [`Gateway::answer`].
 fn mark_not_applied(response: &mut AxumResponse, token: &'static str) {
     response
         .headers_mut()
@@ -1318,14 +1549,26 @@ pub enum GatewayError {
         #[source]
         source: reqwest::Error,
     },
-    /// No connection to the leader that a node's Raft redirect named. The
-    /// request was never sent there, but the answer stays unmarked, like
-    /// every failure of the leader hop.
-    #[error("redirect leader {upstream} is unreachable")]
+    /// No connection to the upstream of a hop after a Raft redirect. The
+    /// request was never sent there. `applied_nothing`: every earlier hop was
+    /// answered with a marked redirect, so no node proposed it. Otherwise a
+    /// node that redirected may have.
+    #[error("upstream {upstream} is unreachable after a redirect")]
     LeaderUnreachable {
         upstream: String,
         #[source]
         source: reqwest::Error,
+        applied_nothing: bool,
+    },
+    /// Every upstream the request reached redirected it, and the gateway
+    /// stopped following: after [`MAX_LEADER_REDIRECTS`] hops, after
+    /// [`LEADER_REDIRECT_DEADLINE`], or with nowhere left to go. `followed`
+    /// counts the redirects it followed. `applied_nothing`: every redirect
+    /// was marked, so no node proposed the request.
+    #[error("no leader found after following {followed} redirects")]
+    LeaderNotFound {
+        followed: usize,
+        applied_nothing: bool,
     },
     /// No response headers in time. The request may have reached the
     /// upstream.
@@ -1353,18 +1596,21 @@ impl GatewayError {
         match self {
             Self::UpstreamUnreachable { .. } | Self::LeaderUnreachable { .. } => true,
             Self::Upstream { source, .. } => !source.is_builder(),
-            Self::UpstreamTimeout { .. } | Self::ResponseBuild(_) => false,
+            Self::UpstreamTimeout { .. } | Self::LeaderNotFound { .. } | Self::ResponseBuild(_) => {
+                false
+            }
         }
     }
 
     /// The client's answer. An unreachable upstream is answered `503` with
     /// `Retry-After`, as Ursula answers while a group has no reachable
     /// leader: the request was never sent there. The first upstream's answer
-    /// is marked, because no node received the request. An unreachable
-    /// leader's is not: the gateway leaves every failure of the leader hop
-    /// unmarked and does not combine a redirect's marker with a failed second
-    /// exchange. The other failures may follow a request the upstream
-    /// received. The bodies name no internal address.
+    /// is marked, because no node received the request. One after a redirect
+    /// is marked only when every redirect before it was marked: a node that
+    /// redirected may have proposed the request otherwise. A request whose
+    /// redirects the gateway stopped following is answered the same way, and
+    /// marked on the same condition. The other failures may follow a request
+    /// the upstream received. The bodies name no internal address.
     fn into_response(self) -> AxumResponse {
         match self {
             Self::UpstreamUnreachable { .. } => {
@@ -1372,7 +1618,29 @@ impl GatewayError {
                 mark_not_applied(&mut response, "UpstreamUnreachable");
                 response
             }
-            Self::LeaderUnreachable { .. } => unreachable_response(),
+            Self::LeaderUnreachable {
+                applied_nothing, ..
+            } => {
+                let mut response = unreachable_response();
+                if applied_nothing {
+                    mark_not_applied(&mut response, "UpstreamUnreachable");
+                }
+                response
+            }
+            Self::LeaderNotFound {
+                applied_nothing, ..
+            } => {
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(RETRY_AFTER, HeaderValue::from_static("1"))],
+                    "no leader found; retry",
+                )
+                    .into_response();
+                if applied_nothing {
+                    mark_not_applied(&mut response, "LeaderNotFound");
+                }
+                response
+            }
             Self::UpstreamTimeout { .. } => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream sent no response in time",

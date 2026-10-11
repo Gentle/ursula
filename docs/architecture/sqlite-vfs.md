@@ -75,10 +75,11 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   local WAL, and the database is poisoned until it is re-attached.
 - **Refused before it reached the stream.** An attempt answered 401, 402 (a layer such as an
   authorizer or a quota or billing service refuses writes until something is paid or settled) or
-  429, or any answer that carries both the marker `x-ursula-not-applied: <reason>` and the vouch
-  `x-ursula-not-applied-checked`, applied nothing. One function, `client::applied_nothing`, decides
-  this for every answer, and any other answer proves nothing, a 403, 413 or 503 with only one of
-  the two headers among them. The marker says that the request was refused before it reached the
+  429, or any refusal (a 4xx or 5xx) that carries both the marker `x-ursula-not-applied: <reason>`
+  and the vouch `x-ursula-not-applied-checked`, applied nothing. One function,
+  `client::applied_nothing`, decides this for every answer, and any other answer proves nothing: a
+  403, 413 or 503 with only one of the two headers, and a redirect or a success whatever headers it
+  carries. The marker says that the request was refused before it reached the
   stream, and its value names why. The server's ingress admission sets it on the writes it refuses
   (`503` with `RaftLogPressure`, `WalDiskPressure` or `IngressBodyBytesLimitReached`, and
   `Retry-After`, and `413` with `RequestBodyTooLarge`). A gateway sets it on refusals it makes

@@ -154,9 +154,9 @@ fn refused(r: &ureq::http::Response<ureq::Body>) -> Option<Refused> {
 }
 
 /// The response header with which a layer (the server's ingress admission, a gateway, a proxy in
-/// front of either) marks its answer to a request it refused before passing it on: the stream
-/// applied nothing of it, whatever the status. The value is a short token naming why
-/// (`RaftLogPressure`, say). Older layers never send it. It counts only with a gateway's vouch
+/// front of either) marks its refusal (a 4xx or 5xx) of a request it refused before passing it on:
+/// the stream applied nothing of it. The value is a short token naming why (`RaftLogPressure`,
+/// say). Older layers never send it. It counts only on a refusal status and with a gateway's vouch
 /// (`NOT_APPLIED_CHECKED`): see `applied_nothing`.
 const NOT_APPLIED: &str = "x-ursula-not-applied";
 
@@ -172,11 +172,13 @@ const NOT_APPLIED_CHECKED: &str = "x-ursula-not-applied-checked";
 
 /// How an answer proves that the stream applied nothing of the request it answers (see
 /// `applied_nothing`).
-enum Proof {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Proof {
     /// Its status: 401, 402 or 429.
     Status,
-    /// `x-ursula-not-applied` with a gateway's vouch: the marker's token, cut to `BODY_SHOWN` bytes
-    /// like a body. A marker with an empty value still marks.
+    /// A refusal status (4xx or 5xx) with `x-ursula-not-applied` and a gateway's vouch: the
+    /// marker's token, cut to `BODY_SHOWN` bytes like a body. A marker with an empty value still
+    /// marks.
     Marked(String),
 }
 
@@ -184,7 +186,7 @@ impl Proof {
     /// The refusal that an answer with `status` and `body`, proven this way, stands for: a 401, 402
     /// or 403 keeps its own kind, a vouched marker names any other (`NotApplied`), and a 429
     /// without one is rate limiting.
-    fn refusal(self, status: u16, body: String) -> WriteRefusal {
+    pub(crate) fn refusal(self, status: u16, body: String) -> WriteRefusal {
         match (status, self) {
             (401, _) => WriteRefusal::Unauthorized { body },
             (402, _) => WriteRefusal::PaymentRequired { body },
@@ -198,23 +200,26 @@ impl Proof {
 /// Whether an answer proves that the stream applied nothing of the request it answers, and how: the
 /// one place that decides it (design doc §2). It does when its status is 401 or 402 (a layer in
 /// front of the stream refused the request before passing it on) or 429 (the same, or the server's
-/// limit on a stream's producers, which never answers an attempt sent after an earlier one was
-/// applied: that one is acknowledged as a duplicate), or when it carries both `x-ursula-not-applied`
-/// and the vouch `x-ursula-not-applied-checked`. Any other answer proves nothing, whatever its
-/// status, a 403, 413 or 503 with only one of the two headers among them: `None`.
-fn applied_nothing(r: &ureq::http::Response<ureq::Body>) -> Option<Proof> {
+/// limit on a stream's producers, which refuses only the first append of a producer the stream does
+/// not hold: an attempt sent after an earlier one was applied is answered as its duplicate), or
+/// when a refusal status (4xx or 5xx) carries both `x-ursula-not-applied` and the vouch
+/// `x-ursula-not-applied-checked`. Any other answer proves nothing: a 403, 413 or 503 with only one
+/// of the two headers, and a redirect or a success whatever headers it carries (`None`). It reads
+/// the status and the headers only, never the body.
+pub(crate) fn applied_nothing<B>(r: &ureq::http::Response<B>) -> Option<Proof> {
+    let status = r.status();
     let headers = r.headers();
-    if let Some(marker) = headers
-        .get(NOT_APPLIED)
-        .filter(|_| headers.contains_key(NOT_APPLIED_CHECKED))
-    {
+    if let Some(marker) = headers.get(NOT_APPLIED).filter(|_| {
+        headers.contains_key(NOT_APPLIED_CHECKED)
+            && (status.is_client_error() || status.is_server_error())
+    }) {
         let value = marker.as_bytes();
         let shown = value.get(..BODY_SHOWN).unwrap_or(value);
         return Some(Proof::Marked(
             String::from_utf8_lossy(shown).trim().to_owned(),
         ));
     }
-    matches!(r.status().as_u16(), 401 | 402 | 429).then_some(Proof::Status)
+    matches!(status.as_u16(), 401 | 402 | 429).then_some(Proof::Status)
 }
 
 /// The error of request `op` to `url` that a layer in front of the stream refused (a refused
@@ -918,7 +923,9 @@ mod tests {
     use std::net::TcpListener;
 
     use super::Append;
+    use super::Proof;
     use super::append;
+    use super::applied_nothing;
     use super::create_stream;
     use super::get_snapshot;
     use super::head;
@@ -1072,6 +1079,50 @@ mod tests {
         }
     }
 
+    // `applied_nothing` alone decides whether an answer proves that the stream applied nothing: a
+    // 401, 402 or 429 by its status, and a refusal (a 4xx or 5xx) by the marker with a gateway's
+    // vouch, which then names it. A redirect or a success proves nothing whatever headers it
+    // carries, and neither does the marker or the vouch alone.
+    #[test]
+    fn only_a_refusal_proves_that_nothing_was_applied() {
+        let response = |status: u16, headers: &[(&str, &str)]| {
+            let mut r = ureq::http::Response::builder().status(status);
+            for &(name, value) in headers {
+                r = r.header(name, value);
+            }
+            r.body(()).unwrap()
+        };
+        let marker = ("x-ursula-not-applied", "RaftLogPressure");
+        let vouch = ("x-ursula-not-applied-checked", "1");
+        let marked = Some(Proof::Marked("RaftLogPressure".to_owned()));
+        for status in [503, 413, 403, 404, 502, 504, 401, 402, 429] {
+            let proof = applied_nothing(&response(status, &[marker, vouch]));
+            assert_eq!(proof, marked, "{status}");
+        }
+        for status in [307, 308, 301, 303, 200, 201, 204] {
+            let proof = applied_nothing(&response(status, &[marker, vouch]));
+            assert_eq!(proof, None, "{status}");
+        }
+        for status in [401, 402, 429] {
+            for headers in [&[][..], &[marker], &[vouch]] {
+                let proof = applied_nothing(&response(status, headers));
+                assert_eq!(proof, Some(Proof::Status), "{status} {headers:?}");
+            }
+        }
+        for status in [503, 413, 403, 404, 400, 500] {
+            for headers in [&[][..], &[marker], &[vouch]] {
+                let proof = applied_nothing(&response(status, headers));
+                assert_eq!(proof, None, "{status} {headers:?}");
+            }
+        }
+        // An empty marker still marks, and a long one is cut like a body.
+        let empty = applied_nothing(&response(503, &[("x-ursula-not-applied", ""), vouch]));
+        assert_eq!(empty, Some(Proof::Marked(String::new())));
+        let long = "x".repeat(300);
+        let cut = applied_nothing(&response(503, &[("x-ursula-not-applied", &long), vouch]));
+        assert_eq!(cut, Some(Proof::Marked("x".repeat(256))));
+    }
+
     // A token crosses the network in clear only over plain HTTP to a host other than this one.
     #[test]
     fn tokens_go_in_clear_over_http_to_other_hosts() {
@@ -1195,11 +1246,11 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 2);
     }
 
-    // Answers that applied nothing (401, 429, or marked `x-ursula-not-applied` with a gateway's
-    // vouch, whatever the status) leave the outcome known: when the budget runs out on them, the
-    // append is refused, with the last answer's reason (the marker's token when there is one, cut
-    // like a body; an empty marker still marks), and the producer sequence is free. A marked final
-    // answer refuses it at once.
+    // Answers that applied nothing (401, 429, or a refusal marked `x-ursula-not-applied` with a
+    // gateway's vouch) leave the outcome known: when the budget runs out on them, the append is
+    // refused, with the last answer's reason (the marker's token when there is one, cut like a
+    // body; an empty marker still marks), and the producer sequence is free. A marked final answer
+    // refuses it at once.
     #[test]
     fn refusals_that_applied_nothing_refuse_the_append_when_the_budget_runs_out() {
         let marked = |status: &str, token: &str, last: &str| {

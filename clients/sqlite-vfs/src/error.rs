@@ -124,7 +124,8 @@ pub(crate) enum Error {
         status: u16,
         body: String,
     },
-    /// A redirect the extension does not retry (any 3xx but 307 and 308: `client::redirected`).
+    /// A redirect the extension does not retry (any 3xx but 307, a 308 included:
+    /// `client::redirected`).
     /// It never follows one: `location` is where it pointed.
     #[error(
         "{op} {url}: {status} redirect{}: the extension never follows redirects (point the stream \

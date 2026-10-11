@@ -52,13 +52,16 @@
 //!   sends (see `client::applied_nothing`): without a gateway, only a 401, 402 or 429 counts.
 //!   Nothing of it reached the stream, so the database is not poisoned, reads go on from the local
 //!   files, and the next commit is sent as usual (the epoch and the claim stay valid). Unless an
-//!   attempt of the append may have reached the stream (no answer, or a 5xx without a vouched
-//!   marker): its outcome is then unknown, and the commit poisons as on an exhausted budget (see
-//!   `client::append`). So does a 403 without `Producer-Epoch` or a vouched marker, which a
-//!   filtering proxy may send in place of the stream's own answer. A refused commit that was
-//!   applied after all (a layer in front of the stream broke the rule of design doc §2) is caught
-//!   at the next commit, which goes out with its sequence and is answered as its duplicate: that
-//!   commit poisons (`Db::append_commit`). The overlay belongs to the write transaction: it is
+//!   attempt of the append may have reached the stream (no answer, a 307, or a 5xx without a
+//!   vouched marker): its outcome is then unknown, and the commit poisons as on an exhausted
+//!   budget (see `client::append`). So does a 403 without `Producer-Epoch` or a vouched marker,
+//!   which a filtering proxy may send in place of the stream's own answer. A refused commit that
+//!   was applied after all (a layer in front of the stream broke the rule of design doc §2) is
+//!   usually caught at the next commit, which goes out with its sequence and is answered as its
+//!   duplicate: that commit poisons (`Db::append_commit`). Unless an attempt of that commit got no
+//!   answer, or an answer that proves nothing, first: it is then acknowledged, with a warning
+//!   (`refused_commit_unchecked`). Design doc §2 lists what else the check misses, such as an
+//!   attach before the next commit. The overlay belongs to the write transaction: it is
 //!   cleared whenever the WAL write lock is taken or released, so a rolled-back transaction's
 //!   spilled frames never shadow a later one's.
 //! * Durability is the stream's acknowledgement alone: the local files (db, -wal, -shm, sidecar)

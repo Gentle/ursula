@@ -315,7 +315,7 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 
 ### A commit or attach is refused with error code 7178
 
-`SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`, `UrsulaWriteRefusedError` from `attach` and `openUrsulaPiStorage`) means that a write was refused before it reached the stream, so nothing of it was applied. A refused commit was rolled back, but the file is not poisoned. Reads go on, and the next commit succeeds once the refusals stop, with no new attach. A refused attach claimed nothing. Attach again later, or attach read-only to read the database meanwhile. For a refused commit, `status(file)` (`ursula_status`) reports `writes_refused: true` and names the refusal:
+`SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`, `UrsulaWriteRefusedError` from `attach` and `openUrsulaPiStorage`) means that a write was refused before it reached the stream, so nothing of it was applied. A refused commit was rolled back, but the file is not poisoned. Reads go on, and the next commit succeeds once the refusals stop, with no new attach. A refused attach claimed nothing. Attach again later, or attach read-only to read the database meanwhile. An attach whose claim a `402` refuses fails with `SQLITE_AUTH` (`errcode` 23) instead, and `attach` throws `UrsulaPaymentRequiredError`. For a refused commit, `status(file)` (`ursula_status`) reports `writes_refused: true` and names the refusal:
 
 | `refused_kind` | Refusal | What to do |
 | -------------- | ------- | ---------- |
@@ -333,11 +333,12 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 | `WalDiskPressure` | The server's WAL filesystem is below `raft.wal.min_available_size`. Free space or expand the volume |
 | `IngressBodyBytesLimitReached` | The server holds as many request bytes in flight as it admits |
 | `RequestBodyTooLarge` | The commit is over the server's or the gateway's request limit. Commit smaller transactions |
+| `RequestBodyUnreadable` | The gateway could not read the request body, so it sent nothing on |
 | `NotFound` | The gateway's access policy does not serve the stream to these credentials: no token, or one the policy does not allow. The cause is the credentials or the policy, not load |
 | `AuthenticationUnavailable`, `AuthorizationUnavailable` | The gateway could not verify the token or reach a decision, for example while its token issuer is down |
 | `NoUpstream`, `UpstreamUnreachable` | The gateway could not reach a server, so it sent nothing on |
 
-[Refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing) lists every value. A commit fails with 7178 only when every attempt of it was refused this way. One attempt that got no answer, or a `5xx` without both headers, poisons the file instead, because that attempt may have been applied.
+[Refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing) lists every value. A commit fails with 7178 only when every attempt of it was refused this way. One attempt that got no answer, a `307`, or a `5xx` without both headers, poisons the file instead, because that attempt may have been applied.
 
 ### The file is poisoned at the commit after a refused one
 

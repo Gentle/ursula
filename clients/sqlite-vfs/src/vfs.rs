@@ -262,8 +262,8 @@ impl Db {
     /// returned. Otherwise the database is poisoned, or the commit refused alone when nothing of it
     /// reached the stream (`refuse`), and the code the write fails with is returned. A duplicate's
     /// answer that none of the commit's attempts explains, at the sequence a refused commit left
-    /// free (`refused_at`), poisons: the stream holds the refused commit, applied after all, or this
-    /// one, sent again by a layer in front of the stream, and the local files hold neither.
+    /// free (`refused_at`), poisons: the stream holds the refused commit, applied after all, or
+    /// this one, sent again by a layer in front of the stream, and the local files hold neither.
     fn append_commit(&mut self, body: &[u8]) -> Result<u32, c_int> {
         let mut outcome = append(
             &self.url,
@@ -310,10 +310,10 @@ impl Db {
                     receipt,
                 }));
             }
-            // A duplicate's answer after an attempt of this commit whose outcome is unknown is taken
-            // for that attempt's (`client::append`). At the sequence a refused commit left free it
-            // may be the refused commit's instead, which nothing here tells apart (design doc §2):
-            // acknowledged, with a warning that leaves a trace of the unchecked refusal.
+            // A duplicate's answer after an attempt of this commit whose outcome is unknown is
+            // taken for that attempt's (`client::append`). At the sequence a refused commit left
+            // free it may be the refused commit's instead, which nothing here tells apart (design
+            // doc §2): acknowledged, with a warning that leaves a trace of the unchecked refusal.
             Append::Acked {
                 next: Some(n),
                 attempts,
@@ -1333,9 +1333,10 @@ mod tests {
     // with no error: it poisons instead, also when the refused commit was the first after the
     // claim. A fresh append's 200 after the refusal is acknowledged, and so is a duplicate's answer
     // at a sequence no refused commit used (this commit, applied by an exchange that a gateway made
-    // and answered for itself): one refused at an older epoch, or a refused snapshot publish, leaves
-    // no sequence. After an attempt whose outcome is unknown a duplicate's answer is taken for that
-    // attempt's, which hides a refused commit applied after all (the gap design doc §2 names).
+    // and answered for itself): one refused at an older epoch, or a refused snapshot publish,
+    // leaves no sequence. After an attempt whose outcome is unknown a duplicate's answer is taken
+    // for that attempt's, which hides a refused commit applied after all (the gap design doc §2
+    // names).
     #[test]
     fn the_commit_after_a_refused_one_that_was_applied_poisons() {
         let duplicate = || answer("204 No Content\r\nstream-next-offset: 00000000000000000012");

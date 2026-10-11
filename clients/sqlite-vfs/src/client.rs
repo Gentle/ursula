@@ -1383,9 +1383,9 @@ mod tests {
 
     // A 402 is a layer in front of the stream refusing the request: it fails that request alone,
     // with the layer's explanation, and is never retried, except by an append one of whose earlier
-    // attempts may have reached the stream (no answer, or a 5xx): its outcome is still unknown, so
-    // it is sent again until an answer settles it. Refusals in front of the stream (401, 402) and
-    // rate limiting (429) leave the outcome known.
+    // attempts may have reached the stream (no answer, a 5xx or a 307): its outcome is still
+    // unknown, so it is sent again until an answer settles it. Refusals in front of the stream
+    // (401, 402) and rate limiting (429) leave the outcome known.
     #[test]
     fn payment_refusals_fail_the_request_alone() {
         let reason = "{\"detail\":\"quota exhausted\"}";
@@ -1719,9 +1719,10 @@ mod tests {
     // of it can have reached the stream is a duplicate that no attempt of it explains: a commit
     // refused before it at the same sequence may have been applied after all (`Db::append_commit`
     // decides). A refused attempt of the same append does not explain it either. A 200 is an
-    // acknowledgement, a 204 after an attempt that may have reached the stream (no answer, or a 307,
-    // marked and vouched for or not: a redirect proves nothing) is that attempt's duplicate, and a
-    // claim's 204 is verified separately. A 307 to the end of the budget leaves the outcome unknown.
+    // acknowledgement, a 204 after an attempt that may have reached the stream (no answer, or a
+    // 307, marked and vouched for or not: a redirect proves nothing) is that attempt's duplicate,
+    // and a claim's 204 is verified separately. A 307 to the end of the budget leaves the outcome
+    // unknown.
     #[test]
     fn a_duplicate_that_no_attempt_explains_is_told_apart() {
         let pressure = |last: &str| {

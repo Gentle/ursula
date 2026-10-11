@@ -131,22 +131,22 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   runs out on refusals fails it as unknown. Each poisons.
 - The VFS takes these answers to mean that the attempt applied nothing. That is a requirement on
   every layer in front of the stream, which the VFS cannot check: such a layer answers 401, 402 or
-  429, or sends a vouched marker, only on requests the stream did not apply. It refuses them
-  before it passes them on, or relays such an answer from the layer behind it. A layer that passes
-  an append on and then answers so (a 402 from metering after the response, say) breaks it. So
-  does a layer that sends one request upstream more than once, because it retries or follows a
-  redirect, and relays such an answer to a later exchange, since an earlier exchange may have
-  applied the request. Such a layer may relay it only if every exchange was refused that way, so
-  turn off retries and redirect following for writes in any proxy or service mesh in front of
-  Ursula. A service mesh retries unless told not to: Istio's default retry policy for a
-  VirtualService route retries a 503 twice, POSTs included, and Envoy does the same when a retry
-  policy is configured. A retry in front of the gateway can hide an applied first exchange behind
-  the refusal of the retry, such as the gateway's vouched 503 while the servers are under
-  pressure, and a retry between the gateway and the servers hides it from the gateway too. Set
-  `retries: attempts: 0` on the Istio routes that carry stream writes (or leave Envoy's retry
-  policy off for them). When the rule breaks, the stream holds the refused transaction, which the
-  local file lacks, and the next commit goes out with the producer sequence the refused one used.
-  The check in the next item catches most of what slips through.
+  429, or sends a vouched marker, only on requests the stream did not apply. It refuses them before
+  it passes them on, or relays such an answer from the layer behind it. A layer that passes an
+  append on and then answers so (a 402 from metering after the response, say) breaks it. So does a
+  layer that sends one request upstream more than once, because it retries or follows a redirect,
+  and relays such an answer to a later exchange, since an earlier exchange may have applied the
+  request. Such a layer may relay it only if every exchange was refused that way, so turn off
+  retries and redirect following for writes in any proxy or service mesh in front of Ursula. Some
+  service meshes retry unless told not to: Istio's default retry policy for a VirtualService route
+  retries a 503 twice, POSTs included, and Envoy does the same when a retry policy is configured. A
+  retry in front of the gateway can hide an applied first exchange behind the refusal of the retry,
+  such as the gateway's vouched 503 while the servers are under pressure, and a retry between the
+  gateway and the servers hides it from the gateway too. Set `retries: attempts: 0` on the Istio
+  routes that carry stream writes (or leave Envoy's retry policy off for them). When the rule
+  breaks, the stream holds the refused transaction, which the local file lacks, and the next commit
+  goes out with the producer sequence the refused one used. The check in the next item catches much
+  of what slips through, not all of it (the items after it name what it misses).
 - **A false refusal is caught at the next commit.** The server answers a fresh producer append 200
   and a duplicate 204 with the receipt of the append it duplicates. The next commit after a refused
   one goes out with the same epoch and sequence, so when the refused commit was applied after all,
@@ -155,14 +155,32 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   at the sequence a refused commit left free the VFS takes it for that commit. It poisons the
   database (`reason`: a commit refused as never applied may have been applied after all) instead of
   acknowledging a commit whose pages may never reach the stream. The answer does not tell which of
-  the two commits the stream holds (the second gap below), so the reason names both, and the attach
-  that follows replays whichever it is. When it is the refused transaction, the database then holds
-  it although its commit failed with `SQLITE_IOERR_AUTH`. With this check a false refusal poisons at
-  the next commit instead of diverging, so the vouch makes false refusals rarer but is no longer the
-  only barrier against divergence. Two gaps remain. A 204 after an attempt of the next commit that
-  got no answer, or an answer that proves nothing, is taken for that attempt's own duplicate, as
-  every retry's is, so a false refusal followed by such an attempt still diverges with no error. And
-  an unexplained 204 can be the commit's own: a gateway follows a leader redirect that a server can
+  the two commits the stream holds (see the item on a commit's own 204 below), so the reason names
+  both, and the attach that follows replays whichever it is. When it is the refused transaction, the
+  database then holds it although its commit failed with `SQLITE_IOERR_AUTH`. With this check a
+  false refusal usually poisons at the next commit instead of diverging, so the vouch makes false
+  refusals rarer but is no longer the only barrier against divergence.
+- The check misses a false refusal when an attempt of the next commit got no answer, or an answer
+  that proves nothing (a timeout, a `307`, a 5xx without a vouched marker), before the 204. The 204
+  is then taken for that attempt's own duplicate, as every retry's is, so the commit is acknowledged
+  without its pages and the database diverges from the stream with no error. The VFS logs
+  `refused_commit_unchecked`, with the commit and its receipt, when it acknowledges a commit that
+  way at the sequence a refused commit left free, so this case leaves a trace. Such attempts are
+  frequent behind a gateway whose upstreams name the servers otherwise than their peer URLs (the
+  Helm chart names them alike unless `gateway.upstreams` is set). It cannot follow their leader
+  redirects, so it passes each one on and keeps no route, and a commit's first attempt meets a `307`
+  whenever the gateway picks a follower.
+- The check also misses a false refusal when the owner attaches again between it and its next
+  commit: a restart, or a process whose last commit was the refused one. The attach replays the
+  refused commit into the database with no error, and no later commit meets its sequence, so
+  nothing ever says that the refusal was false. An application that runs the refused transaction
+  again after the restart applies it twice.
+- A false refusal shows as a fence when the producer expired before the next commit (7 idle days):
+  the re-claim finds the refused commit past the owner's offset (`producer expired and the stream
+  moved past ...`). It does too when the refused request was a re-claim's claim: the owner keeps its
+  epoch, and its next commit meets the epoch the refused claim took (`superseded`). Both poison, and
+  `ursula_status` reports `fenced` with no second owner behind it.
+- An unexplained 204 can be the commit's own: a gateway follows a leader redirect that a server can
   send after it proposed the write, and the new leader answers the gateway's second exchange as the
   duplicate of the first. At a sequence no refused commit used, that is the only explanation, so the
   commit is acknowledged. At the sequence a refused commit left free, that case poisons too, which
@@ -462,11 +480,11 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
   most of that window; §6 lists what remains. Local files rolled back while no process had them attached (a restored disk
   image) are caught by attach (§6).
 - Nothing the stream did not acknowledge becomes visible: no frame of a transaction reaches the
-  local WAL before its append is acknowledged, and a fenced, refused or failed commit leaves no trace
-  locally or remotely (the server deduplicates retries, and a refused commit relies on §2's
+  local WAL before its append is acknowledged, and a fenced, refused or failed commit leaves no
+  trace locally or remotely (the server deduplicates retries, and a refused commit relies on §2's
   requirement on layers in front of the stream: when a layer breaks it, the next commit poisons,
-  except in the gaps §2 names). An append the server applied but whose answer the
-  client never saw is in the stream, and appears after the next attach.
+  except in the cases §2 names). An append the server applied but whose answer the client never saw
+  is in the stream, and appears after the next attach.
 - Fencing: after a claim at epoch `e` is verified, appends below `e` fail. Snapshots carry the
   highest epoch, so this survives retention trimming the claims.
 - A snapshot reflects exactly the stream at its offset; retention advances only past a snapshot
@@ -637,17 +655,17 @@ What attach does in each case:
   meanwhile cannot attach as the owner, because its claim is refused. It attaches read-only to read
   (§3).
 - A proxy or service mesh in front of Ursula that retries writes, or follows redirects for them, can
-  relay a refusal to a retry after an earlier exchange applied the write (§2). A mesh retries by
+  relay a refusal to a retry after an earlier exchange applied the write (§2). Some meshes retry by
   default: Istio retries a 503 twice, POSTs included, unless a route sets `retries: attempts: 0`.
   The next commit is then answered as the refused commit's duplicate, and it poisons with a reason
   that names both commits the stream may hold (§2): attach again, and the database holds the refused
-  transaction. If an attempt of that next commit got no answer, or an answer that proves nothing,
-  before the duplicate's answer, the next commit is acknowledged instead and its pages never reach
-  the stream. Turn such retries off for writes, on the routes to the gateway and on those from the
-  gateway to the servers.
-- A layer between the gateway and the servers that answers 401, 402 or 429 is trusted by status
-  even after the gateway followed a redirect that carried no marker, since only the marker passes
-  the gateway's redirect rule. Ursula's components never answer so there, and such a third-party
+  transaction. If an attempt of that next commit got no answer, or an answer that proves nothing (a
+  `307` among them), before the duplicate's answer, the next commit is acknowledged instead, its
+  pages never reach the stream, and the VFS logs `refused_commit_unchecked`. Turn such retries off
+  for writes, on the routes to the gateway and on those from the gateway to the servers.
+- A layer between the gateway and the servers that answers 401, 402 or 429 is trusted by status even
+  after the gateway followed a redirect that carried no marker, since the gateway's redirect rule
+  applies only to the marker. Ursula's components never answer so there, and such a third-party
   layer is unsupported (§2). The check of the next commit is the safety net.
 - A gateway older than 0.7.3 in front of a server of 0.7.3 or later passes on the marker of an
   answer it got by following a leader redirect, which can follow a proposal. It never vouches for
@@ -780,29 +798,36 @@ must say in its release notes to stop every owner of a stream before upgrading.
   only as the first frame after the owner's offset). A 402 fails a request alone with the layer's
   explanation, and ends an append only while no attempt of it can have reached the stream: after a
   401 or a 429 it does, after no answer, a 5xx or a 307 it is retried until an answer settles the
-  outcome, and an outcome still unknown when the budget runs out fails as unknown. Answers that
-  applied nothing (401, 429, any answer marked `x-ursula-not-applied` with its vouch, an empty
-  marker included) refuse an append when the budget runs out on them, with the last one's kind and
-  reason (a long marker cut to 256 bytes). A vouched 4xx, an authorizer's 403 among them, refuses it
-  at once, and an unmarked 403 fails it. One attempt whose outcome is unknown among them, before or
-  after, keeps the append unknown. The marker without the vouch, or the vouch without the marker,
-  proves nothing: a 503 so answered is an unknown outcome, a 403 or a 413 a failure, a claim fails,
-  and a 401, 402 or 429 still refuses by its status. Against a stand-in server, a commit refused
-  this way (`Db::append_commit`: pressure, a refused token, a 402, a 429, a vouched 403 or 413)
-  leaves the owner unpoisoned with its epoch, sequence and offset, the next commit goes out with the
-  same sequence, and a re-claim refused this way refuses the commit too. An unmarked 403, the marker
-  alone or the vouch alone, and one attempt marked alone among vouched refusals poison. A poison
-  clears the refusal (and a refusal after a poison is not recorded), no snapshot is taken while any
-  refusal is recorded, `ursula_status` reports the kind and the reason (a 402 also in its 0.7.1
-  fields), a refused attach gets `SQLITE_AUTH` for a 402 and `SQLITE_IOERR_AUTH` otherwise, and the
-  attach mode parses. A 204 to a commit while no earlier attempt of it can have reached the stream
-  is told apart from an acknowledgement, and at the sequence a refused commit left free it poisons,
-  while a 200 there, a 204 at a sequence no refused commit used, and a 204 after an attempt whose
-  outcome is unknown are acknowledged. No request follows a redirect: a `307` is sent again to the
-  same URL with the same method, token and sequence (an append's or a `PUT`'s outcome stays unknown
-  to the end of the budget, and a `HEAD`, a read, a snapshot `GET` or a create then fails with the
-  redirect's status, never as a missing stream or snapshot), and any other redirect, a `308`
-  included, fails the request at once with its `Location`.
+  outcome, and an outcome still unknown when the budget runs out fails as unknown. One function
+  decides whether an answer proves that nothing was applied: a 401, 402 or 429 by its status, with
+  either header or none, and a refusal (a 4xx or 5xx) by the marker with its vouch, while a redirect
+  or a success proves nothing whatever headers it carries. Answers that applied nothing (401, 429,
+  any refusal marked `x-ursula-not-applied` with its vouch, an empty marker included) refuse an
+  append when the budget runs out on them, with the last one's kind and reason (a long marker cut to
+  256 bytes, and the marker's token for `not_applied`, never the body beside it). A 401, 402, 403 or
+  429 keeps its own kind, with the marker's token when its body is empty. A vouched 4xx, an
+  authorizer's 403 among them, refuses it at once, and an unmarked 403 fails it. One attempt whose
+  outcome is unknown among them, before or after, keeps the append unknown. The marker without the
+  vouch, or the vouch without the marker, proves nothing: a 503 so answered is an unknown outcome, a
+  403 or a 413 a failure, a claim fails, and a 401, 402 or 429 still refuses by its status. Against
+  a stand-in server, a commit refused this way (`Db::append_commit`: pressure, a refused token, a
+  402, a 429, a vouched 403 or 413) leaves the owner unpoisoned with its epoch, sequence and offset,
+  the next commit goes out with the same sequence, and a re-claim refused this way refuses the
+  commit too. An unmarked 403, the marker alone or the vouch alone, and one attempt marked alone
+  among vouched refusals poison. A poison clears the refusal (and a refusal after a poison is not
+  recorded), no snapshot is taken while any refusal is recorded, `ursula_status` reports the kind
+  and the reason (a 402 also in its 0.7.1 fields), a refused attach gets `SQLITE_AUTH` for a 402 and
+  `SQLITE_IOERR_AUTH` otherwise, and the attach mode parses. A 204 to a commit while no earlier
+  attempt of it can have reached the stream is told apart from an acknowledgement, and at the
+  sequence a refused commit left free it poisons, the first commit after a claim included. A 200
+  there, a 204 at a sequence no refused commit used (a commit refused at an older epoch, or a
+  refused snapshot publish, leaves none), and a 204 after an attempt whose outcome is unknown (no
+  answer, or a `307`, marked and vouched for or not) are acknowledged, the last with
+  `refused_commit_unchecked` at a refused commit's sequence. No request follows a redirect: a `307`
+  is sent again to the same URL with the same method, token and sequence (an append's or a `PUT`'s
+  outcome stays unknown to the end of the budget, and a `HEAD`, a read, a snapshot `GET` or a create
+  then fails with the redirect's status, never as a missing stream or snapshot), and any other
+  redirect, a `308` included, fails the request at once with its `Location`.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -852,13 +877,15 @@ must say in its release notes to stop every owner of a stream before upgrading.
   accepted commits alone. An append whose answer was lost and whose retries are refused as applying
   nothing poisons, and the stream holds it once. A layer that forwards a commit and answers it with
   a vouched refusal makes it fail alone, the next commit poisons because the refused commit was
-  applied after all, and a replica built from the stream holds the refused transaction. A commit
-  refused with the marker alone poisons,
-  and an attach whose claim a 403 marked alone denies fails with `SQLITE_ERROR`. An authorizer's
-  403 marked and vouched for refuses a commit at once, and an unmarked one poisons. An attach the
-  vouched 403 refuses throws `UrsulaWriteRefusedError`, one the unmarked 403 refuses fails with
-  `SQLITE_ERROR`, and a read-only attach reads meanwhile. Through Pi, a refused commit rejects with
-  `UrsulaWriteRefusedError` and the storage commits again once allowed.
+  applied after all, and a replica built from the stream holds the refused transaction. When the
+  next commit's first attempt loses its answer instead, the commit is acknowledged, the extension
+  logs `refused_commit_unchecked`, and the file and the stream diverge: the gap §2 names. A commit
+  refused with the marker alone poisons, and an attach whose claim a 403 marked alone denies fails
+  with `SQLITE_ERROR`. An authorizer's 403 marked and vouched for refuses a commit at once, and an
+  unmarked one poisons. An attach the vouched 403 refuses throws `UrsulaWriteRefusedError`, one the
+  unmarked 403 refuses fails with `SQLITE_ERROR`, and a read-only attach reads meanwhile. Through
+  Pi, a refused commit rejects with `UrsulaWriteRefusedError` and the storage commits again once
+  allowed.
 - Same-minor compatibility (`test/compat.e2e.ts`, §7): the previous published patch of the minor
   and the build take over each other's streams on a new host and on the same one, both ways.
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + S3 (AWS S3 in CI,

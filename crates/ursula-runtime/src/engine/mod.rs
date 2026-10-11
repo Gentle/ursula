@@ -1138,9 +1138,9 @@ impl GroupEngineError {
 
     /// The refusal this error reports when the engine raised it before it
     /// proposed the write's command, so that nothing of the write can apply.
-    /// A forward OpenRaft reports after `client_write`, and every other error,
-    /// can follow a proposal or is no refusal to retry. The HTTP layer marks
-    /// exactly these answers as applying nothing.
+    /// Every other error, a forward OpenRaft reports after `client_write`
+    /// among them, can follow a proposal or is no refusal to retry. The HTTP
+    /// layer marks exactly these answers as applying nothing.
     pub fn refused_before_proposal(&self) -> Option<RefusedBeforeProposal> {
         if self.is_forward_before_proposal() {
             return Some(RefusedBeforeProposal::NotLeader);

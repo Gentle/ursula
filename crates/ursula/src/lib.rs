@@ -4048,9 +4048,10 @@ impl PreProposalRefusal {
     /// The refusal `err` reports, if the runtime raised it before it proposed
     /// the failed command: a group this node does not host, or what the
     /// engine refused before proposing
-    /// ([`GroupEngineError::refused_before_proposal`]). Every other failure can follow a proposal (a
-    /// forward or a lost response after `client_write`, a group that stopped
-    /// applying, a storage error) or is no refusal to retry.
+    /// ([`GroupEngineError::refused_before_proposal`]). Every other failure
+    /// can follow a proposal (a forward or a lost response after
+    /// `client_write`, a group that stopped applying, a storage error) or is
+    /// no refusal to retry.
     fn of(err: &RuntimeError) -> Option<Self> {
         match err {
             RuntimeError::GroupNotHosted { .. } => Some(Self::GroupNotHosted),

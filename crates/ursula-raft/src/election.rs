@@ -214,7 +214,7 @@ impl ElectionPolicy {
     /// leader or from a self-election. A transfer to another node only
     /// drops this node's leader lease. A transfer to this node makes it
     /// campaign, so its campaign policy must allow that, and it must not
-    /// already lead.
+    /// carry this node's own committed vote.
     ///
     /// OpenRaft acts on a transfer only while this node's vote equals the
     /// vote the transfer carries, and compares the two in its core as it
@@ -225,15 +225,22 @@ impl ElectionPolicy {
     /// its invariant that the leader's vote is at least the node's vote
     /// (an assertion that stops the core thread in debug builds).
     ///
-    /// The check reads the vote in the request rather than this node's
-    /// state, so nothing can change between the check and the core. A
-    /// transfer it accepts acts only while this node holds another node's
+    /// The vote rule reads the vote in the request rather than this node's
+    /// state, so nothing can change between that check and the core. The
+    /// campaign policy reads the recovery gate and the leadership shed,
+    /// which can change before the core acts on the transfer (while the
+    /// log flushes, up to `election_timeout_min`): a shed that starts
+    /// meanwhile does not stop a transfer accepted before it. A transfer
+    /// the vote rule accepts acts only while this node holds another node's
     /// vote or its own uncommitted vote. OpenRaft holds leader state under
     /// such a vote only after an election started on a leader. A transfer
     /// starts one only with the leader's committed vote, which is refused
     /// here. `trigger().elect()` on a leader starts one too, so its only
     /// production caller, `abandon_stalled_transfer`, steps the leader down
-    /// first, and a new caller must do the same.
+    /// first, and a new caller must do the same. So would a vote request
+    /// that names this node as its own candidate, in a higher term, as a
+    /// transfer's (OpenRaft skips the leader lease check for those): no
+    /// peer sends one, and the vote handler does not refuse it.
     pub(crate) fn validate_incoming_transfer(
         &self,
         group: RaftGroupId,
@@ -246,7 +253,7 @@ impl ElectionPolicy {
         }
         let vote = *request.from_leader();
         if vote.is_committed() && *vote.leader_id().node_id() == node_id {
-            return Err(IncomingTransferError::AlreadyLeader { group, vote });
+            return Err(IncomingTransferError::OwnCommittedVote { group, vote });
         }
         if !self.may_campaign(gate) {
             return Err(IncomingTransferError::MayNotCampaign { group });
@@ -304,11 +311,13 @@ pub enum LeadershipTransferError {
 pub enum IncomingTransferError {
     #[error(transparent)]
     Group(#[from] GroupEngineError),
+    /// A transfer to this node that carries its own committed vote: it
+    /// leads under that vote, or led and has seen no newer one.
     #[error(
-        "node already leads Raft group {group:?} under vote {vote}; refusing a leadership \
-         transfer to itself"
+        "a leadership transfer of Raft group {group:?} to this node carries its own committed \
+         vote {vote} (it leads, or led and has seen no newer vote); refusing it"
     )]
-    AlreadyLeader {
+    OwnCommittedVote {
         group: RaftGroupId,
         vote: UrsulaVote,
     },

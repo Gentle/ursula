@@ -1128,6 +1128,10 @@ impl RaftGroupHandleRegistry {
     /// replica holds the vote it carries, so the transfer carries the vote
     /// the replica observes. Success means OpenRaft took the transfer, not
     /// that the replica won the election.
+    ///
+    /// A replica whose Raft core stopped is refused first
+    /// ([`IncomingTransferError::Raft`]): its metrics keep the last vote, so
+    /// one that led when it stopped would otherwise read as the leader.
     pub async fn request_self_election(
         &self,
         group: RaftGroupId,
@@ -1135,6 +1139,9 @@ impl RaftGroupHandleRegistry {
     ) -> Result<(), SelfElectionError> {
         let entry = self.entry(group).map_err(IncomingTransferError::Group)?;
         let observed = entry.raft().metrics().borrow_watched().clone();
+        if let Err(source) = observed.running_state {
+            return Err(IncomingTransferError::Raft { group, source }.into());
+        }
         if observed.current_term != current_term {
             return Err(SelfElectionError::TermChanged {
                 group,

@@ -3216,7 +3216,7 @@ async fn incoming_transfer_policy_refuses_only_transfers_to_this_node() {
     ));
     assert!(matches!(
         policy.validate_incoming_transfer(group, node, &transfer(own_vote, node), None),
-        Err(IncomingTransferError::AlreadyLeader { vote, .. }) if vote == own_vote
+        Err(IncomingTransferError::OwnCommittedVote { vote, .. }) if vote == own_vote
     ));
 
     let (_root, store) = fresh_journal_store();
@@ -3269,7 +3269,7 @@ async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follow
     let vote = leader_raft.metrics().borrow_watched().vote;
     assert!(matches!(
         registry(leader).request_self_election(group, term(leader)).await,
-        Err(SelfElectionError::Transfer(IncomingTransferError::AlreadyLeader {
+        Err(SelfElectionError::Transfer(IncomingTransferError::OwnCommittedVote {
             vote: refused,
             ..
         })) if refused == vote

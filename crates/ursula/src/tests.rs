@@ -8783,9 +8783,10 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
 /// The leader gains nothing from electing itself again, and OpenRaft would
 /// run that election under its old leader state. Self-election on the leader
 /// is refused before it reaches OpenRaft, as is one for a stale term, and the
-/// leader keeps its vote and commits. A follower's self-election and the
-/// campaign policy are covered with a three-voter group in `ursula-raft`,
-/// through the same registry entry point.
+/// leader keeps its vote and commits. A group the node does not host answers
+/// 404. A replica whose Raft core stopped while it led keeps the leader's vote
+/// in its metrics, and answers 503, not the leader's 409. A follower's
+/// self-election is `self_election_elects_a_follower_unless_it_may_not_campaign`.
 #[tokio::test]
 async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
     let root = tempfile::tempdir().unwrap();
@@ -8843,8 +8844,142 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
     assert_eq!(after.vote, observed.vote);
     assert_eq!(after.current_term, observed.current_term);
     assert_eq!(after.current_leader, Some(1));
+    let elsewhere = http_post(
+        &admin,
+        "/__ursula/raft/7/self-election",
+        &[("content-type", "application/json")],
+        Body::from(serde_json::to_vec(&SelfElectionRequest { current_term: 1 }).unwrap()),
+    )
+    .await;
+    assert_eq!(elsewhere.status(), StatusCode::NOT_FOUND);
+    // The core stops under the registered engine, which keeps its handle.
+    raft.shutdown().await.unwrap();
+    let stopped = raft.metrics().borrow_watched().clone();
+    assert!(stopped.running_state.is_err());
+    assert_eq!(stopped.vote, observed.vote);
+    assert_eq!(
+        self_election(observed.current_term).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     runtime.shutdown_group_engines().await.unwrap();
     spawned.raft_wal.unwrap().shutdown().await.unwrap();
+}
+
+/// A follower's self-election is held to the policy of every leadership
+/// transfer it receives: refused with 409 while it may not campaign (here a
+/// maintenance drain), and once it may, taken with 204, after which it leads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_election_elects_a_follower_unless_it_may_not_campaign() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                1,
+                StaticGrpcTestNodeStorage {
+                    per_group_initializers: true,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let group = RaftGroupId(0);
+    for node in &nodes {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+    }
+    for node in &nodes {
+        node.registry
+            .get(group)
+            .expect("registered group")
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "node 1 leads group 0")
+            .await
+            .expect("node 1 leads group 0");
+    }
+    // The followers' recovery gates open once they caught up: until then
+    // they may not campaign either.
+    let manifest = peers
+        .iter()
+        .map(|(id, endpoint)| ursula_ctl::NodeInfo {
+            expected_process_incarnation: None,
+            expected_maintenance_fence: None,
+            id: *id,
+            admin_url: endpoint.parse().unwrap(),
+            http_url: Some(endpoint.parse().unwrap()),
+            metrics_url: Some(endpoint.parse().unwrap()),
+            host: endpoint.clone(),
+        })
+        .collect::<Vec<_>>();
+    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    ursula_ctl::wait_cluster_ready(
+        "self-election fixture startup",
+        &manifest,
+        &client,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        1,
+    )
+    .await
+    .unwrap();
+    let follower = &nodes[1];
+    let raft = follower.registry.get(group).expect("registered group");
+    let admin = admin_router(HttpState::with_raft_registry(
+        follower.runtime.clone(),
+        follower.registry.clone(),
+    ));
+    let self_election = |current_term: u64| {
+        http_post(
+            &admin,
+            "/__ursula/raft/0/self-election",
+            &[("content-type", "application/json")],
+            Body::from(serde_json::to_vec(&SelfElectionRequest { current_term }).unwrap()),
+        )
+    };
+    follower
+        .registry
+        .mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    // The term is read first: a metrics guard held across the request would
+    // block the Raft core's metrics update and, behind it, the handler's read.
+    let term = raft.metrics().borrow_watched().current_term;
+    let refused = self_election(term).await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let reason = String::from_utf8(body_bytes(refused).await.to_vec()).unwrap();
+    assert!(reason.contains("may not campaign"), "{reason}");
+    assert_eq!(raft.metrics().borrow_watched().current_leader, Some(1));
+    follower
+        .registry
+        .clear_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    let term = raft.metrics().borrow_watched().current_term;
+    let taken = self_election(term).await;
+    let status = taken.status();
+    let reason = String::from_utf8(body_bytes(taken).await.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT, "{reason}");
+    raft.wait(Some(Duration::from_secs(5)))
+        .current_leader(2, "the follower's self-election elects it")
+        .await
+        .expect("node 2 leads group 0");
+    for node in nodes {
+        node.shutdown().await;
+    }
 }
 
 #[tokio::test]

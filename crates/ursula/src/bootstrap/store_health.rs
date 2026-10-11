@@ -35,40 +35,54 @@ pub(crate) struct StoreHealthSample {
     pub cold_flush_uploads: u64,
 }
 
-/// Failed cold-flush writes and successful uploads over some ticks.
+/// The failed and successful cold-flush writes one tick recorded.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FlushOutcomes {
     pub errors: u64,
     pub uploads: u64,
 }
 
-impl FlushOutcomes {
-    /// Good without a failed write, bad with failed writes and no successful
-    /// one, and inconclusive with both.
-    pub(crate) fn health(self) -> TickHealth {
-        match (self.errors, self.uploads) {
-            (0, _) => TickHealth::Good,
-            (_, 0) => TickHealth::Bad,
-            _ => TickHealth::Inconclusive,
-        }
-    }
+/// What the flush window shows of the store's writes on one tick.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FlushEvidence {
+    /// Failed writes in the window.
+    pub errors: u64,
+    /// Successful writes since the window's latest failed write, counted from
+    /// the start of the tick that recorded it. 0 when the window holds no
+    /// failed write.
+    pub uploads_since_failure: u64,
+    /// This tick's own writes.
+    pub tick: FlushOutcomes,
+}
 
-    fn plus(self, other: Self) -> Self {
-        Self {
-            errors: self.errors.saturating_add(other.errors),
-            uploads: self.uploads.saturating_add(other.uploads),
+impl FlushEvidence {
+    /// Bad when a write failed within the window and no write succeeded
+    /// since. Otherwise the tick is judged by its own writes: inconclusive
+    /// when it recorded a failed write (and so also a successful one), good
+    /// when it recorded none. Successful writes from before a failure prove
+    /// nothing about the store after it, and a failure that a later success
+    /// answered weighs on its own tick only.
+    pub(crate) fn health(self) -> TickHealth {
+        if self.errors == 0 {
+            TickHealth::Good
+        } else if self.uploads_since_failure == 0 {
+            TickHealth::Bad
+        } else if self.tick.errors > 0 {
+            TickHealth::Inconclusive
+        } else {
+            TickHealth::Good
         }
     }
 }
 
-/// How many ticks of cold-flush outcomes the gate judges together: enough to
-/// span the longest pause between two failed writes while the store refuses
-/// every write, so no tick of such an outage looks good. The flush worker
-/// records a failed write only once the S3 client gave up on it, which can
-/// take [`s3_operation_budget`] (every attempt runs into `s3.timeout`, and
-/// each backoff before one of the `s3.max_retries` retries runs to its
-/// maximum), and then pauses `cold_flush_interval` before its next pass. With
-/// the defaults that is 55 s, or 11 ticks of 5 s.
+/// How many ticks a failed cold-flush write counts for while no write
+/// succeeds: enough to span the longest pause between two failed writes
+/// while the store refuses every write, so no tick of such an outage looks
+/// good. The flush worker records a failed write only once the S3 client gave
+/// up on it, which can take [`s3_operation_budget`] (every attempt runs into
+/// `s3.timeout`, and each backoff before one of the `s3.max_retries` retries
+/// runs to its maximum), and then pauses `cold_flush_interval` before its next
+/// pass. With the defaults that is 55 s, or 11 ticks of 5 s.
 pub(crate) fn flush_window_ticks(
     s3: &ursula_config::S3Config,
     cold_flush_interval: Duration,
@@ -101,19 +115,36 @@ impl FlushWindow {
         }
     }
 
-    /// Takes one tick's cumulative counters and returns the outcomes of the
+    /// Takes one tick's cumulative counters and returns the evidence of the
     /// window that ends with it.
-    fn advance(&mut self, errors_total: u64, uploads_total: u64) -> FlushOutcomes {
+    fn advance(&mut self, errors_total: u64, uploads_total: u64) -> FlushEvidence {
         if self.recent.len() >= self.ticks {
             self.recent.pop_front();
         }
-        self.recent.push_back(FlushOutcomes {
+        let tick = FlushOutcomes {
             errors: self.errors.advance(errors_total),
             uploads: self.uploads.advance(uploads_total),
-        });
-        self.recent
+        };
+        self.recent.push_back(tick);
+        let errors = self
+            .recent
             .iter()
-            .fold(FlushOutcomes::default(), |window, tick| window.plus(*tick))
+            .fold(0_u64, |errors, tick| errors.saturating_add(tick.errors));
+        let uploads_since_failure =
+            self.recent
+                .iter()
+                .rposition(|tick| tick.errors > 0)
+                .map_or(0, |latest_failure| {
+                    self.recent
+                        .iter()
+                        .skip(latest_failure)
+                        .fold(0_u64, |uploads, tick| uploads.saturating_add(tick.uploads))
+                });
+        FlushEvidence {
+            errors,
+            uploads_since_failure,
+            tick,
+        }
     }
 }
 
@@ -122,14 +153,15 @@ impl FlushWindow {
 pub(crate) struct StoreHealthTick {
     /// The worse of the probe's verdict and the flush window's.
     pub health: TickHealth,
-    /// Cold-flush outcomes over the window that ends with this tick.
-    pub flush: FlushOutcomes,
+    /// The cold-flush evidence of the window that ends with this tick.
+    pub flush: FlushEvidence,
     pub transition: HealthTransition,
 }
 
 /// Decision core of the snapshot-store gate, free of I/O so tests drive it
-/// with synthetic samples. A tick is bad when the probe failed, or when the
-/// flush window holds failed cold-flush writes and no successful one.
+/// with synthetic samples. A tick is bad when the probe failed, or when a
+/// cold-flush write failed within the flush window and no write succeeded
+/// since.
 #[derive(Debug, Clone)]
 pub(crate) struct StoreHealthTracker {
     hysteresis: HealthHysteresis,
@@ -293,7 +325,7 @@ pub(crate) fn spawn_store_health_gate(
                         unhealthy_ticks = config.unhealthy_ticks,
                         probe_answered,
                         flush_errors = tick.flush.errors,
-                        flush_uploads = tick.flush.uploads,
+                        flush_uploads_since_failure = tick.flush.uploads_since_failure,
                         flush_window_ticks = config.flush_window_ticks,
                         "snapshot store unhealthy; shedding leadership"
                     );
@@ -341,6 +373,7 @@ mod tests {
     use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
 
+    use super::FlushEvidence;
     use super::FlushOutcomes;
     use super::StoreGateConfig;
     use super::StoreHealthSample;
@@ -414,12 +447,33 @@ mod tests {
     }
 
     #[test]
-    fn a_flush_window_is_bad_only_with_failures_and_no_upload() {
-        let outcomes = |errors, uploads| FlushOutcomes { errors, uploads };
-        assert_eq!(outcomes(0, 0).health(), TickHealth::Good);
-        assert_eq!(outcomes(0, 9).health(), TickHealth::Good);
-        assert_eq!(outcomes(1, 0).health(), TickHealth::Bad);
-        assert_eq!(outcomes(3, 1).health(), TickHealth::Inconclusive);
+    fn flush_evidence_is_bad_only_while_no_write_succeeded_after_the_last_failure() {
+        let evidence = |errors, uploads_since_failure, tick_errors, tick_uploads| FlushEvidence {
+            errors,
+            uploads_since_failure,
+            tick: FlushOutcomes {
+                errors: tick_errors,
+                uploads: tick_uploads,
+            },
+        };
+        assert_eq!(evidence(0, 0, 0, 0).health(), TickHealth::Good);
+        assert_eq!(evidence(0, 0, 0, 9).health(), TickHealth::Good);
+        assert_eq!(evidence(1, 0, 1, 0).health(), TickHealth::Bad);
+        assert_eq!(
+            evidence(1, 0, 0, 0).health(),
+            TickHealth::Bad,
+            "an earlier failure no write answered"
+        );
+        assert_eq!(
+            evidence(3, 1, 2, 1).health(),
+            TickHealth::Inconclusive,
+            "this tick failed and succeeded"
+        );
+        assert_eq!(
+            evidence(3, 4, 0, 1).health(),
+            TickHealth::Good,
+            "a write succeeded after the last failure, and this tick failed none"
+        );
     }
 
     #[test]
@@ -467,7 +521,7 @@ mod tests {
         );
         for answered in [true, false] {
             let tick = tracker.evaluate(probe(answered));
-            assert_eq!(tick.flush, FlushOutcomes::default());
+            assert_eq!(tick.flush, FlushEvidence::default());
             assert_eq!(tick.health == TickHealth::Bad, !answered);
         }
     }
@@ -550,17 +604,149 @@ mod tests {
         let mut errors = 0_u64;
         let mut uploads = 0_u64;
         for tick in 0..200_u64 {
-            // Every tick uploads, and most ticks also record failures.
+            // Every tick uploads, most ticks also record failures, and every
+            // seventh probe fails.
             uploads = uploads.saturating_add(1);
             errors = errors.saturating_add(tick.checked_rem(3).unwrap());
-            let verdict = tracker.evaluate(sample(true, errors, uploads));
-            assert_ne!(verdict.health, TickHealth::Bad, "tick {tick}");
+            let answered = tick.checked_rem(7) != Some(0);
+            let verdict = tracker.evaluate(sample(answered, errors, uploads));
+            assert_eq!(verdict.health == TickHealth::Bad, !answered, "tick {tick}");
             assert_eq!(verdict.transition, HealthTransition::Hold, "tick {tick}");
         }
     }
 
     #[test]
-    fn the_node_heals_once_failed_writes_age_out_of_the_window() {
+    fn a_write_that_failed_beside_successful_ones_does_not_keep_later_ticks_from_being_good() {
+        use TickHealth::Bad;
+        use TickHealth::Good;
+        use TickHealth::Inconclusive;
+
+        // Ticks of 5 s from 0 s, with an upload on every tick: the probes at
+        // 15 s and 20 s fail, one write fails at 25 s, and the probe at 55 s
+        // fails. The failed write weighs on its own tick only, so the good
+        // ticks after it end the bad streak.
+        let mut tracker = default_tracker();
+        let mut errors = 0_u64;
+        let mut ticks = Vec::new();
+        for (index, at_secs) in (0..=60_u64).step_by(5).enumerate() {
+            if at_secs == 25 {
+                errors = errors.saturating_add(1);
+            }
+            let answered = ![15, 20, 55].contains(&at_secs);
+            let uploads = u64::try_from(index).unwrap();
+            ticks.push(tracker.evaluate(sample(answered, errors, uploads)));
+        }
+        let health: Vec<_> = ticks.iter().map(|tick| tick.health).collect();
+        assert_eq!(health, vec![
+            Good,
+            Good,
+            Good,
+            Bad,
+            Bad,
+            Inconclusive,
+            Good,
+            Good,
+            Good,
+            Good,
+            Good,
+            Bad,
+            Good
+        ]);
+        assert!(
+            ticks
+                .iter()
+                .all(|tick| tick.transition == HealthTransition::Hold),
+            "{ticks:?}"
+        );
+
+        // A failed write every 50 s among uploads and a failed probe every
+        // 10 minutes, the probe failing right after a failed write: no shed
+        // in two hours.
+        let mut tracker = default_tracker();
+        let mut errors = 0_u64;
+        for tick in 0..1_440_u64 {
+            if tick.checked_rem(10) == Some(0) {
+                errors = errors.saturating_add(1);
+            }
+            let answered = tick.checked_rem(120) != Some(1);
+            let verdict = tracker.evaluate(sample(answered, errors, tick));
+            assert_eq!(verdict.transition, HealthTransition::Hold, "tick {tick}");
+        }
+    }
+
+    #[test]
+    fn uploads_from_before_an_outage_do_not_hide_it() {
+        // Ticks of 5 s from -60 s. Writes upload until 0 s, then every write
+        // fails: the flush worker records a failure at 10 s and every 8 s
+        // after, and the probe answers throughout.
+        let mut tracker = default_tracker();
+        let mut uploads = 0_u64;
+        let mut ticks = Vec::new();
+        for at_secs in (-60..=30_i64).step_by(5) {
+            if at_secs <= 0 {
+                uploads = uploads.saturating_add(1);
+            }
+            let errors = if at_secs < 10 {
+                0
+            } else {
+                u64::try_from(at_secs.saturating_sub(10).checked_div(8).unwrap())
+                    .unwrap()
+                    .saturating_add(1)
+            };
+            let verdict = tracker.evaluate(sample(true, errors, uploads));
+            ticks.push((at_secs, verdict.health, verdict.transition));
+        }
+        let first_bad = ticks
+            .iter()
+            .position(|(_, health, _)| *health == TickHealth::Bad)
+            .unwrap();
+        assert_eq!(ticks[first_bad].0, 10, "{ticks:?}");
+        assert!(
+            ticks[first_bad..]
+                .iter()
+                .all(|(_, health, _)| *health == TickHealth::Bad),
+            "{ticks:?}"
+        );
+        let sheds: Vec<_> = ticks
+            .iter()
+            .filter(|(_, _, transition)| *transition == HealthTransition::Shed)
+            .map(|(at_secs, _, _)| *at_secs)
+            .collect();
+        assert_eq!(sheds, vec![20], "{ticks:?}");
+
+        // Nor does a write that succeeded after an earlier failure: at 0 s a
+        // write fails beside a successful one, writes upload until 5 s, and
+        // from then on every write fails, recorded at 15 s and every 8 s.
+        let mut tracker = default_tracker();
+        let mut ticks = Vec::new();
+        for at_secs in (-5..=35_i64).step_by(5) {
+            let uploads = if at_secs <= 5 {
+                u64::try_from(at_secs.saturating_add(5)).unwrap()
+            } else {
+                10
+            };
+            let outage_errors = if at_secs < 15 {
+                0
+            } else {
+                u64::try_from(at_secs.saturating_sub(15).checked_div(8).unwrap())
+                    .unwrap()
+                    .saturating_add(1)
+            };
+            let errors = u64::from(at_secs >= 0).saturating_add(outage_errors);
+            let verdict = tracker.evaluate(sample(true, errors, uploads));
+            ticks.push((at_secs, verdict.health, verdict.transition));
+        }
+        let sheds: Vec<_> = ticks
+            .iter()
+            .filter(|(_, _, transition)| *transition == HealthTransition::Shed)
+            .map(|(at_secs, _, _)| *at_secs)
+            .collect();
+        assert_eq!(sheds, vec![25], "{ticks:?}");
+    }
+
+    /// A node that sheds after failed writes: one failure at its second tick
+    /// and one at its fourth, nothing uploading, and the probe answering.
+    fn shed_by_failed_writes() -> StoreHealthTracker {
         let mut tracker = default_tracker();
         let mut transitions = run(&mut tracker, &[
             sample(true, 0, 0),
@@ -569,6 +755,25 @@ mod tests {
             sample(true, 2, 0),
         ]);
         assert_eq!(transitions.pop(), Some(HealthTransition::Shed));
+        tracker
+    }
+
+    #[test]
+    fn the_node_heals_two_good_ticks_after_a_write_succeeds_again() {
+        let mut tracker = shed_by_failed_writes();
+        let healing =
+            [sample(true, 2, 1), sample(true, 2, 1)].map(|sample| tracker.evaluate(sample));
+        assert_eq!(healing[0].health, TickHealth::Good);
+        assert_eq!(healing[0].flush.uploads_since_failure, 1);
+        assert_eq!(healing[0].transition, HealthTransition::Hold);
+        assert_eq!(healing[1].transition, HealthTransition::Heal);
+    }
+
+    #[test]
+    fn a_node_that_writes_nothing_heals_once_its_last_failed_write_leaves_the_window() {
+        // A node that handed off every leadership flushes nothing, so no
+        // successful write can answer its last failure.
+        let mut tracker = shed_by_failed_writes();
         // The last failure stays in the window for 11 ticks, then two good
         // ticks heal.
         let after: Vec<_> = (0..13)
@@ -590,10 +795,11 @@ mod tests {
 
         /// Against the gate's definition, written out over the tick history:
         /// a tick is bad when the probe went unanswered, or when the last
-        /// `window` ticks hold failed writes and no upload; it is good when
-        /// the probe answered and they hold no failed write. The node sheds
-        /// once the ticks since the last good one hold `unhealthy_ticks` bad
-        /// ones.
+        /// `window` ticks hold a failed write and no write succeeded from the
+        /// tick of the latest one on; it is good when the probe answered and
+        /// the flush part is not bad and this tick recorded no failed write.
+        /// The node sheds once the ticks since the last good one hold
+        /// `unhealthy_ticks` bad ones.
         #[test]
         fn sheds_only_after_unhealthy_ticks_bad_ticks(
             base in 0u64..1_000,
@@ -615,20 +821,29 @@ mod tests {
                 uploads = uploads.saturating_add(u64::from(uploaded));
                 let tick = tracker.evaluate(sample(answered, errors, uploads));
                 // The first tick is the counters' baseline.
-                history.push(if index == 0 {
+                let this_tick = if index == 0 {
                     (0, 0)
                 } else {
                     (new_errors, u64::from(uploaded))
-                });
+                };
+                history.push(this_tick);
                 let recent = &history[history.len().saturating_sub(window)..];
                 let window_errors: u64 = recent.iter().map(|(errors, _)| errors).sum();
-                let window_uploads: u64 = recent.iter().map(|(_, uploads)| uploads).sum();
-                prop_assert_eq!(tick.flush, FlushOutcomes {
+                let uploads_since_failure: u64 = recent
+                    .iter()
+                    .rposition(|(errors, _)| *errors > 0)
+                    .map_or(0, |latest| recent[latest..].iter().map(|(_, uploads)| uploads).sum());
+                prop_assert_eq!(tick.flush, FlushEvidence {
                     errors: window_errors,
-                    uploads: window_uploads,
+                    uploads_since_failure,
+                    tick: FlushOutcomes {
+                        errors: this_tick.0,
+                        uploads: this_tick.1,
+                    },
                 });
-                let bad = !answered || (window_errors > 0 && window_uploads == 0);
-                let good = answered && window_errors == 0;
+                let flush_bad = window_errors > 0 && uploads_since_failure == 0;
+                let bad = !answered || flush_bad;
+                let good = answered && !flush_bad && this_tick.0 == 0;
                 prop_assert_eq!(tick.health == TickHealth::Bad, bad);
                 prop_assert_eq!(tick.health == TickHealth::Good, good);
                 if shedding {

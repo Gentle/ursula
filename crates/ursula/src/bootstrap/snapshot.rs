@@ -88,15 +88,15 @@ async fn trigger_snapshot_build(
 
 /// Whether this tick triggers snapshot builds.
 ///
-/// While the store health gate's latest tick was bad (the probe failed, or
-/// cold-flush writes failed and none succeeded over the gate's flush window),
-/// routine snapshots are held back so the driver does not push uploads into a
-/// failing store. Not once the log is
-/// over the pressure watermark: a build whose upload, verification or
-/// reference publication fails falls back to an inline snapshot, which still
-/// truncates the log, so nothing a snapshot needs depends on the store.
-/// Holding builds back there would grow the log into the node-wide 503 write
-/// gate while the store is merely throttling.
+/// While the store health gate's latest tick was bad (the probe failed, or a
+/// cold-flush write failed within the gate's flush window and none succeeded
+/// since), routine snapshots are held back so the driver does not push
+/// uploads into a failing store. Not once the log is over the pressure
+/// watermark: a build whose upload, verification or reference publication
+/// fails falls back to an inline snapshot, which still truncates the log, so
+/// nothing a snapshot needs depends on the store. Holding builds back there
+/// would grow the log into the node-wide 503 write gate while the store is
+/// merely throttling.
 fn should_drive_snapshots(store_trouble: bool, log_pressure: bool) -> bool {
     !store_trouble || log_pressure
 }

@@ -475,14 +475,17 @@ pub struct S3Config {
     pub probe_timeout: HumanDuration,
     /// Bad health ticks, with no good tick between them, before the node
     /// sheds its leadership. A tick is bad when the probe fails or times out,
-    /// or when cold-flush writes failed and none succeeded over the flush
-    /// window, which spans as long as the S3 client can take to give up on a
-    /// write (`timeout` and `max_retries`). A tick whose window holds failed
-    /// and successful writes is inconclusive: it never ends a bad streak and
-    /// never lengthens one, as in the cold-health gate. Must be non-zero.
+    /// or when a cold-flush write failed within the flush window and no write
+    /// has succeeded since. The window spans as long as the S3 client can
+    /// take to give up on a write (`timeout` and `max_retries`). A tick that
+    /// records both failed and successful writes is inconclusive: it never
+    /// ends a bad streak and never lengthens one, as in the cold-health gate.
+    /// Must be non-zero.
     pub unhealthy_ticks: usize,
     /// Good health ticks in a row before a node that shed may lead again.
-    /// Must be non-zero.
+    /// After failed writes, the good ticks start with the first write that
+    /// succeeds after the last failed one, or once the last failed one has
+    /// left the flush window. Must be non-zero.
     pub heal_ticks: usize,
 }
 

@@ -4,9 +4,10 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// The most measurements of each kind an attached database keeps between two drains: 10,000
-/// commits take about 640 KB.
-pub(crate) const KEPT: usize = 10_000;
+/// The most measurements of each kind an attached database keeps between two drains: 8,192
+/// commits take 512 KiB (64 bytes each), checkpoints 128 KiB. A power of two: the queues grow by
+/// doubling, so their capacity stops at `KEPT` too.
+pub(crate) const KEPT: usize = 8_192;
 
 /// One acknowledged commit.
 pub(crate) struct CommitStat {
@@ -130,11 +131,12 @@ mod tests {
     use super::SnapshotStat;
     use super::Stats;
 
-    /// A commit told apart by its frame bytes (`i`).
+    /// A commit told apart by its frame bytes (`i`), with no record bytes, so a sum of the wrong
+    /// field shows.
     fn commit(i: usize, attempts: u32) -> CommitStat {
         CommitStat {
             bytes: i,
-            raw: i,
+            raw: 0,
             pages: 1,
             attempts,
             append: Duration::ZERO,
@@ -185,8 +187,8 @@ mod tests {
         assert_eq!(d.dropped, Dropped::default());
     }
 
-    // A database nobody drains keeps at most `KEPT` of each kind, the newest: about 640 KB of
-    // commits (no longer 64 MB) however long it runs.
+    // A database nobody drains keeps at most `KEPT` of each kind, the newest, in queues no larger:
+    // 512 KiB of commits (no longer 64 MB) however long it runs.
     #[test]
     fn a_database_nobody_drains_keeps_a_bounded_number_of_each_kind() {
         assert!(size_of::<CommitStat>() <= 64);
@@ -200,6 +202,9 @@ mod tests {
             assert!(s.checkpoints.len() <= KEPT);
             assert!(s.snapshots.len() <= KEPT);
         }
+        assert!(s.commits.capacity() <= KEPT, "{}", s.commits.capacity());
+        assert!(s.checkpoints.capacity() <= KEPT);
+        assert!(s.snapshots.capacity() <= KEPT);
         let d = s.drain();
         let newest = 2 * KEPT..total;
         assert!(d.commits.iter().map(|c| c.bytes).eq(newest.clone()));

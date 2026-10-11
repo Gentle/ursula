@@ -104,7 +104,7 @@
 //!   the snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none; the rest
 //!   are the owner's health, see `status`);
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench):
-//!   at most the newest 10,000 of each kind between drains, and `dropped` counts the rest.
+//!   at most the newest 8,192 of each kind between drains, and `dropped` counts the rest.
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
 //! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds every retry
@@ -131,6 +131,7 @@
 //! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `snapshotter`: the snapshot thread, snapshots and retention.
+//! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
 //! - `status`: `ursula_status` and `ursula_stats`.
 //! - `vfs`: the VFS file methods and the commit path.
 //! - `wal`: the local WAL's format, recovery scan and fold.

@@ -168,9 +168,40 @@ fn stats_json(drained: &Drained) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::stats_json;
     use super::status_json;
     use crate::db::Db;
     use crate::error::WriteRefusal;
+    use crate::stats::CommitStat;
+    use crate::stats::KEPT;
+    use crate::stats::Stats;
+
+    // `ursula_stats` reports what was dropped under the names the TypeScript package reads
+    // (`VfsDropped`): the commits, their frame bytes and append retries, checkpoints and snapshots.
+    #[test]
+    fn stats_report_what_was_dropped() {
+        let mut s = Stats::default();
+        for i in 0..KEPT + 2 {
+            s.commit(CommitStat {
+                bytes: 100 + i,
+                raw: 0,
+                pages: 1,
+                attempts: 2,
+                append: Duration::ZERO,
+                vfs: Duration::ZERO,
+            });
+        }
+        let json = stats_json(&s.drain());
+        assert!(
+            json.ends_with(
+                r#""dropped":{"commits":2,"commit_bytes":201,"append_retries":2,"checkpoints":0,"snapshots":0}}"#
+            ),
+            "{}",
+            json.get(json.len().saturating_sub(120)..).unwrap_or(&json)
+        );
+    }
 
     // A write refused before it reached the stream shows in `writes_refused`, with its kind and
     // reason, until a commit is acknowledged; a 402 also shows in the fields 0.7.1 introduced.

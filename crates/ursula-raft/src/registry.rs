@@ -1131,7 +1131,9 @@ impl RaftGroupHandleRegistry {
     ///
     /// A replica whose Raft core stopped is refused first
     /// ([`IncomingTransferError::Raft`]): its metrics keep the last vote, so
-    /// one that led when it stopped would otherwise read as the leader.
+    /// one that led when it stopped would otherwise read as the leader. A
+    /// core that panicked never reports that it stopped (its metrics keep
+    /// their last values), so it is refused as what they show.
     pub async fn request_self_election(
         &self,
         group: RaftGroupId,
@@ -1166,9 +1168,12 @@ impl RaftGroupHandleRegistry {
     ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, IncomingTransferError>
     {
         let raft = entry.raft();
+        // Read first: a metrics guard held through the policy check would hold up the core's
+        // next metrics update while the check takes the recovery gate's locks.
+        let node_id = raft.metrics().borrow_watched().id;
         self.election.validate_incoming_transfer(
             group,
-            raft.metrics().borrow_watched().id,
+            node_id,
             &request,
             entry.recovery.as_deref(),
         )?;

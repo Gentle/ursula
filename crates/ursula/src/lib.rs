@@ -2594,9 +2594,10 @@ use ursula_proto::admin::SelfElectionRequest;
 /// ([`ursula_raft::RaftGroupHandleRegistry::request_self_election`]). A
 /// replica that already leads the group or may not campaign, or whose term
 /// or vote changed, is refused with `409 Conflict`. A replica whose Raft
-/// core stopped answers `503 Service Unavailable`. A group this node does not
-/// host, or whose apply loop stopped (the registry retires it), answers
-/// `404 Not Found`.
+/// core or apply loop has stopped answers `503 Service Unavailable` (a core
+/// that panicked is not seen: its metrics keep their last values). A group
+/// this node does not host, or one retired because its replay stopped at
+/// startup, answers `404 Not Found`.
 async fn request_raft_self_election(
     State(state): State<HttpState>,
     Path(group_id): Path<u64>,

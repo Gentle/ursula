@@ -238,9 +238,11 @@ impl ElectionPolicy {
     /// here. `trigger().elect()` on a leader starts one too, so its only
     /// production caller, `abandon_stalled_transfer`, steps the leader down
     /// first, and a new caller must do the same. So would a vote request
-    /// that names this node as its own candidate, in a higher term, as a
-    /// transfer's (OpenRaft skips the leader lease check for those): no
-    /// peer sends one, and the vote handler does not refuse it.
+    /// that names this node as its own candidate in a higher term: OpenRaft
+    /// accepts it at once when it is marked as a transfer's, and otherwise
+    /// once the leader's own vote lease (set once, when it became leader)
+    /// has expired. No peer sends one, and the vote handler does not refuse
+    /// it, whatever its transfer mark.
     pub(crate) fn validate_incoming_transfer(
         &self,
         group: RaftGroupId,

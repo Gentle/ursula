@@ -7,7 +7,8 @@
 //! 10 s, doubled for each failure after a window up to 60 s.
 //!
 //! When the window expires, one request probes the upstream: the first one
-//! that selects it, through a cached route or at random. Until that probe
+//! that selects it, through a cached route or at random, or as a search hop
+//! after a leader redirect (`Ejections::claim`). Until that probe
 //! answers or fails, every other request keeps skipping the upstream. A probe
 //! that does neither within the probe deadline (a slow long-poll, say) no
 //! longer holds the others back, and the next request that selects the
@@ -191,6 +192,22 @@ impl Table {
         })
     }
 
+    /// Whether a request at `now` may go to `upstream` (see
+    /// [`Ejections::claim`]).
+    fn claim(&mut self, upstream: &str, now: Instant, probe_deadline: Duration) -> bool {
+        match self.0.get_mut(upstream) {
+            None => true,
+            Some(e) if e.active(now, probe_deadline) => false,
+            Some(e) => {
+                *e = Ejection::Probing {
+                    failures: e.failures(),
+                    since: now,
+                };
+                true
+            }
+        }
+    }
+
     /// Upstreams requests skip at `now`.
     fn active(&self, now: Instant, probe_deadline: Duration) -> usize {
         self.0
@@ -262,6 +279,15 @@ impl Ejections {
             });
         }
         self.with_table(|table| table.pick(cached, upstreams, now, self.probe_deadline, rng))
+    }
+
+    /// Whether a request at `now` may go to `upstream`: not while requests
+    /// skip it, inside its window or while a probe of it is unresolved. One
+    /// whose window has expired becomes this request's probe, as through
+    /// [`Ejections::pick`].
+    pub(crate) fn claim(&self, upstream: &str, now: Instant) -> bool {
+        self.nothing_ejected()
+            || self.with_table(|table| table.claim(upstream, now, self.probe_deadline))
     }
 
     /// Upstreams requests skip at `now`.

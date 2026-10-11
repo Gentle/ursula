@@ -1,15 +1,15 @@
 // Leader redirects through a gateway that checks tokens, while every group's leadership moves
 // (3 nodes only). This gateway reaches the nodes as `localhost`, while the peer URLs that leader
-// redirects name say `127.0.0.1`, so it cannot follow a redirect itself: it passes each one on with
-// a path-only Location, as it passes on a second redirect after following the first. The extension
-// never follows a redirect. It sends the request again to the same URL with its token, like a 503
-// (followed, the request would go out without the token, and the gateway would hide the stream
-// behind a 404). Meanwhile a loop hands every group's leadership to the next node, again and again
-// with a short pause, through the nodes' admin API: from before an owner's attach, through its
-// commits and snapshot read-backs, a second host's attach from the snapshot, and the owner's attach
-// of its own files again, and the test checks that leaderships moved while the owner committed and
-// while it waited for its snapshots. Nothing is poisoned, every commit goes through, every host
-// reads the same rows, and commits and snapshot GETs each met a redirect.
+// redirects name say `127.0.0.1`, so no redirect names one of its upstreams. A gateway before 0.7.3
+// passed each such redirect on with a path-only Location. From 0.7.3 it looks for the leader among
+// the upstreams it has not tried yet, and answers 503 when it finds none within its limits, so no
+// redirect reaches the client (#460). Meanwhile a loop hands every group's leadership to the next
+// node, again and again with a short pause, through the nodes' admin API: from before an owner's
+// attach, through its commits and snapshot read-backs, a second host's attach from the snapshot, and
+// the owner's attach of its own files again, and the test checks that leaderships moved while the
+// owner committed and while it waited for its snapshots. Nothing is poisoned, every commit goes
+// through, every host reads the same rows, the gateway looked for leaders among its upstreams, and
+// a proxy in front of it saw no redirect.
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -116,7 +116,7 @@ function operation(method: string | undefined, path: string | undefined, seq: st
 	return method ?? "?";
 }
 
-/** An HTTP proxy in front of the gateway that counts the redirects it passes on, by operation. */
+/** An HTTP proxy in front of the gateway that counts the redirects and `503`s it passes on, by operation. */
 class RedirectCounter {
 	private readonly server: Server;
 	private readonly seen = new Map<string, number>();
@@ -133,8 +133,8 @@ class RedirectCounter {
 		const server = createServer((req, res) => {
 			const up = request({ host: t.hostname, port: t.port, method: req.method, path: req.url, headers: req.headers }, (answer) => {
 				const status = answer.statusCode ?? 502;
-				if (status === 307) {
-					const kind = operation(req.method, req.url, req.headers["producer-seq"]);
+				if (status === 307 || status === 503) {
+					const kind = `${status} ${operation(req.method, req.url, req.headers["producer-seq"])}`;
 					counter?.seen.set(kind, (counter.seen.get(kind) ?? 0) + 1);
 				}
 				res.writeHead(status, answer.headers);
@@ -148,9 +148,11 @@ class RedirectCounter {
 		return counter;
 	}
 
-	/** Redirects passed on to requests of `kind` (see `operation`). */
-	count(kind: string): number {
-		return this.seen.get(kind) ?? 0;
+	/** Answers with `status` passed on, to requests of any kind (see `operation`). */
+	count(status: number): number {
+		let n = 0;
+		for (const [kind, seen] of this.seen) if (kind.startsWith(`${status} `)) n += seen;
+		return n;
 	}
 
 	summary(): string {
@@ -195,7 +197,7 @@ async function finished(child: Child, ms: number): Promise<{ done: ChildLine; ro
 }
 
 it.runIf(nodes.length === 3)(
-	"attach, commits and snapshot read-backs retry the redirects a gateway that checks tokens passes on while leaderships move",
+	"attach, commits and snapshot read-backs go through a gateway that finds moving leaders itself, and no redirect reaches the client",
 	async () => {
 		const counter = proxy as RedirectCounter;
 		const url = counter.url + streamPath();
@@ -216,8 +218,8 @@ it.runIf(nodes.length === 3)(
 			const steps = ["CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB)"];
 			for (let i = 0; i < 40; i++) steps.push(`INSERT OR REPLACE INTO t VALUES (${i % 4}, randomblob(16384))`, "@sleep:100");
 			const lastCommit = steps.length - 2;
-			// Under these moves one snapshot can take seconds (its requests meet redirects, or a 503 with
-			// Retry-After: 1 from a group between leaders): the owner waits for two before it exits.
+			// Under these moves one snapshot can take seconds (its requests meet a 503 with Retry-After: 1
+			// from a group between leaders): the owner waits for two before it exits.
 			steps.push("@snapshots:2", "@sleep:2000", ROWS);
 			const file = freshFile();
 			const started = loop.byGroup();
@@ -238,14 +240,10 @@ it.runIf(nodes.length === 3)(
 			expect(host.done.installed).not.toBe("-1");
 			expect(host.rows).toEqual(owner.rows);
 
-			// The gateway sends each request to a node picked at random, the leader one time in three,
-			// so the snapshot GETs so far may all have missed a redirect. Until one met a redirect,
-			// read-only hosts (they claim nothing) install the snapshot again.
-			for (let i = 0; counter.count("GET snapshot") === 0 && i < 10; i++) {
-				const reader = await finished(runChild(freshFile(), url, [ROWS], { ...env, CHILD_ATTACH_MODE: "read_only" }), 90_000);
-				expect(reader.done.installed).not.toBe("-1");
-				expect(reader.rows).toEqual(owner.rows);
-			}
+			// A read-only host (it claims nothing) installs the snapshot too.
+			const reader = await finished(runChild(freshFile(), url, [ROWS], { ...env, CHILD_ATTACH_MODE: "read_only" }), 90_000);
+			expect(reader.done.installed).not.toBe("-1");
+			expect(reader.rows).toEqual(owner.rows);
 
 			// The owner attaches its own files again (they hold data: a stream hidden behind a 404
 			// would be refused as missing), takes the stream back and commits.
@@ -255,11 +253,17 @@ it.runIf(nodes.length === 3)(
 		} finally {
 			moved = await loop.stop();
 		}
-		console.log(`leadership moves: ${moved}; redirects passed on: ${counter.summary()}; snapshots: ${snapshots}`);
+		const metrics = (await (await fetch(`${(gateway as AuthGateway).url}/__ursula/gateway/metrics`)).json()) as {
+			leader_redirects: number;
+			leader_searches: number;
+			leader_not_found: number;
+		};
+		console.log(`leadership moves: ${moved}; passed on: ${counter.summary()}; gateway: ${JSON.stringify(metrics)}; snapshots: ${snapshots}`);
 		expect(moved).toBeGreaterThanOrEqual(4);
-		// The gateway passed redirects on to commits, and to snapshot read-backs or installs.
-		expect(counter.count("commit")).toBeGreaterThan(0);
-		expect(counter.count("GET snapshot")).toBeGreaterThan(0);
+		// The gateway looked for leaders among its upstreams (every redirect it followed was a
+		// search hop here), and passed no redirect on.
+		expect(metrics.leader_searches).toBeGreaterThan(0);
+		expect(counter.count(307)).toBe(0);
 	},
 	600_000,
 );

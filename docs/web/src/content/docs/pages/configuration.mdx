@@ -49,7 +49,7 @@ CLI `--node-id` intentionally overrides any `raft.node_id` value in the config f
 | `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core. `0` disables the limit |
 | `observability.tokio_console` | `false` | Enables Tokio console when the binary is built with the feature |
 
-Without `server.cluster_listen`, `server.listen` serves both client/API and Raft/cluster routes, and each `[[raft.peers]].url` should point at that address. With `server.cluster_listen` set, `server.listen` is client/API-only and peer URLs must point at the cluster listener instead. Note that the same peer URL is currently also used for HTTP leader redirects, so it must be reachable by clients or the gateway as well as by peers.
+Without `server.cluster_listen`, `server.listen` serves both client/API and Raft/cluster routes, and each `[[raft.peers]].url` should point at that address. With `server.cluster_listen` set, `server.listen` is client/API-only and peer URLs must point at the cluster listener instead. Note that the same peer URL is currently also used for HTTP leader redirects. A client that talks to a node directly follows it, so it must be reachable by such clients as well as by peers. `ursula gateway` follows a redirect to an upstream directly when its `--upstream` equals the peer URL, and searches its upstreams for the leader otherwise.
 
 ## Raft
 

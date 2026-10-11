@@ -19,15 +19,15 @@ identifies the Raft leader.
   [Upstream Selection](#upstream-selection).
 - Buffers request bodies up to `--max-request-body-bytes`; larger requests
   receive `413 Payload Too Large` before reaching an upstream.
-- Follows Ursula Raft leader redirects internally when the response includes
-  `x-ursula-raft-leader-id` and the leader URL matches a configured upstream.
+- Follows Ursula Raft leader redirects internally, so clients never get one.
+  See [Redirects](#redirects).
 - Returns other redirects to clients and rewrites redirect targets so clients
   continue through the gateway.
 - Keeps long-lived SSE reads open after response headers arrive.
 - Optionally classifies Durable Streams requests as an explicit
   `bucket/stream/action` resource before forwarding them to provider-neutral
   authentication and authorization hooks.
-- Marks its answers to requests that no node received with the
+- Marks its answers to requests that no node can have applied with the
   `x-ursula-not-applied` response header, and sets
   `x-ursula-not-applied-checked: 1` on every response. See
   [Refusals That Applied Nothing](#refusals-that-applied-nothing).
@@ -35,14 +35,16 @@ identifies the Raft leader.
 ## Upstream Selection
 
 - **Leader cache.** When an upstream answers with Ursula's internal `307` and
-  `x-ursula-raft-leader-id`, the gateway follows it to the leader and
-  remembers that leader for the stream, or for the stream's Raft group with
-  `--raft-group-count`. Later requests for the stream or group go to the
-  cached leader directly. A route is dropped when its leader answers with the
-  retryable `503` it sends while it does not know the leader, or when a
-  request to it fails. The cache holds up to 16384 routes and starts over
-  when full. Requests without a route go to a configured upstream picked at
-  random.
+  `x-ursula-raft-leader-id`, the gateway follows it (see
+  [Redirects](#redirects)). The upstream that then serves the request with a
+  success (`2xx`) becomes the route for the stream, or for the stream's Raft
+  group with `--raft-group-count`. Any other answer teaches no route, since a
+  node gives some before its leadership check. Later requests for the stream
+  or group go to the cached leader directly. A route is dropped when its
+  upstream redirects, when it answers `503` with `Retry-After` (while it does
+  not know the leader, or under backpressure), or when a request to it fails.
+  The cache holds up to 16384 routes and starts over when full. Requests
+  without a route go to a configured upstream picked at random.
 - **Ejection.** An upstream that fails at the transport (it refuses or times
   out the connection, or the exchange breaks) is ejected: requests skip it
   for 10 s. Each failure after a window ejects it again for twice as long,
@@ -52,7 +54,8 @@ identifies the Raft leader.
   a live node does the same. A node that vanished fails within
   `--upstream-tcp-user-timeout` instead.
 - **Probe.** When a window expires, the next request that selects the
-  upstream, along a cached route or at random, probes it. The other requests
+  upstream, along a cached route, at random, or as a search hop after a
+  leader redirect, probes it. The other requests
   keep skipping the upstream until the probe answers or fails, or for at most
   `--connect-timeout` plus `--upstream-tcp-user-timeout`, after which the
   next request that selects it probes it again. Any response from the
@@ -64,7 +67,11 @@ identifies the Raft leader.
   (times an upstream was ejected) and `upstream_ejected` (upstreams skipped
   now, inside a window or with a probe outstanding), next to the leader-cache
   counters `leader_cache_hits`, `leader_cache_misses`, `leader_cache_updates`,
-  `leader_cache_evictions` and `leader_cache_entries`.
+  `leader_cache_evictions` and `leader_cache_entries`, and the redirect
+  counters `leader_redirects` (hops that followed a redirect, search hops
+  included), `leader_redirect_ns` (time spent by the requests that followed
+  one), `leader_searches` (search hops) and `leader_not_found` (requests
+  answered `503` because no upstream answered without redirecting).
 
 ## Access Control and Logical Tenancy
 
@@ -94,9 +101,55 @@ can mount its own health or operator routes outside the gateway fallback.
 
 ## Redirects
 
-The gateway follows Ursula `307 Temporary Redirect` responses internally when
-they are marked as Raft leader redirects with `x-ursula-raft-leader-id` and the
-leader target resolves to one of the configured upstreams.
+The gateway follows Ursula `307 Temporary Redirect` responses marked as Raft
+leader redirects with `x-ursula-raft-leader-id` itself, so a client never gets
+one:
+
+- It sends the request to the upstream that the redirect's `Location` names,
+  unless the request already went to that upstream.
+- Otherwise, and when the `Location` names no upstream because `--upstream`
+  names the nodes otherwise than their peer URLs, it searches: it sends the
+  request to the next upstream it has not tried yet, starting after the one
+  that redirected, in the configured order and around. It skips ejected
+  upstreams, and one whose ejection window has expired becomes the request's
+  probe. A search hop that cannot connect sent nothing, so the search goes on
+  to the next upstream.
+- At most three hops follow redirects, search hops included, and none starts
+  later than 5 s after the request's first redirect. A hop under way runs to
+  its answer, so a long-poll or a large upload that reached the leader is not
+  cut short. Nor does a slow first hop use the 5 s up: a follower can store a
+  large body in object storage before it redirects.
+- When no upstream answers without redirecting within these limits, the
+  client gets `503` with `Retry-After: 1`, as from a node whose group has no
+  known leader.
+
+Gateways before 0.7.3 followed one redirect, to a configured upstream only,
+and passed any other on to the client with a path-only `Location`.
+
+Each hop sends the request again. Only stream requests are redirected. Two
+hops of one request are at most 5 s and the earlier hop's own time apart.
+When a node proposed a write before it redirected, so that the write may
+already apply, the next hop's copy fares as follows:
+
+- A producer append or close is deduplicated by its `Producer-Id`,
+  `Producer-Epoch` and `Producer-Seq`.
+- A create answers `200` for a stream that already exists as it asks. If
+  another client deleted the stream between the two hops, it creates the
+  stream again.
+- A close without a body answers as the first close did.
+- A snapshot publish or a retention move makes the same change again.
+- A delete answers `404`: the stream is gone. An unconditional delete also
+  deletes a stream that another client recreated between the two hops. With
+  `Stream-Incarnation`, it answers `412` and deletes nothing instead, so send
+  it.
+- An append with `Stream-Seq`, or one that also closes the stream, is refused
+  with `409`, which its client cannot tell apart from a conflict with another
+  writer.
+- A plain append, without a producer or `Stream-Seq`, applies again: once for
+  each node that proposed it and then redirected. Its client gets
+  at-least-once delivery, as on any retry of it, and as through gateways
+  before 0.7.3, which followed one redirect. Use a producer for exactly-once
+  writes.
 
 Other `307` responses remain visible to the client. Their `Location` header is
 reduced to the path and query so redirect-following clients such as `curl -L`
@@ -106,9 +159,10 @@ directly.
 ## Refusals That Applied Nothing
 
 The gateway sets the `x-ursula-not-applied` response header, the marker,
-when no node received the request: on every request it refuses before
-forwarding it, and on a request it could not send because the connection to
-its first upstream failed. The value names the refusal:
+when no node can have applied the request: on every request it refuses
+before forwarding it, on a request it could not send because the connection
+to its first upstream failed, and after redirects that were all marked
+(below). The value names the refusal:
 
 | Status | Token | Refusal |
 | ------ | ----- | ------- |
@@ -122,18 +176,21 @@ its first upstream failed. The value names the refusal:
 | `413` | `RequestBodyTooLarge` | The body is over `--max-request-body-bytes` or the bucket's limit |
 | `400` | `RequestBodyUnreadable` | The request body could not be read |
 | `503` | `NoUpstream` | No upstream is configured |
-| `503` | `UpstreamUnreachable` | The connection to the first upstream failed, so the request was never sent |
+| `503` | `UpstreamUnreachable` | The connection to the first upstream failed, so the request was never sent. Or the connection to an upstream after redirects failed, and every redirect was marked |
+| `503` | `LeaderNotFound` | No upstream answered without redirecting within the [redirect limits](#redirects), and every redirect was marked |
 
 A node's marker passes through unchanged when the gateway sent the request
-to one node. After the gateway follows a Raft leader redirect, it keeps the
-leader's marker only if the redirect carried one too, because a node can
-redirect a write after it proposed it. A node marks only the redirects it
+to one node. After the gateway follows Raft leader redirects, it keeps the
+final answer's marker only if every redirect carried one too, because a node
+can redirect a write after it proposed it. A node marks only the redirects it
 sends before it proposes a write, so a leader's admission refusal reached
-through such a redirect keeps its marker. The other answers the gateway gives
-when an upstream fails carry no marker: the `502` and `504`, and the `503`
-for a leader it could not connect to after a redirect. The gateway leaves
-every failure of the leader hop unmarked, even after a marked redirect: it
-does not combine a redirect's marker with a failed second exchange.
+through such redirects keeps its marker. The gateway's `503` for an upstream
+it could not connect to after redirects, and its `503` when it stops
+following redirects, are marked only when every redirect was marked. A hop
+that could not connect sent nothing, so it does not count against the
+marker. The other
+answers the gateway gives when an upstream fails carry no marker: the `502`,
+and the `504` for an upstream that sent no response headers in time.
 
 From 0.7.3 the gateway sets `x-ursula-not-applied-checked: 1`, the vouch, on
 every response it returns: forwarded responses, its own refusals and its own
@@ -214,9 +271,12 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 
 --upstream <URL>
     Base URL for an Ursula HTTP or HTTPS node. Repeat once per node. Required.
-    Point it at the node itself. A proxy, service-mesh sidecar or another
-    gateway in between must not resend requests, or the gateway vouches for
-    an x-ursula-not-applied marker from a later delivery. Nor may it answer
+    Point it at the node itself, by the node's peer URL where you can. A
+    leader redirect names the leader by its peer URL, and the gateway follows
+    one that names another address only by trying the upstreams it has not
+    tried yet. A proxy, service-mesh sidecar or another gateway in between
+    must not resend requests, or the gateway vouches for an
+    x-ursula-not-applied marker from a later delivery. Nor may it answer
     401, 402 or 429, for example from a local rate limit: a client counts
     those statuses as never applied.
 

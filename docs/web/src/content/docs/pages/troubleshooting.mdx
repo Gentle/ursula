@@ -363,7 +363,8 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 | `RequestBodyUnreadable` | The gateway could not read the request body, so it sent nothing on |
 | `NotFound` | The gateway's access policy does not serve the stream to these credentials: no token, or one the policy does not allow. The cause is the credentials or the policy, not load |
 | `AuthenticationUnavailable`, `AuthorizationUnavailable` | The gateway could not verify the token or reach a decision, for example while its token issuer is down |
-| `NoUpstream`, `UpstreamUnreachable` | The gateway could not reach a server, so it sent nothing on |
+| `NoUpstream`, `UpstreamUnreachable` | The gateway could not reach a server, so it sent nothing on. After redirects, the nodes it reached before refused the write as not their own to propose |
+| `LeaderNotFound` | The gateway found no node that leads the stream's group among its upstreams within three hops and 5 s, and every node it reached refused the write before proposing it. Writes go through once the group has a leader. If it persists, check that `--upstream` reaches every voter, by its peer URL where possible |
 
 [Refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing) lists every value. A commit fails with 7178 only when every attempt of it was refused this way. One attempt that got no answer, a `307`, or a `5xx` without both headers, poisons the file instead, because that attempt may have been applied.
 

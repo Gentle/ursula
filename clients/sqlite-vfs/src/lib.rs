@@ -84,8 +84,9 @@
 //!   db file's pages, fsyncs the WAL and the db file (a write-back error poisons the database, and
 //!   nothing is published), publishes the pages at the stream offset they reflect, reads the
 //!   snapshot back and only then advances the stream's retention to the *previous* snapshot's
-//!   offset. A publish or retention move refused with 402, like a commit refused before it reached
-//!   the stream, holds snapshots until the next acknowledged commit.
+//!   offset. A publish or retention move refused with 402 holds snapshots until the next
+//!   acknowledged commit, like a commit refused by a layer that refuses other writes too, and
+//!   unlike one refused as `too_large`.
 //!   Attach installs the latest snapshot when the local file is missing or behind it, then replays
 //!   the tail.
 //! * `SELECT ursula_status(path)` returns

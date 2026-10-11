@@ -82,9 +82,10 @@ pub(crate) struct Db {
     /// `poisoned`: a poisoned database needs a re-attach whatever the refusing layer does
     /// (`set_poisoned`).
     pub(crate) refused: Option<WriteRefusal>,
-    /// The latest refusal that a layer in front of the stream answered, set and cleared with
-    /// `refused`, except that a write the extension refused itself leaves it: what that layer does
-    /// now. `payment_required` follows it, and so does whether a snapshot may be taken
+    /// The latest refusal that a layer in front of the stream answered and that refuses other
+    /// writes too (`WriteRefusal::refuses_other_writes`), cleared with `refused`: what that layer
+    /// does now. A write the extension refused itself, or a 413 for one frame alone, leaves it.
+    /// `payment_required` follows it, and so does whether a snapshot may be taken
     /// (`snapshot_wanted`).
     pub(crate) layer_refused: Option<WriteRefusal>,
     /// The epoch and producer sequence of the latest commit refused before it reached the stream
@@ -171,18 +172,13 @@ impl Db {
 
     /// A snapshot is due and may be taken now: never while the database is poisoned, nor while
     /// writes are refused before they reach the stream by a layer that refuses other writes too
-    /// (`layer_refused`, `WriteRefusal::refuses_other_writes`): its publish would be refused too.
-    /// The next acknowledged commit clears the refusal and requests one if it is still due. A
-    /// commit frame too large to send holds no snapshot back: an owner that stops committing after
-    /// one still publishes, and retention still moves. Nor does it lift the hold of a layer that
-    /// refused before it.
+    /// (`layer_refused`): its publish would be refused too. The next acknowledged commit clears the
+    /// refusal and requests one if it is still due. A commit frame too large for one request,
+    /// never sent or refused with a 413 in front, holds no snapshot back: an owner that stops
+    /// committing after one still publishes, and retention still moves. Nor does it lift the hold
+    /// of a layer that refused before it.
     pub(crate) fn snapshot_wanted(&self) -> bool {
-        self.snapshot_due()
-            && self.poisoned.is_none()
-            && self
-                .layer_refused
-                .as_ref()
-                .is_none_or(|refusal| !refusal.refuses_other_writes())
+        self.snapshot_due() && self.poisoned.is_none() && self.layer_refused.is_none()
     }
 
     /// The log size past which a snapshot is due: the database's size, or the configured minimum
@@ -293,15 +289,18 @@ impl Db {
     }
 
     /// Records a write that a layer in front of the stream refused before it reached the stream
-    /// (`during`: which, for the log), as the latest refusal and as the layer's. A poisoned
-    /// database records none (a snapshot publish under way can be refused after the poison): see
-    /// `set_poisoned`.
+    /// (`during`: which, for the log), as the latest refusal, and as the layer's when it refuses
+    /// other writes too. A 413 for one frame alone leaves the refusal before it, and the snapshots
+    /// that one holds back, as they were. A poisoned database records none (a snapshot publish
+    /// under way can be refused after the poison): see `set_poisoned`.
     pub(crate) fn writes_refused(&mut self, refusal: WriteRefusal, during: &str) {
         if self.poisoned.is_some() {
             return;
         }
         self.log_refusal(&refusal, during);
-        self.layer_refused = Some(refusal.clone());
+        if refusal.refuses_other_writes() {
+            self.layer_refused = Some(refusal.clone());
+        }
         self.refused = Some(refusal);
     }
 
@@ -593,13 +592,23 @@ mod tests {
         }
         d.refuse_unsent(WriteRefusal::frame_over_limit(40 << 20, 32 << 20));
         assert!(d.refused.is_some() && d.snapshot_wanted(), "too_large");
-        d.refuse(WriteRefusal::TooLarge {
+        let in_front = WriteRefusal::TooLarge {
             bytes: 40 << 20,
             over: FrameLimit::InFront {
                 token: "RequestBodyTooLarge".into(),
             },
+        };
+        d.refuse(in_front.clone());
+        assert!(d.layer_refused.is_none() && d.snapshot_wanted(), "413");
+        // A 413 for one frame leaves a refusal of other writes before it, which still holds the
+        // snapshot back.
+        d.refuse(WriteRefusal::NotApplied {
+            status: 503,
+            reason: "RaftLogPressure".into(),
         });
-        assert!(d.layer_refused.is_some() && d.snapshot_wanted(), "413");
+        d.refuse(in_front.clone());
+        assert_eq!(d.refused, Some(in_front));
+        assert!(!d.snapshot_wanted(), "503, then a 413");
         d.poison(Error::ProducerExpiredAgain);
         assert!(!d.snapshot_wanted());
     }

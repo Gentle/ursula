@@ -132,7 +132,10 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   `refused_reason` report, but it leaves what a layer refused before it as it was (`layer_refused`):
   `payment_required` stays, and so does the hold on snapshots. Nor does it set or clear the check
   below that catches a false refusal at the next commit: the stream cannot hold a frame that was
-  never sent.
+  never sent. A frame too large to encode at all is refused unsent too. A vouched `413` from a
+  lower limit in front (`too_large` as well) refuses that frame alone, so it leaves
+  `layer_refused`, and with it `payment_required` and the hold on snapshots, as it was too. It was
+  an exchange, so it sets the check like any refusal a layer answered.
 - This holds only while no attempt of the append can have reached the stream. After an attempt whose
   outcome is unknown (no answer, a `307`, or a 5xx without a vouched marker) the append may be in
   the stream, and the next commit, sent with the same sequence, would be answered as its duplicate,
@@ -897,10 +900,12 @@ must say in its release notes to stop every owner of a stream before upgrading.
 - Units also cover commit frames too large for one request. A frame over the frame limit is never
   sent (the stand-in server receives nothing), and one at the limit is. A vouched 413 refuses a
   commit as `too_large`, and a 413 with one of the two headers or none is a rejection. The limit
-  setting stays between 64 KiB and 32 MiB. A transaction refused unsent leaves a layer's refusal,
-  `payment_required` and the sequence check as they were: a duplicate's answer to the next commit is
-  acknowledged, unless a layer refused a commit at that sequence before, and a due snapshot waits
-  only while a layer's refusal does.
+  setting stays between 64 KiB and 32 MiB. A frame too large to encode at all is refused unsent too,
+  and any other failure to encode one poisons. A transaction refused unsent leaves a layer's
+  refusal, `payment_required` and the sequence check as they were: a duplicate's answer to the next
+  commit is acknowledged, unless a layer refused a commit at that sequence before. A vouched 413
+  leaves a layer's earlier refusal as it was too, and a due snapshot waits only while a layer's
+  refusal that refuses other writes is recorded.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is

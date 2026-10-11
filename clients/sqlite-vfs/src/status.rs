@@ -243,7 +243,7 @@ mod tests {
         d.refuse_unsent(WriteRefusal::frame_over_limit(40 << 20, 32 << 20));
         shows(
             &d,
-            r#""payment_required":true,"payment_reason":"{\"detail\":\"quota\"}","writes_refused":true,"refused_kind":"too_large","refused_reason":"41943040 bytes over the 33554432-byte frame limit","#,
+            r#""payment_required":true,"payment_reason":"{\"detail\":\"quota\"}","writes_refused":true,"refused_kind":"too_large","refused_reason":"41943040-byte frame over the 33554432-byte frame limit","#,
         );
         d.writes_accepted();
         shows(

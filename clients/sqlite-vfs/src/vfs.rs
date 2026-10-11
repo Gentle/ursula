@@ -813,13 +813,17 @@ unsafe fn final_pages(
     Ok(pages)
 }
 
-/// What a commit whose frame could not be encoded does. One too large for a frame at all is never
-/// sent, so it fails alone, as one over the frame limit does (`client::append`). Any other failure
-/// poisons the database.
-fn unencodable(e: FrameError) -> Result<WriteRefusal, Error> {
+/// What a commit whose frame could not be encoded does, with the code its write fails with. One
+/// too large for a frame at all is never sent, so it fails alone through `Db::refuse_unsent`, as
+/// one over the frame limit does (`Append::Unsent` in `Db::append_commit`). Its size is the
+/// payload's bytes, or for more pages than a frame can count their number: either is over 4 GiB.
+/// Any other failure poisons the database.
+fn unencodable(db: &mut Db, e: FrameError) -> c_int {
     match e {
-        FrameError::TooLarge(bytes) => Ok(WriteRefusal::frame_over_limit(bytes, max_frame_bytes())),
-        other => Err(Error::EncodeFrame(other)),
+        FrameError::TooLarge(size) => {
+            db.refuse_unsent(WriteRefusal::frame_over_limit(size, max_frame_bytes()))
+        }
+        other => db.poison(Error::EncodeFrame(other)),
     }
 }
 
@@ -858,12 +862,7 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     }
     let (body, raw) = match frame::encode_commit(size, &pages) {
         Ok(encoded) => encoded,
-        Err(e) => {
-            return match unencodable(e) {
-                Ok(refusal) => db.refuse_unsent(refusal),
-                Err(e) => db.poison(e),
-            };
-        }
+        Err(e) => return unencodable(db, e),
     };
     let t = Instant::now();
     let attempts = match db.append_commit(&body) {
@@ -1528,17 +1527,34 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 8);
     }
 
-    // A commit frame too large to encode at all is refused unsent, as one over the frame limit is.
-    // Any other failure to encode one poisons.
+    // A commit frame too large to encode at all is refused unsent, as one over the frame limit is:
+    // it leaves a layer's refusal and the sequence check as they were. Any other failure to encode
+    // one poisons.
     #[test]
     fn an_unencodable_frame_too_large_is_refused_and_any_other_poisons() {
+        let mut d = owner("http://h/b/s".into());
+        // A layer refused a snapshot publish: a layer's refusal without the sequence check.
+        let payment = WriteRefusal::PaymentRequired {
+            body: "quota".into(),
+        };
+        d.writes_refused(payment.clone(), "snapshot publish");
+        assert_eq!(
+            unencodable(&mut d, FrameError::TooLarge(5 << 30)),
+            ffi::SQLITE_IOERR_AUTH
+        );
+        assert_eq!(
+            d.refused,
+            Some(WriteRefusal::frame_over_limit(5 << 30, max_frame_bytes()))
+        );
+        assert_eq!(d.layer_refused, Some(payment));
+        assert!(d.refused_at.is_none() && d.poisoned.is_none());
+        assert_eq!(
+            unencodable(&mut d, FrameError::UnknownRecord),
+            ffi::SQLITE_IOERR_WRITE
+        );
         assert!(matches!(
-            unencodable(FrameError::TooLarge(5 << 30)),
-            Ok(refusal) if refusal == WriteRefusal::frame_over_limit(5 << 30, max_frame_bytes())
-        ));
-        assert!(matches!(
-            unencodable(FrameError::UnknownRecord),
-            Err(Error::EncodeFrame(FrameError::UnknownRecord))
+            d.poisoned.as_ref().map(|p| &p.first),
+            Some(Error::EncodeFrame(FrameError::UnknownRecord))
         ));
     }
 

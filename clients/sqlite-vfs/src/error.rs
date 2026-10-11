@@ -415,8 +415,9 @@ impl WriteRefusal {
     }
 
     /// Whether the layer that refused this write refuses other writes too, a snapshot publish among
-    /// them (`Db::snapshot_wanted`). A refused token, a denial, rate limiting, a payment or write
-    /// pressure do. A frame too large for one request says nothing about any other write.
+    /// them: `Db::writes_refused` records it as `layer_refused` then, which holds snapshots back. A
+    /// refused token, a denial, rate limiting, a payment or write pressure do. A frame too large
+    /// for one request says nothing about any other write.
     pub(crate) fn refuses_other_writes(&self) -> bool {
         !matches!(self, WriteRefusal::TooLarge { .. })
     }
@@ -453,7 +454,7 @@ impl WriteRefusal {
                 over: FrameLimit::Extension { limit },
             } => {
                 return Some(Cow::Owned(format!(
-                    "{bytes} bytes over the {limit}-byte frame limit"
+                    "{bytes}-byte frame over the {limit}-byte frame limit"
                 )));
             }
         };
@@ -714,7 +715,7 @@ mod tests {
             (
                 WriteRefusal::frame_over_limit(40 << 20, 32 << 20),
                 "too_large",
-                Some("41943040 bytes over the 33554432-byte frame limit"),
+                Some("41943040-byte frame over the 33554432-byte frame limit"),
             ),
             (
                 WriteRefusal::TooLarge {

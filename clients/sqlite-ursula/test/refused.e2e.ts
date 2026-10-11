@@ -385,7 +385,7 @@ it("a transaction too large for one request fails alone without being sent, and 
 		fenced: false,
 		writes_refused: true,
 		refused_kind: "too_large",
-		refused_reason: expect.stringMatching(/^\d+ bytes over the 33554432-byte frame limit$/),
+		refused_reason: expect.stringMatching(/^\d+-byte frame over the 33554432-byte frame limit$/),
 		offset: accepted?.offset,
 		epoch: accepted?.epoch,
 	});
@@ -447,7 +447,7 @@ it("URSULA_VFS_MAX_FRAME_BYTES lowers the frame limit for a smaller limit in fro
 	expect(step(child, 3)?.status).toMatchObject({
 		poisoned: false,
 		refused_kind: "too_large",
-		refused_reason: expect.stringMatching(/^\d+ bytes over the 1048576-byte frame limit$/),
+		refused_reason: expect.stringMatching(/^\d+-byte frame over the 1048576-byte frame limit$/),
 	});
 	expect(step(child, 5)?.ok).toBe(true);
 	expect(done).toMatchObject({ poisoned: false, writes_refused: false });

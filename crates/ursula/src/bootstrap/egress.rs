@@ -12,6 +12,7 @@ use crate::bootstrap::health_gate::HealthTransition;
 use crate::bootstrap::health_gate::ShedCandidate;
 use crate::bootstrap::health_gate::TickHealth;
 use crate::bootstrap::health_gate::plan_shed_handoffs;
+use crate::bootstrap::participation::PeerParticipation;
 
 const DEFAULT_CLUSTER_PROBE_INTERVAL_MS: usize = 500;
 const DEFAULT_CLUSTER_PROBE_TIMEOUT_MS: usize = 200;
@@ -103,19 +104,23 @@ pub(crate) fn cluster_egress_probe_groups(
         .collect()
 }
 
-/// Config-driven cluster egress gate.
+/// Config-driven cluster egress gate. It probes `probe_peers` and, when it
+/// sheds, hands every leadership off at once to the peers in `participation`
+/// that may campaign.
 pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
-    node_id: u64,
-    peers: &[(u64, String)],
+    participation: &PeerParticipation,
+    probe_peers: &[(u64, String)],
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     cp_cfg: &ursula_config::ClusterProbeConfig,
 ) {
+    let node_id = participation.node_id();
     let interval_ms = cp_cfg.interval.as_duration().as_millis() as usize;
     if interval_ms == 0 {
         return;
     }
-    let initial_probe_groups = cluster_egress_probe_groups(node_id, peers, &per_group_voters, &[]);
+    let initial_probe_groups =
+        cluster_egress_probe_groups(node_id, probe_peers, &per_group_voters, &[]);
     if initial_probe_groups.is_empty() {
         return;
     }
@@ -124,7 +129,8 @@ pub fn spawn_egress_gate(
     let unhealthy_ticks = cp_cfg.unhealthy_ticks;
     let heal_ticks = cp_cfg.heal_ticks;
     let registry = registry.clone();
-    let peers = peers.to_vec();
+    let peers = probe_peers.to_vec();
+    let participation = participation.clone();
     tokio::spawn(async move {
         let interval = Duration::from_millis(
             u64::try_from(interval_ms)
@@ -184,14 +190,25 @@ pub fn spawn_egress_gate(
                     registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
                     // A node that cannot reach a quorum cannot replicate, so its
                     // leaderships stall where they are: hand them all off now.
+                    let may_campaign = participation.campaign_eligible_nodes(&registry).await;
                     let plan = plan_shed_handoffs(
                         &snaps,
                         node_id,
                         ShedCandidate::every_group_led_by(&snaps, node_id),
                         &[],
                         usize::MAX,
+                        &may_campaign,
                         |group, target| registry.check_handoff(group, target).is_ok(),
                     );
+                    if !plan.stranded.is_empty() {
+                        tracing::warn!(
+                            node_id,
+                            groups = ?plan.stranded,
+                            ?may_campaign,
+                            "cluster-egress: no peer that may campaign can take over these \
+                             leaderships"
+                        );
+                    }
                     for handoff in plan.handoffs {
                         if let Err(err) = registry
                             .transfer_leader(RaftGroupId(handoff.group_id), handoff.target)

@@ -9,6 +9,7 @@ use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
 use crate::bootstrap::health_gate::LeadershipShed;
 use crate::bootstrap::health_gate::TickHealth;
+use crate::bootstrap::participation::PeerParticipation;
 
 /// M4 — cold-health leadership gate. Two signals declare this node
 /// "cold-impaired":
@@ -21,10 +22,10 @@ use crate::bootstrap::health_gate::TickHealth;
 ///
 /// Either condition sustained for `unhealthy_ticks` ticks triggers a soft
 /// shed: the node hands off the groups it leads, a few per tick and the
-/// hottest first, but it stays campaign-eligible. Cold-health is often cluster-wide during backlog;
-/// disabling elections on every hot peer can freeze leadership movement. The
-/// node heals when error growth stops AND hot_max drops below HOT_LOW for
-/// `heal_ticks` ticks.
+/// hottest first, to peers that may campaign, but it stays campaign-eligible.
+/// Cold-health is often cluster-wide during backlog; disabling elections on
+/// every hot peer can freeze leadership movement. The node heals when error
+/// growth stops AND hot_max drops below HOT_LOW for `heal_ticks` ticks.
 ///
 /// Why this matters: ColdBackpressure 503 is a per-write reactive gate —
 /// once hot pegs at cap, the leader keeps accepting writes that immediately
@@ -116,7 +117,7 @@ impl ColdHealthTracker {
 pub fn spawn_cold_health_gate(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
-    node_id: u64,
+    participation: &PeerParticipation,
     ch_cfg: &ursula_config::ColdHealthConfig,
 ) {
     let interval_ms = ch_cfg.interval.as_duration().as_millis() as usize;
@@ -130,6 +131,8 @@ pub fn spawn_cold_health_gate(
     let errors_per_tick_high = u64::try_from(ch_cfg.errors_per_tick_high).unwrap_or(1);
     let metrics = runtime.metrics();
     let registry = registry.clone();
+    let participation = participation.clone();
+    let node_id = participation.node_id();
     tokio::spawn(async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(2_000));
         let mut tracker = ColdHealthTracker::new(
@@ -158,7 +161,9 @@ pub fn spawn_cold_health_gate(
                 ColdHealthDecision::NoChange => {}
             }
             if shed.is_draining() {
-                shed.step(&snap.per_group_cold_hot_bytes).await;
+                let may_campaign = participation.campaign_eligible_nodes(&registry).await;
+                shed.step(&may_campaign, &snap.per_group_cold_hot_bytes)
+                    .await;
             }
         }
     });

@@ -19,6 +19,7 @@ use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
 use crate::bootstrap::health_gate::LeadershipShed;
 use crate::bootstrap::health_gate::TickHealth;
+use crate::bootstrap::participation::PeerParticipation;
 
 /// What one tick of the snapshot-store gate read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,19 +237,20 @@ impl Drop for StoreHealthGate {
 /// store within `config.probe_timeout`, and reads the node's failed and
 /// successful cold-flush writes. After `config.unhealthy_ticks` bad ticks
 /// with no good tick between them the node stops campaigning and hands its
-/// leaderships off a few per tick, hottest first. After `config.heal_ticks`
-/// good ticks in a row it may lead again.
+/// leaderships off a few per tick, hottest first, to the peers that may
+/// campaign. After `config.heal_ticks` good ticks in a row it may lead again.
 pub(crate) fn spawn_store_health_gate(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     snapshot_store: SharedSnapshotStore,
-    node_id: u64,
+    participation: PeerParticipation,
     config: StoreGateConfig,
 ) -> StoreHealthGate {
     let metrics = runtime.metrics();
     let registry = registry.clone();
     let (verdicts, latest_bad) = watch::channel(false);
     let task = tokio::spawn(async move {
+        let node_id = participation.node_id();
         let mut tracker = StoreHealthTracker::new(
             config.unhealthy_ticks,
             config.heal_ticks,
@@ -304,7 +306,9 @@ pub(crate) fn spawn_store_health_gate(
                 HealthTransition::Hold => {}
             }
             if shed.is_draining() {
-                shed.step(&snap.per_group_cold_hot_bytes).await;
+                let may_campaign = participation.campaign_eligible_nodes(&registry).await;
+                shed.step(&may_campaign, &snap.per_group_cold_hot_bytes)
+                    .await;
             }
             tokio::time::sleep(config.interval.saturating_sub(tick_started.elapsed())).await;
         }
@@ -345,6 +349,7 @@ mod tests {
     use super::spawn_store_health_gate;
     use crate::bootstrap::health_gate::HealthTransition;
     use crate::bootstrap::health_gate::TickHealth;
+    use crate::bootstrap::participation::PeerParticipation;
     use crate::bootstrap::snapshot::StoreGateInputs;
 
     /// The snapshot driver's default interval with an external store.
@@ -730,6 +735,10 @@ mod tests {
         ShardRuntime::spawn(config).expect("runtime")
     }
 
+    fn no_peers() -> PeerParticipation {
+        PeerParticipation::new(1, &[], reqwest::Client::new())
+    }
+
     /// Runs the snapshot driver, with `s3` as `[storage.cold.s3]`, against
     /// `store` until it has been probed `probes` times.
     async fn drive_with(
@@ -739,14 +748,15 @@ mod tests {
         probes: usize,
     ) -> Vec<bool> {
         let runtime = hosted_runtime();
+        let participation = no_peers();
         crate::bootstrap::snapshot::spawn_snapshot_driver(
             &runtime,
             registry,
-            1,
             Some(store.clone()),
             StoreGateInputs {
                 s3,
                 cold_flush_interval: FLUSH_INTERVAL,
+                participation: &participation,
             },
             5_000,
             SnapshotCadence::new(1 << 30, 1, 100_000),
@@ -837,7 +847,7 @@ mod tests {
             &runtime,
             &registry,
             store.clone(),
-            1,
+            no_peers(),
             StoreGateConfig::new(&ursula_config::S3Config::default(), FLUSH_INTERVAL, TICK),
         );
         assert!(!gate.latest_bad().unwrap(), "no tick yet");

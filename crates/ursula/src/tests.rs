@@ -6415,13 +6415,14 @@ mod cluster_egress {
     use ursula_shard::RaftGroupId;
 
     use crate::bootstrap::ClusterEgressProbeScope;
+    use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ShedCandidate;
     use crate::bootstrap::ShedHandoff;
     use crate::bootstrap::cluster_egress_probe_groups;
     use crate::bootstrap::plan_shed_handoffs;
 
-    /// The egress gate's plan: every group `node_id` leads, to any voter
-    /// that `can_take_over` accepts.
+    /// The egress gate's plan: every group `node_id` leads, to any voter that
+    /// may campaign and that `can_take_over` accepts.
     fn plan_egress_shed(
         snaps: &[RaftGroupMetricsSnapshot],
         node_id: u64,
@@ -6433,6 +6434,7 @@ mod cluster_egress {
             ShedCandidate::every_group_led_by(snaps, node_id),
             &[],
             usize::MAX,
+            &std::collections::HashSet::from([1, 2, 3, 4]),
             can_take_over,
         )
     }
@@ -6592,7 +6594,7 @@ mod cluster_egress {
 
         crate::bootstrap::spawn_egress_gate(
             &registry,
-            1,
+            &PeerParticipation::new(1, &peers, reqwest::Client::new()),
             &peers,
             per_group_voters,
             &ursula_config::UrsulaConfig::default()

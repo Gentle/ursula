@@ -15,6 +15,7 @@ mod egress;
 mod format_epoch;
 mod health_gate;
 mod leadership;
+mod participation;
 mod runtime;
 mod snapshot;
 mod store_health;
@@ -51,6 +52,7 @@ mod test_reexports {
     pub(crate) use super::health_gate::plan_shed_handoffs;
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
+    pub(crate) use super::participation::PeerParticipation;
     pub(crate) use super::snapshot::group_log_progress;
     pub(crate) use super::snapshot::plan_snapshot_drive;
     pub(crate) use super::snapshot::resolve_snapshot_drive_interval_ms;

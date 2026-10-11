@@ -11,6 +11,7 @@ use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_shard::RaftGroupId;
 
+use crate::bootstrap::participation::PeerParticipation;
 use crate::bootstrap::store_health::StoreGateConfig;
 use crate::bootstrap::store_health::spawn_store_health_gate;
 
@@ -194,6 +195,8 @@ pub(crate) struct StoreGateInputs<'a> {
     /// `storage.cold.flush_interval`, the flush worker's pause between
     /// passes, which the gate's flush window spans.
     pub cold_flush_interval: Duration,
+    /// The node's peers, which take over the leaderships the gate sheds.
+    pub participation: &'a PeerParticipation,
 }
 
 /// Config-driven snapshot driver. Reads parameters from typed config.
@@ -206,7 +209,6 @@ pub(crate) struct StoreGateInputs<'a> {
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
-    node_id: u64,
     snapshot_store: Option<SharedSnapshotStore>,
     store_gate: StoreGateInputs<'_>,
     interval_ms: usize,
@@ -224,7 +226,7 @@ pub fn spawn_snapshot_driver(
             runtime,
             registry,
             store,
-            node_id,
+            store_gate.participation.clone(),
             StoreGateConfig::new(
                 store_gate.s3.unwrap_or(&default_s3),
                 store_gate.cold_flush_interval,

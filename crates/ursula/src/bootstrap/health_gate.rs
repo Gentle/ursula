@@ -7,6 +7,7 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 
 // `tokio::time::Instant` so the drain's deadlines follow tokio's clock, which
@@ -24,6 +25,10 @@ use crate::bootstrap::util::leader_counts;
 /// time rather than all at once (#508). The cap is per gate: two gates that
 /// shed at once drain independently.
 const SHED_HANDOFFS_PER_TICK: usize = 4;
+
+/// How often a pending leadership that no peer can take over is reported
+/// again.
+const STRANDED_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What one tick of a health gate observed. Ordered from healthy to failing,
 /// so the verdict of several signals is the maximum of theirs.
@@ -188,8 +193,9 @@ pub(crate) struct ShedPlan {
 
 /// Plans at most `limit` handoffs of `candidates`, the groups `node_id`
 /// leads that it may hand off, in the order given. A target must be another
-/// voter of the group that `can_take_over` accepts (the registry's handoff
-/// check). Of those, each
+/// voter of the group that may campaign (`may_campaign`, from
+/// [`crate::bootstrap::participation::PeerParticipation`]) and that
+/// `can_take_over` accepts (the registry's handoff check). Of those, each
 /// handoff goes to the one that leads the fewest groups, counting the
 /// `in_flight` handoffs that have not moved yet and the ones planned before
 /// it, so the handoffs spread over the peers. A candidate's `avoid` target is
@@ -201,6 +207,7 @@ pub(crate) fn plan_shed_handoffs(
     candidates: impl IntoIterator<Item = ShedCandidate>,
     in_flight: &[ShedHandoff],
     limit: usize,
+    may_campaign: &HashSet<u64>,
     can_take_over: impl Fn(RaftGroupId, u64) -> bool,
 ) -> ShedPlan {
     let by_group: HashMap<u32, &RaftGroupMetricsSnapshot> = snaps
@@ -233,7 +240,9 @@ pub(crate) fn plan_shed_handoffs(
             .voter_ids
             .iter()
             .copied()
-            .filter(|voter| *voter != node_id && can_take_over(group, *voter))
+            .filter(|voter| {
+                *voter != node_id && may_campaign.contains(voter) && can_take_over(group, *voter)
+            })
             .collect();
         let preferred = qualifying
             .iter()
@@ -344,6 +353,7 @@ impl ShedDrain {
         now: Instant,
         limit: usize,
         heat: &[u64],
+        may_campaign: &HashSet<u64>,
         can_take_over: impl Fn(RaftGroupId, u64) -> bool,
     ) -> DrainTick {
         let leaders: HashMap<u32, Option<u64>> = snaps
@@ -408,7 +418,15 @@ impl ShedDrain {
                 Pending::Queued { .. } => None,
             })
             .collect();
-        let plan = plan_shed_handoffs(snaps, node_id, candidates, &in_flight, limit, can_take_over);
+        let plan = plan_shed_handoffs(
+            snaps,
+            node_id,
+            candidates,
+            &in_flight,
+            limit,
+            may_campaign,
+            can_take_over,
+        );
         DrainTick {
             moved,
             stalled,
@@ -475,6 +493,8 @@ pub(crate) struct LeadershipShed {
     reason: LeadershipShedReason,
     node_id: u64,
     drain: ShedDrain,
+    /// When each stranded group was last reported.
+    stranded_reported: BTreeMap<u32, Instant>,
 }
 
 impl LeadershipShed {
@@ -488,6 +508,7 @@ impl LeadershipShed {
             reason,
             node_id,
             drain: ShedDrain::default(),
+            stranded_reported: BTreeMap::new(),
         }
     }
 
@@ -495,6 +516,7 @@ impl LeadershipShed {
     pub(crate) fn begin(&mut self) {
         self.registry.mark_leadership_shed(self.reason);
         self.drain = ShedDrain::of_groups_led_by(&self.registry.metrics_snapshot(), self.node_id);
+        self.stranded_reported.clear();
         tracing::warn!(
             reason = %self.reason,
             node_id = self.node_id,
@@ -507,21 +529,23 @@ impl LeadershipShed {
     pub(crate) fn end(&mut self) {
         self.registry.clear_leadership_shed(self.reason);
         self.drain = ShedDrain::default();
+        self.stranded_reported.clear();
     }
 
-    /// Whether leaderships are left to hand off.
+    /// Whether leaderships are left to hand off. A gate asks its peers which
+    /// of them may campaign only while they are.
     pub(crate) fn is_draining(&self) -> bool {
         !self.drain.is_empty()
     }
 
     /// Hands off this tick's share of the pending leaderships: at most
     /// [`SHED_HANDOFFS_PER_TICK`] new submissions, the hottest group first
-    /// (`heat` holds the node's hot bytes by group id), each to a voter that
-    /// the registry's handoff check accepts. A submitted
+    /// (`heat` holds the node's hot bytes by group id), each to a voter in
+    /// `may_campaign` that the registry's handoff check accepts. A submitted
     /// handoff stays pending until another node leads the group, and is
     /// submitted again if this node still leads it after Raft gave up on
     /// the transfer.
-    pub(crate) async fn step(&mut self, heat: &[u64]) -> ShedStep {
+    pub(crate) async fn step(&mut self, may_campaign: &HashSet<u64>, heat: &[u64]) -> ShedStep {
         let now = Instant::now();
         let snaps = self.registry.metrics_snapshot();
         let registry = &self.registry;
@@ -531,6 +555,7 @@ impl LeadershipShed {
             now,
             SHED_HANDOFFS_PER_TICK,
             heat,
+            may_campaign,
             |group, target| registry.check_handoff(group, target).is_ok(),
         );
         for handoff in &tick.stalled {
@@ -583,6 +608,7 @@ impl LeadershipShed {
                 }
             }
         }
+        self.report_stranded(&step.stranded, may_campaign, now);
         if step.changed() {
             let still_led = self.drain.still_led(&snaps, self.node_id);
             if self.drain.is_empty() {
@@ -605,6 +631,29 @@ impl LeadershipShed {
         }
         step
     }
+
+    /// Reports each stranded group once per [`STRANDED_REPORT_INTERVAL`].
+    fn report_stranded(&mut self, stranded: &[u32], may_campaign: &HashSet<u64>, now: Instant) {
+        let drain = &self.drain;
+        self.stranded_reported
+            .retain(|group_id, _| drain.contains(*group_id));
+        for group_id in stranded {
+            let due = self.stranded_reported.get(group_id).is_none_or(|reported| {
+                now.saturating_duration_since(*reported) >= STRANDED_REPORT_INTERVAL
+            });
+            if due {
+                self.stranded_reported.insert(*group_id, now);
+                tracing::warn!(
+                    reason = %self.reason,
+                    node_id = self.node_id,
+                    raft_group_id = *group_id,
+                    ?may_campaign,
+                    "leadership-shed: no peer that may campaign can take over this leadership \
+                     now; it stays pending"
+                );
+            }
+        }
+    }
 }
 
 impl Drop for LeadershipShed {
@@ -615,6 +664,7 @@ impl Drop for LeadershipShed {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use proptest::prelude::ProptestConfig;
@@ -663,6 +713,10 @@ mod tests {
         }
     }
 
+    fn every_node() -> HashSet<u64> {
+        HashSet::from([1, 2, 3])
+    }
+
     fn handoff(group_id: u32, target: u64) -> ShedHandoff {
         ShedHandoff { group_id, target }
     }
@@ -680,7 +734,15 @@ mod tests {
         now: Instant,
         heat: &[u64],
     ) -> DrainTick {
-        drain.tick(snaps, ME, now, SHED_HANDOFFS_PER_TICK, heat, |_, _| true)
+        drain.tick(
+            snaps,
+            ME,
+            now,
+            SHED_HANDOFFS_PER_TICK,
+            heat,
+            &every_node(),
+            |_, _| true,
+        )
     }
 
     /// Submits every planned handoff at `now`.
@@ -853,7 +915,7 @@ mod tests {
             group_id,
             avoid: None,
         });
-        let plan = plan_shed_handoffs(&snaps, ME, candidates, &[], 3, |_, _| true);
+        let plan = plan_shed_handoffs(&snaps, ME, candidates, &[], 3, &every_node(), |_, _| true);
         assert_eq!(plan.handoffs, vec![
             handoff(5, 2),
             handoff(0, 3),
@@ -871,6 +933,7 @@ mod tests {
             ShedCandidate::every_group_led_by(&snaps, ME),
             &[],
             SHED_HANDOFFS_PER_TICK,
+            &every_node(),
             |group, _| group.0 != 0,
         );
         assert_eq!(plan.handoffs, vec![
@@ -879,6 +942,42 @@ mod tests {
             handoff(3, 2)
         ]);
         assert_eq!(plan.stranded, vec![0]);
+    }
+
+    #[test]
+    fn handoffs_go_only_to_peers_that_may_campaign() {
+        // Node 3 leads nothing, so it would win every pick, but it may not
+        // campaign (it is draining, gated or shedding for a hard reason) and
+        // would refuse each transfer without telling the leader.
+        let mut snaps: Vec<_> = (0..6).map(|group| snap(group, Some(ME))).collect();
+        snaps.extend((6..9).map(|group| snap(group, Some(2))));
+        let plan = plan_shed_handoffs(
+            &snaps,
+            ME,
+            ShedCandidate::every_group_led_by(&snaps, ME),
+            &[],
+            usize::MAX,
+            &HashSet::from([1, 2]),
+            |_, _| true,
+        );
+        assert_eq!(plan.handoffs.len(), 6);
+        assert!(
+            plan.handoffs.iter().all(|handoff| handoff.target == 2),
+            "{plan:?}"
+        );
+
+        // With no peer that may campaign, every group stays pending.
+        let plan = plan_shed_handoffs(
+            &snaps,
+            ME,
+            ShedCandidate::every_group_led_by(&snaps, ME),
+            &[],
+            usize::MAX,
+            &HashSet::from([1]),
+            |_, _| true,
+        );
+        assert!(plan.handoffs.is_empty());
+        assert_eq!(plan.stranded, (0..6).collect::<Vec<_>>());
     }
 
     #[test]
@@ -893,6 +992,7 @@ mod tests {
             }),
             &[handoff(0, 2), handoff(1, 2)],
             usize::MAX,
+            &every_node(),
             |_, _| true,
         );
         assert_eq!(plan.handoffs, vec![handoff(2, 3), handoff(3, 3)]);
@@ -995,7 +1095,8 @@ mod tests {
             at(start, 16),
             SHED_HANDOFFS_PER_TICK,
             &[],
-            |_, target| target == 3,
+            &HashSet::from([1, 3]),
+            |_, _| true,
         );
         assert_eq!(only_three.stalled, vec![handoff(0, 3)]);
         assert_eq!(only_three.plan.handoffs, vec![handoff(0, 3)]);
@@ -1063,6 +1164,7 @@ mod tests {
             start,
             SHED_HANDOFFS_PER_TICK,
             &[],
+            &every_node(),
             |group, _| group.0 != 1,
         );
         assert_eq!(first.plan.handoffs, vec![handoff(0, 3)]);

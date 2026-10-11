@@ -6,6 +6,8 @@ use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_shard::RaftGroupId;
 
+use crate::bootstrap::participation::PeerParticipation;
+
 /// M1 — leadership balancing. Spreads raft-group leadership evenly across
 /// nodes so a single node's failure or network impairment can stall at most
 /// its `ceil(groups / nodes)` share rather than the whole cluster (leadership
@@ -15,58 +17,21 @@ use ursula_shard::RaftGroupId;
 /// `current_leader` is globally agreed, so every node computes the same
 /// distribution and converges. One transfer per tick keeps convergence gentle
 /// and avoids thundering-herd handoffs. Before planning a handoff, M1 asks
-/// peers for their leadership-shed policy state and only targets nodes whose
-/// policy says they may campaign. That prevents balancing into a hard-yielded
-/// peer that cannot safely lead. Cold-health remains campaign-eligible because
-/// it is a cluster-wide pressure signal under backlog: excluding every hot
-/// peer can deadlock leadership movement. A planned handoff fires only when
-/// the registry's handoff policy accepts the target (it answered recently,
-/// holds every committed entry and did not lose its log); otherwise the
-/// group is retried on a later tick.
+/// peers for their leadership-shed policy state
+/// ([`PeerParticipation::campaign_eligible_nodes`]) and only targets nodes
+/// whose policy says they may campaign. That prevents balancing into a
+/// hard-yielded peer that cannot safely lead. Cold-health remains
+/// campaign-eligible because it is a cluster-wide pressure signal under
+/// backlog: excluding every hot peer can deadlock leadership movement. A
+/// planned handoff fires only when the registry's handoff policy accepts the
+/// target (it answered recently, holds every committed entry and did not lose
+/// its log); otherwise the group is retried on a later tick.
 /// One planned leader handoff for the M1 balancer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LeadershipBalanceAction {
     pub group_id: u32,
     pub target: u64,
     pub fair: usize,
-}
-
-use ursula_proto::admin::LeadershipShedStatus;
-
-async fn leadership_balance_eligible_nodes(
-    registry: &RaftGroupHandleRegistry,
-    node_id: u64,
-    peers: &[(u64, String)],
-    client: &reqwest::Client,
-) -> HashSet<u64> {
-    let mut eligible = HashSet::new();
-    if registry.participation_status().should_campaign {
-        eligible.insert(node_id);
-    }
-
-    for (peer_id, peer_url) in peers {
-        if *peer_id == node_id {
-            continue;
-        }
-        let url = format!("{peer_url}{}", crate::LEADERSHIP_SHED_PATH);
-        let Ok(response) = client.get(url).send().await else {
-            continue;
-        };
-        if !response.status().is_success() {
-            continue;
-        }
-        let Ok(body) = response.text().await else {
-            continue;
-        };
-        let Ok(status) = serde_json::from_str::<LeadershipShedStatus>(&body) else {
-            continue;
-        };
-        if status.should_campaign {
-            eligible.insert(*peer_id);
-        }
-    }
-
-    eligible
 }
 
 /// Plan the leader handoffs this tick should attempt. Pure function — split
@@ -195,11 +160,11 @@ pub(crate) async fn handoff_shutdown_leadership(
     if remaining_leaders() == 0 {
         return 0;
     }
-    let client = match reqwest::Client::builder()
+    let participation = match reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()
     {
-        Ok(client) => client,
+        Ok(client) => PeerParticipation::new(node_id, peers, client),
         Err(err) => {
             tracing::warn!(%err, "shutdown: cannot discover eligible leadership targets");
             return remaining_leaders();
@@ -219,7 +184,7 @@ pub(crate) async fn handoff_shutdown_leadership(
         if remaining == 0 {
             return 0;
         }
-        let eligible = leadership_balance_eligible_nodes(registry, node_id, peers, &client).await;
+        let eligible = participation.campaign_eligible_nodes(registry).await;
         let counts = crate::bootstrap::util::leader_counts(&snapshots);
         for snapshot in snapshots {
             if snapshot.current_leader != Some(node_id)
@@ -258,8 +223,7 @@ pub(crate) async fn handoff_shutdown_leadership(
 /// Config-driven leadership balancer.
 pub fn spawn_leadership_balancer(
     registry: &RaftGroupHandleRegistry,
-    node_id: u64,
-    peers: &[(u64, String)],
+    participation: &PeerParticipation,
     lb_cfg: &ursula_config::LeadershipBalanceConfig,
 ) {
     let interval_ms = lb_cfg.interval.as_duration().as_millis() as usize;
@@ -267,31 +231,17 @@ pub fn spawn_leadership_balancer(
         return;
     }
     let max_per_tick = lb_cfg.max_per_tick;
-    let peer_timeout_ms = lb_cfg.peer_timeout.as_duration().as_millis() as usize;
     let registry = registry.clone();
-    let peers: Vec<(u64, String)> = peers.to_vec();
+    let participation = participation.clone();
     tokio::spawn(async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(5_000));
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_millis(
-                u64::try_from(peer_timeout_ms).unwrap_or(500),
-            ))
-            .build()
-        {
-            Ok(client) => client,
-            Err(err) => {
-                tracing::error!("leadership-balance: failed to build peer-status client: {err}");
-                return;
-            }
-        };
         loop {
             tokio::time::sleep(interval).await;
             let snaps = registry.metrics_snapshot();
             let Some(my_id) = snaps.first().map(|snap| snap.node_id) else {
                 continue;
             };
-            let eligible_nodes =
-                leadership_balance_eligible_nodes(&registry, node_id, &peers, &client).await;
+            let eligible_nodes = participation.campaign_eligible_nodes(&registry).await;
             let actions = plan_leadership_balance_with_eligible_nodes(
                 &snaps,
                 my_id,

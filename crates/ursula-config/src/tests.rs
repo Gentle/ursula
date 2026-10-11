@@ -845,4 +845,101 @@ kms_key_id = "arn:aws:kms:us-east-1:111122223333:key/test"
             Some("arn:aws:kms:us-east-1:111122223333:key/test")
         );
     }
+
+    #[test]
+    fn s3_health_gate_rides_out_one_failed_probe_by_default_and_keeps_explicit_keys() {
+        use std::time::Duration;
+
+        use crate::config::UrsulaConfig;
+        let defaults: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+"#,
+        )
+        .expect("valid config");
+        let s3 = defaults.storage.cold.s3.expect("s3 config");
+        assert_eq!(s3.probe_timeout.as_duration(), Duration::from_secs(5));
+        assert_eq!(s3.unhealthy_ticks, 3);
+        assert_eq!(s3.heal_ticks, 2);
+
+        // A config written for the earlier defaults keeps them.
+        let explicit: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+probe_timeout = "2s"
+unhealthy_ticks = 1
+heal_ticks = 4
+"#,
+        )
+        .expect("valid config");
+        let s3 = explicit.storage.cold.s3.expect("s3 config");
+        assert_eq!(s3.probe_timeout.as_duration(), Duration::from_secs(2));
+        assert_eq!(s3.unhealthy_ticks, 1);
+        assert_eq!(s3.heal_ticks, 4);
+    }
+
+    #[test]
+    fn a_zero_leadership_balance_peer_timeout_fails_to_load() {
+        use crate::validate::ValidationError;
+
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[governance.leadership_balance]
+peer_timeout = "0s"
+"#,
+        );
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Validation(ValidationError::ZeroPeerTimeout)
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_s3_health_gate_setting_fails_to_load() {
+        use crate::validate::S3HealthSetting;
+        use crate::validate::ValidationError;
+
+        for (key, value, expected) in [
+            ("probe_timeout", r#""0s""#, S3HealthSetting::ProbeTimeout),
+            ("unhealthy_ticks", "0", S3HealthSetting::UnhealthyTicks),
+            ("heal_ticks", "0", S3HealthSetting::HealTicks),
+        ] {
+            let tmp = temp_config(
+                ".toml",
+                &format!(
+                    r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+{key} = {value}
+"#
+                ),
+            );
+            let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::ConfigError::Validation(ValidationError::ZeroS3HealthSetting {
+                        setting
+                    }) if setting == expected
+                ),
+                "{key}: {err}"
+            );
+        }
+    }
 }

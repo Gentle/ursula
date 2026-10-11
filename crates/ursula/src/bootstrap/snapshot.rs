@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::SnapshotBuildCoordinator;
@@ -10,8 +9,11 @@ use ursula_raft::snapshot_cadence::SnapshotCadence;
 use ursula_raft::snapshot_cadence::SnapshotPlan;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
-use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
+
+use crate::bootstrap::participation::PeerParticipation;
+use crate::bootstrap::store_health::StoreGateConfig;
+use crate::bootstrap::store_health::spawn_store_health_gate;
 
 /// Longest the driver waits for a build permit (the previous build to finish)
 /// before it ends the tick.
@@ -86,15 +88,17 @@ async fn trigger_snapshot_build(
 
 /// Whether this tick triggers snapshot builds.
 ///
-/// A bad tick (store probe failed, or new cold-flush write errors) holds
-/// routine snapshots back so the driver does not push uploads into a failing
-/// store. Not once the log is over the pressure watermark: a build whose
-/// upload, verification or reference publication fails falls back to an
-/// inline snapshot, which still truncates the log, so nothing a snapshot needs
-/// depends on the store. Holding builds back there would grow the log into
-/// the node-wide 503 write gate while the store is merely throttling.
-fn should_drive_snapshots(bad_tick: bool, log_pressure: bool) -> bool {
-    !bad_tick || log_pressure
+/// While the store health gate's latest tick was bad (the probe failed, or a
+/// cold-flush write failed within the gate's flush window and none succeeded
+/// since), routine snapshots are held back so the driver does not push
+/// uploads into a failing store. Not once the log is over the pressure
+/// watermark: a build whose upload, verification or reference publication
+/// fails falls back to an inline snapshot, which still truncates the log, so
+/// nothing a snapshot needs depends on the store. Holding builds back there
+/// would grow the log into the node-wide 503 write gate while the store is
+/// merely throttling.
+fn should_drive_snapshots(store_trouble: bool, log_pressure: bool) -> bool {
+    !store_trouble || log_pressure
 }
 
 /// Keeps the coordinator's log-pressure flag (read by HTTP admission) in step
@@ -125,8 +129,9 @@ fn spawn_log_pressure_monitor(coordinator: SnapshotBuildCoordinator, cadence: &S
 }
 
 /// Default driver interval: 5 s with an external snapshot store, whose
-/// health the driver probes every tick, and 1 s inline. `Some(0)` disables
-/// the driver, and OpenRaft's entry-count policy runs instead.
+/// health gate ticks on the same interval, and 1 s inline. `Some(0)`
+/// disables the driver and the store health gate, and OpenRaft's entry-count
+/// policy runs instead.
 pub(crate) fn resolve_snapshot_drive_interval_ms(
     configured: Option<usize>,
     snapshot_store_configured: bool,
@@ -182,12 +187,30 @@ pub(crate) fn plan_snapshot_drive<'a>(
     (plan, selected)
 }
 
+/// What the snapshot driver hands its snapshot-store health gate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreGateInputs<'a> {
+    /// `[storage.cold.s3]`, or `None` for its defaults.
+    pub s3: Option<&'a ursula_config::S3Config>,
+    /// `storage.cold.flush_interval`, the flush worker's pause between
+    /// passes, which the gate's flush window spans.
+    pub cold_flush_interval: Duration,
+    /// The node's peers, which take over the leaderships the gate sheds.
+    pub participation: &'a PeerParticipation,
+}
+
 /// Config-driven snapshot driver. Reads parameters from typed config.
+///
+/// With an external snapshot store it also spawns the store health gate
+/// ([`spawn_store_health_gate`]) on the same interval, and owns it: the gate
+/// stops when the driver does. Only an external store is probed: inline
+/// snapshots depend on nothing outside the node, so the inline driver never
+/// sheds leadership. A drive interval of 0 turns both off.
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     snapshot_store: Option<SharedSnapshotStore>,
-    s3_cfg: Option<&ursula_config::S3Config>,
+    store_gate: StoreGateInputs<'_>,
     interval_ms: usize,
     cadence: SnapshotCadence,
     wal_lagging: Option<std::sync::Arc<ursula_raft::LaggingGroups>>,
@@ -196,84 +219,41 @@ pub fn spawn_snapshot_driver(
     if interval_ms == 0 {
         return;
     }
-    // Only an external store is probed; inline snapshots depend on nothing
-    // outside the node, so the inline driver never sheds leadership.
-    let external_store = snapshot_store.is_some();
-    let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
-    let probe_timeout = Duration::from_millis(
-        s3_cfg
-            .map(|c| c.probe_timeout.as_duration().as_millis() as u64)
-            .unwrap_or(2_000),
-    );
-    let unhealthy_ticks = s3_cfg.map(|c| c.unhealthy_ticks).unwrap_or(1).max(1);
-    let heal_ticks = s3_cfg.map(|c| c.heal_ticks).unwrap_or(2).max(1);
+    let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
+    let mut gate = snapshot_store.map(|store| {
+        let default_s3 = ursula_config::S3Config::default();
+        spawn_store_health_gate(
+            runtime,
+            registry,
+            store,
+            store_gate.participation.clone(),
+            StoreGateConfig::new(
+                store_gate.s3.unwrap_or(&default_s3),
+                store_gate.cold_flush_interval,
+                interval,
+            ),
+        )
+    });
     let runtime = runtime.clone();
     let registry = registry.clone();
     let coordinator = registry.snapshot_build_coordinator();
     spawn_log_pressure_monitor(coordinator.clone(), &cadence);
     tokio::spawn(async move {
-        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
-        let mut consecutive_bad = 0usize;
-        let mut consecutive_good = 0usize;
-        let mut yielded = false;
-        let mut last_flush_errors = runtime.metrics().snapshot().cold_flush_write_errors;
         loop {
             let snaps = registry.metrics_snapshot();
-            let bad_tick = if external_store {
-                let probe_healthy = matches!(
-                    tokio::time::timeout(probe_timeout, snapshot_store.health_check()).await,
-                    Ok(Ok(()))
-                );
-                let flush_errors_now = runtime.metrics().snapshot().cold_flush_write_errors;
-                let flush_failing = flush_errors_now > last_flush_errors;
-                last_flush_errors = flush_errors_now;
-                !probe_healthy || flush_failing
-            } else {
-                false
-            };
-            if bad_tick {
-                consecutive_bad = consecutive_bad.saturating_add(1);
-                consecutive_good = 0;
-            } else {
-                consecutive_bad = 0;
-                consecutive_good = consecutive_good.saturating_add(1);
-            }
-
-            if !yielded && consecutive_bad >= unhealthy_ticks {
-                yielded = true;
-                registry.mark_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
-                for snapshot in &snaps {
-                    if snapshot.current_leader == Some(snapshot.node_id)
-                        && let Some(target) = snapshot.voter_ids.iter().copied().find(|voter| {
-                            *voter != snapshot.node_id
-                                && registry
-                                    .check_handoff(RaftGroupId(snapshot.raft_group_id), *voter)
-                                    .is_ok()
-                        })
-                    {
-                        match registry
-                            .transfer_leader(RaftGroupId(snapshot.raft_group_id), target)
-                            .await
-                        {
-                            Ok(()) => tracing::warn!(
-                                "s3-unhealthy: node {} yielded leadership of group {} to node {}",
-                                snapshot.node_id,
-                                snapshot.raft_group_id,
-                                target,
-                            ),
-                            Err(err) => tracing::error!(
-                                "s3-unhealthy: transfer_leader group {} -> {} failed: {err}",
-                                snapshot.raft_group_id,
-                                target,
-                            ),
-                        }
-                    }
+            let store_trouble = match gate.as_mut().map(|gate| gate.latest_bad()) {
+                None => false,
+                Some(Ok(latest_bad)) => latest_bad,
+                Some(Err(err)) => {
+                    tracing::error!(
+                        %err,
+                        "snapshot driver: the store is no longer judged; driving routine \
+                         snapshots as if it were healthy"
+                    );
+                    gate = None;
+                    false
                 }
-            } else if yielded && consecutive_good >= heal_ticks {
-                yielded = false;
-                registry.clear_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
-            }
-
+            };
             let mut pause = interval;
             let lagging = wal_lagging
                 .as_ref()
@@ -287,7 +267,7 @@ pub fn spawn_snapshot_driver(
             }
             let (plan, selected) =
                 plan_snapshot_drive(&snaps, &cadence, max_groups_per_tick, &lagging);
-            if should_drive_snapshots(bad_tick, plan.pressure) {
+            if should_drive_snapshots(store_trouble, plan.pressure) {
                 let mut triggered = 0u64;
                 for snapshot in selected {
                     match trigger_snapshot_build(&registry, &coordinator, snapshot.raft_group_id)
@@ -330,7 +310,7 @@ pub fn spawn_snapshot_driver(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::should_drive_snapshots;
 
     #[test]
     fn store_trouble_holds_back_routine_snapshots_but_not_a_pressure_pass() {

@@ -108,6 +108,7 @@ pub use cold_store::cold_pack_dir;
 pub use cold_store::new_cold_chunk_path_in_generation;
 pub use cold_store::new_cold_pack_path;
 pub use cold_store::new_external_payload_path;
+pub use cold_store::s3_operation_budget;
 pub use cold_worker::spawn_cold_compaction_worker_if_configured;
 pub use cold_worker::spawn_cold_flush_worker_if_configured;
 pub use cold_worker::spawn_cold_gc_worker_if_configured;

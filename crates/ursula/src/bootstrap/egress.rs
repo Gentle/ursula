@@ -7,7 +7,12 @@ use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_shard::RaftGroupId;
 
-use crate::bootstrap::util::leader_counts;
+use crate::bootstrap::health_gate::HealthHysteresis;
+use crate::bootstrap::health_gate::HealthTransition;
+use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedPace;
+use crate::bootstrap::health_gate::TickHealth;
+use crate::bootstrap::participation::PeerParticipation;
 
 const DEFAULT_CLUSTER_PROBE_INTERVAL_MS: usize = 500;
 const DEFAULT_CLUSTER_PROBE_TIMEOUT_MS: usize = 200;
@@ -99,71 +104,38 @@ pub(crate) fn cluster_egress_probe_groups(
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ClusterEgressShedAction {
-    pub group_id: u32,
-    pub target: u64,
-}
-
-pub(crate) fn plan_cluster_egress_shed(
-    snaps: &[RaftGroupMetricsSnapshot],
-    node_id: u64,
-    eligible: impl Fn(RaftGroupId, u64) -> bool,
-) -> Vec<ClusterEgressShedAction> {
-    let mut planned_load = leader_counts(snaps);
-    let mut groups_we_lead: Vec<&RaftGroupMetricsSnapshot> = snaps
-        .iter()
-        .filter(|snap| snap.current_leader == Some(node_id))
-        .collect();
-    groups_we_lead.sort_by_key(|snap| snap.raft_group_id);
-
-    let mut actions = Vec::new();
-    for snap in groups_we_lead {
-        let mut targets: Vec<u64> = snap
-            .voter_ids
-            .iter()
-            .copied()
-            .filter(|voter| *voter != node_id && eligible(RaftGroupId(snap.raft_group_id), *voter))
-            .collect();
-        targets.sort_by_key(|target| (planned_load.get(target).copied().unwrap_or(0), *target));
-        let Some(target) = targets.into_iter().next() else {
-            continue;
-        };
-        actions.push(ClusterEgressShedAction {
-            group_id: snap.raft_group_id,
-            target,
-        });
-        let target_load = planned_load.entry(target).or_insert(0);
-        *target_load = target_load.saturating_add(1);
-        if let Some(load) = planned_load.get_mut(&node_id) {
-            *load = load.saturating_sub(1);
-        }
-    }
-    actions
-}
-
-/// Config-driven cluster egress gate.
+/// Config-driven cluster egress gate. It probes `probe_peers` and, while it
+/// sheds, hands every leadership it held when it shed to its peers at once,
+/// and plans again on every tick for the ones still pending. The peers'
+/// answers to `participation` travel the path the gate judges impaired, so
+/// a leadership's first handoff may also go to a peer that did not answer,
+/// while a leadership whose handoff did not move goes only to a peer that
+/// answered that it may campaign
+/// ([`crate::bootstrap::participation::CampaignStances::shed_targets_over_impaired_path`]).
 pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
-    node_id: u64,
-    peers: &[(u64, String)],
+    participation: &PeerParticipation,
+    probe_peers: &[(u64, String)],
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     cp_cfg: &ursula_config::ClusterProbeConfig,
 ) {
+    let node_id = participation.node_id();
     let interval_ms = cp_cfg.interval.as_duration().as_millis() as usize;
     if interval_ms == 0 {
         return;
     }
-    let initial_probe_groups = cluster_egress_probe_groups(node_id, peers, &per_group_voters, &[]);
+    let initial_probe_groups =
+        cluster_egress_probe_groups(node_id, probe_peers, &per_group_voters, &[]);
     if initial_probe_groups.is_empty() {
         return;
     }
     let probe_bytes = cp_cfg.probe_size.as_bytes() as usize;
     let probe_timeout_ms = cp_cfg.timeout.as_duration().as_millis() as usize;
-    let unhealthy_ticks = cp_cfg.unhealthy_ticks.max(1);
-    let heal_ticks = cp_cfg.heal_ticks.max(1);
+    let unhealthy_ticks = cp_cfg.unhealthy_ticks;
+    let heal_ticks = cp_cfg.heal_ticks;
     let registry = registry.clone();
-    let peers = peers.to_vec();
+    let peers = probe_peers.to_vec();
+    let participation = participation.clone();
     tokio::spawn(async move {
         let interval = Duration::from_millis(
             u64::try_from(interval_ms)
@@ -183,9 +155,16 @@ pub fn spawn_egress_gate(
             }
         };
         let payload = vec![0u8; probe_bytes];
-        let mut consecutive_bad = 0usize;
-        let mut consecutive_good = 0usize;
-        let mut yielded = false;
+        let mut hysteresis = HealthHysteresis::new(unhealthy_ticks, heal_ticks);
+        // A node that cannot reach a quorum cannot replicate, so its
+        // leaderships stall where they are: hand them all off at once. The
+        // shed ends when the task does, however it stops.
+        let mut shed = LeadershipShed::new(
+            &registry,
+            LeadershipShedReason::ClusterEgress,
+            node_id,
+            ShedPace::AllAtOnce,
+        );
         loop {
             tokio::time::sleep(interval).await;
             let snaps = registry.metrics_snapshot();
@@ -215,41 +194,28 @@ pub fn spawn_egress_gate(
                     break;
                 }
             }
-            let can_reach_quorum = degraded_probe.is_none();
-            if can_reach_quorum {
-                consecutive_good = consecutive_good.saturating_add(1);
-                consecutive_bad = 0;
+            let tick = if degraded_probe.is_none() {
+                TickHealth::Good
             } else {
-                consecutive_bad = consecutive_bad.saturating_add(1);
-                consecutive_good = 0;
-            }
-
-            if !yielded && consecutive_bad >= unhealthy_ticks {
-                yielded = true;
-                registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
-                let handoffs = plan_cluster_egress_shed(&snaps, node_id, |group, target| {
-                    registry.check_handoff(group, target).is_ok()
-                });
-                for handoff in handoffs {
-                    if let Err(err) = registry
-                        .transfer_leader(RaftGroupId(handoff.group_id), handoff.target)
-                        .await
+                TickHealth::Bad
+            };
+            match hysteresis.observe(tick) {
+                HealthTransition::Shed => {
+                    if let Some((scope, healthy_peers, peer_count, needed_peers)) = &degraded_probe
                     {
-                        tracing::error!(
-                            "cluster-egress: transfer_leader group {} -> {} failed while yielding: {err}",
-                            handoff.group_id,
-                            handoff.target,
+                        tracing::warn!(
+                            "cluster-egress: node {node_id} {scope:?} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}); yielding leadership",
                         );
                     }
+                    shed.begin();
                 }
-                if let Some((scope, healthy_peers, peer_count, needed_peers)) = degraded_probe {
-                    tracing::warn!(
-                        "cluster-egress: node {node_id} {scope:?} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}); yielding leadership",
-                    );
-                }
-            } else if yielded && consecutive_good >= heal_ticks {
-                yielded = false;
-                registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);
+                HealthTransition::Heal => shed.end(),
+                HealthTransition::Hold => {}
+            }
+            if shed.is_draining() {
+                let stances = participation.campaign_stances(&registry).await;
+                shed.step(&stances.shed_targets_over_impaired_path(), &[])
+                    .await;
             }
         }
     });

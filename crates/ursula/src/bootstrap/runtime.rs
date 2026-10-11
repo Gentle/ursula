@@ -26,7 +26,9 @@ use crate::bootstrap::cold_health;
 use crate::bootstrap::commit_stall;
 use crate::bootstrap::egress;
 use crate::bootstrap::leadership;
+use crate::bootstrap::participation::PeerParticipation;
 use crate::bootstrap::snapshot;
+use crate::bootstrap::snapshot::StoreGateInputs;
 use crate::bootstrap::topology::Persistence;
 use crate::bootstrap::topology::Topology;
 
@@ -47,6 +49,13 @@ pub enum SpawnRuntimeError {
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
     RaftWal(#[from] ursula_raft::RaftWalError),
+    /// The client that reads the peers' leadership-shed state, which every
+    /// handoff planner needs, could not be built.
+    #[error("build the client that reads the peers' leadership-shed state")]
+    PeerStatusClient {
+        #[source]
+        source: reqwest::Error,
+    },
 }
 
 /// Where the runtime's groups keep their Raft logs, once the WAL has
@@ -163,6 +172,25 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         None
     };
 
+    // Built before the runtime starts, so a failure leaves nothing running.
+    let participation = match &topology {
+        Topology::StaticCluster { node_id, peers, .. } => Some(PeerParticipation::new(
+            *node_id,
+            peers,
+            reqwest::Client::builder()
+                .timeout(
+                    config
+                        .governance
+                        .leadership_balance
+                        .peer_timeout
+                        .as_duration(),
+                )
+                .build()
+                .map_err(|source| SpawnRuntimeError::PeerStatusClient { source })?,
+        )),
+        Topology::SingleNode { .. } => None,
+    };
+
     let wal = &config.raft.wal;
     let shard_map = ursula_shard::StaticShardMap::new(
         runtime_config.core_count,
@@ -198,7 +226,9 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         spawn_cold_ref_offload_worker(&spawned.runtime);
     }
 
-    if let Topology::StaticCluster { node_id, peers, .. } = &topology {
+    if let (Topology::StaticCluster { peers, .. }, Some(participation)) =
+        (&topology, &participation)
+    {
         let registry = spawned
             .raft_registry
             .clone()
@@ -207,7 +237,11 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             &spawned.runtime,
             &registry,
             snapshot_store,
-            config.storage.cold.s3.as_ref(),
+            StoreGateInputs {
+                s3: config.storage.cold.s3.as_ref(),
+                cold_flush_interval: config.storage.cold.flush_interval.as_duration(),
+                participation,
+            },
             snapshot_drive_interval_ms,
             ursula_raft::snapshot_cadence::SnapshotCadence::new(
                 config.raft.snapshot_log_budget.as_bytes(),
@@ -219,8 +253,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         );
         leadership::spawn_leadership_balancer(
             &registry,
-            *node_id,
-            peers,
+            participation,
             &config.governance.leadership_balance,
         );
         let per_group_voters: std::collections::BTreeMap<
@@ -239,7 +272,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             .collect();
         egress::spawn_egress_gate(
             &registry,
-            *node_id,
+            participation,
             peers,
             per_group_voters,
             &config.governance.cluster_probe,
@@ -253,7 +286,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             cold_health::spawn_cold_health_gate(
                 &spawned.runtime,
                 &registry,
-                *node_id,
+                participation,
                 &config.governance.cold_health,
             );
         }

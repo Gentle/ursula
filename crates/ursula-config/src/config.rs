@@ -467,11 +467,25 @@ pub struct S3Config {
     pub timeout: HumanDuration,
     /// Max retries per S3 operation.
     pub max_retries: usize,
-    /// Timeout for S3 health probes.
+    /// Deadline of one snapshot-store health probe, retries of the S3 client
+    /// included. The default leaves room for one retry of a probe whose first
+    /// attempt fails fast, since the client's first backoff is 1 to 2
+    /// seconds. An attempt that hangs runs into this deadline instead. Must
+    /// be non-zero.
     pub probe_timeout: HumanDuration,
-    /// Consecutive probe failures before marking S3 unhealthy.
+    /// Bad health ticks, with no good tick between them, before the node
+    /// sheds its leadership. A tick is bad when the probe fails or times out,
+    /// or when a cold-flush write failed within the flush window and no write
+    /// has succeeded since. The window spans as long as the S3 client can
+    /// take to give up on a write (`timeout` and `max_retries`). A tick that
+    /// records both failed and successful writes is inconclusive: it never
+    /// ends a bad streak and never lengthens one, as in the cold-health gate.
+    /// Must be non-zero.
     pub unhealthy_ticks: usize,
-    /// Consecutive probe successes before marking S3 healthy again.
+    /// Good health ticks in a row before a node that shed may lead again.
+    /// After failed writes, the good ticks start with the first write that
+    /// succeeds after the last failed one, or once the last failed one has
+    /// left the flush window. Must be non-zero.
     pub heal_ticks: usize,
 }
 
@@ -488,8 +502,10 @@ impl Default for S3Config {
             kms_key_id: None,
             timeout: HumanDuration::sec(10),
             max_retries: 3,
-            probe_timeout: HumanDuration::sec(2),
-            unhealthy_ticks: 1,
+            // One failed probe the client is still retrying must not move
+            // every leadership on the node (#508).
+            probe_timeout: HumanDuration::sec(5),
+            unhealthy_ticks: 3,
             heal_ticks: 2,
         }
     }
@@ -583,7 +599,12 @@ pub struct LeadershipBalanceConfig {
     pub interval: HumanDuration,
     /// Max leader handoffs to attempt per tick.
     pub max_per_tick: usize,
-    /// Timeout when querying peer shed state.
+    /// How long the leadership balancer and the leadership health gates wait
+    /// for a peer's leadership-shed state. A peer that does not answer in
+    /// time is treated as unable to campaign, except that the cluster-egress
+    /// gate may give it a leadership's first handoff in a shed, on a tick
+    /// when no peer answered that it may not campaign, and leaves that
+    /// handoff to the Raft handoff check. Must be non-zero.
     pub peer_timeout: HumanDuration,
 }
 

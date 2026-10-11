@@ -46,6 +46,7 @@ mod test_reexports {
     pub(crate) use super::egress::ClusterEgressProbeScope;
     pub(crate) use super::egress::cluster_egress_probe_groups;
     pub(crate) use super::egress::spawn_egress_gate;
+    pub(crate) use super::health_gate::LeadershipShed;
     pub(crate) use super::health_gate::ShedCandidate;
     pub(crate) use super::health_gate::ShedHandoff;
     pub(crate) use super::health_gate::ShedPlan;
@@ -53,9 +54,11 @@ mod test_reexports {
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
     pub(crate) use super::participation::PeerParticipation;
+    pub(crate) use super::snapshot::StoreGateInputs;
     pub(crate) use super::snapshot::group_log_progress;
     pub(crate) use super::snapshot::plan_snapshot_drive;
     pub(crate) use super::snapshot::resolve_snapshot_drive_interval_ms;
+    pub(crate) use super::snapshot::spawn_snapshot_driver;
     pub(crate) use super::util::leader_counts;
     pub(crate) use super::util::prioritized_transfer_targets;
 }

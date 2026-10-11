@@ -7,6 +7,8 @@ use crate::db::lock;
 use crate::error::Error;
 use crate::error::WriteRefusal;
 use crate::host::full_pathname;
+use crate::stats::Drained;
+use crate::stats::Dropped;
 
 fn json_str(s: &str) -> String {
     let mut out = String::from("\"");
@@ -97,13 +99,22 @@ fn status_json(db: &Db) -> String {
     format!("{{{}}}", body.join(","))
 }
 
+/// `ursula_stats`: drains the attached database's measurements (see [`Stats`]).
+///
+/// [`Stats`]: crate::stats::Stats
 pub(crate) fn stats(path: &str) -> Result<String, Error> {
     let path = full_pathname(path)?;
     let db = attached(&path)?;
-    let mut db = lock(&db);
-    let commits: Vec<String> = db
-        .stats
-        .drain(..)
+    // Rendered once the mutex is released: a commit waits for it.
+    let drained = lock(&db).stats.drain();
+    Ok(stats_json(&drained))
+}
+
+/// `ursula_stats` of what a drain handed over.
+fn stats_json(drained: &Drained) -> String {
+    let commits: Vec<String> = drained
+        .commits
+        .iter()
         .map(|s| {
             format!(
                 "{{\"bytes\":{},\"raw\":{},\"pages\":{},\"attempts\":{},\"append_us\":{},\"vfs_us\":{}}}",
@@ -116,14 +127,14 @@ pub(crate) fn stats(path: &str) -> Result<String, Error> {
             )
         })
         .collect();
-    let checkpoints: Vec<String> = db
+    let checkpoints: Vec<String> = drained
         .checkpoints
-        .drain(..)
+        .iter()
         .map(|d| d.as_micros().to_string())
         .collect();
-    let snapshots: Vec<String> = db
-        .snapshot_stats
-        .drain(..)
+    let snapshots: Vec<String> = drained
+        .snapshots
+        .iter()
         .map(|s| {
             format!(
                 "{{\"offset\":{},\"bytes\":{},\"raw\":{},\"copy_us\":{},\"total_us\":{}}}",
@@ -135,19 +146,62 @@ pub(crate) fn stats(path: &str) -> Result<String, Error> {
             )
         })
         .collect();
-    Ok(format!(
-        "{{\"commits\":[{}],\"checkpoints_us\":[{}],\"snapshots\":[{}]}}",
+    let Dropped {
+        commits: dropped_commits,
+        commit_bytes,
+        append_retries,
+        checkpoints: dropped_checkpoints,
+        snapshots: dropped_snapshots,
+    } = drained.dropped;
+    let dropped = format!(
+        "{{\"commits\":{dropped_commits},\"commit_bytes\":{commit_bytes},\"append_retries\":{append_retries},\"checkpoints\":{dropped_checkpoints},\"snapshots\":{dropped_snapshots}}}"
+    );
+    let (commits, checkpoints, snapshots) = (
         commits.join(","),
         checkpoints.join(","),
-        snapshots.join(",")
-    ))
+        snapshots.join(","),
+    );
+    format!(
+        "{{\"commits\":[{commits}],\"checkpoints_us\":[{checkpoints}],\"snapshots\":[{snapshots}],\"dropped\":{dropped}}}"
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::stats_json;
     use super::status_json;
     use crate::db::Db;
     use crate::error::WriteRefusal;
+    use crate::stats::CommitStat;
+    use crate::stats::KEPT;
+    use crate::stats::Stats;
+
+    // `ursula_stats` reports what was dropped under the names the TypeScript package reads
+    // (`VfsDropped`): the commits, their frame bytes and append retries, checkpoints and snapshots.
+    #[test]
+    fn stats_report_what_was_dropped() {
+        let mut s = Stats::default();
+        for i in 0..KEPT + 2 {
+            s.commit(CommitStat {
+                bytes: 100 + i,
+                raw: 0,
+                pages: 1,
+                attempts: 2,
+                append: Duration::ZERO,
+                vfs: Duration::ZERO,
+            });
+        }
+        let json = stats_json(&s.drain());
+        assert!(
+            json.ends_with(
+                r#""dropped":{"commits":2,"commit_bytes":201,"append_retries":2,"checkpoints":0,"snapshots":0}}"#
+            ),
+            "{}",
+            json.get(json.len().saturating_sub(120)..).unwrap_or(&json)
+        );
+    }
 
     // A write refused before it reached the stream shows in `writes_refused`, with its kind and
     // reason, until a commit is acknowledged; a 402 also shows in the fields 0.7.1 introduced.

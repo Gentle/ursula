@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
-use std::time::Duration;
 use std::time::Instant;
 
 use libsqlite3_sys as ffi;
@@ -23,16 +22,8 @@ use crate::host::OK;
 use crate::log;
 use crate::log::Level;
 use crate::snapshotter::Snapper;
+use crate::stats::Stats;
 use crate::wal::db_len;
-
-pub(crate) struct CommitStat {
-    pub(crate) bytes: usize,
-    pub(crate) raw: usize,
-    pub(crate) pages: usize,
-    pub(crate) attempts: u32,
-    pub(crate) append: Duration,
-    pub(crate) vfs: Duration,
-}
 
 /// How `ursula_attach` binds a file to its stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,9 +109,9 @@ pub(crate) struct Db {
     pub(crate) writer: usize,
     pub(crate) acked: u64,
     pub(crate) fault_fired: bool,
-    pub(crate) stats: Vec<CommitStat>,
+    /// What `ursula_stats` drains, bounded whether or not anything drains it.
+    pub(crate) stats: Stats,
     pub(crate) checkpoint_started: Option<Instant>,
-    pub(crate) checkpoints: Vec<Duration>,
     /// Database size in pages at `offset`.
     pub(crate) pages: u32,
     /// Offset of the latest snapshot known readable (published and read back by this owner, or
@@ -134,7 +125,6 @@ pub(crate) struct Db {
     /// A due snapshot is waiting to open its window: the next commit waits at its commit point
     /// (up to `WINDOW_WAIT`) until it has, so a writer committing back to back cannot starve it.
     pub(crate) window_wanted: bool,
-    pub(crate) snapshot_stats: Vec<SnapshotStat>,
     /// Stream offset of the local state attach started from (`START`: rebuilt from nothing), and of
     /// the snapshot it installed (`START`: none).
     pub(crate) attached_from: String,
@@ -160,14 +150,6 @@ pub(crate) struct Poisoned {
     /// A reason so far says the local files may hold other pages than this process wrote
     /// ([`Error::is_local_damage`]): once set, it stays.
     pub(crate) damaged: bool,
-}
-
-pub(crate) struct SnapshotStat {
-    pub(crate) offset: String,
-    pub(crate) bytes: usize,
-    pub(crate) raw: usize,
-    pub(crate) copy: Duration,
-    pub(crate) total: Duration,
 }
 
 impl Db {
@@ -449,16 +431,14 @@ impl Db {
             writer: 0,
             acked: 0,
             fault_fired: false,
-            stats: Vec::new(),
+            stats: Stats::default(),
             checkpoint_started: None,
-            checkpoints: Vec::new(),
             pages: 0,
             snapshot: crate::client::START.into(),
             retained: crate::client::START.into(),
             snapper: Arc::new(Snapper::default()),
             window: false,
             window_wanted: false,
-            snapshot_stats: Vec::new(),
             attached_from: crate::client::START.into(),
             installed: crate::client::START.into(),
             attach_ms: 0,

@@ -11,7 +11,6 @@ use crate::client::header_offset;
 use crate::client::put_idempotent;
 use crate::client::recreated;
 use crate::db::Db;
-use crate::db::SnapshotStat;
 use crate::db::lock;
 use crate::error::Error;
 use crate::host::Checkpoint;
@@ -19,6 +18,7 @@ use crate::host::Private;
 use crate::log;
 use crate::log::Level;
 use crate::snapshot;
+use crate::stats::SnapshotStat;
 
 /// Wakes an attached database's snapshot thread.
 #[derive(Default)]
@@ -370,15 +370,13 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
         }
         d.log = d.log.saturating_sub(log);
         d.snapshot_published_at = Some(Instant::now());
-        if d.snapshot_stats.len() < 100_000 {
-            d.snapshot_stats.push(SnapshotStat {
-                offset: offset.clone(),
-                bytes: body.len(),
-                raw: image.len(),
-                copy,
-                total: started.elapsed(),
-            });
-        }
+        d.stats.snapshot(SnapshotStat {
+            offset: offset.clone(),
+            bytes: body.len(),
+            raw: image.len(),
+            copy,
+            total: started.elapsed(),
+        });
         (previous, d.retained.clone())
     };
     // Retention trails one snapshot behind: a host that read the previous snapshot (or whose file

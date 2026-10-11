@@ -49,6 +49,7 @@ use crate::log::Level;
 use crate::snapshot;
 use crate::snapshotter::Snapper;
 use crate::snapshotter::snapshot_loop;
+use crate::stats::Stats;
 use crate::wal::WalClaim;
 use crate::wal::db_len;
 use crate::wal::fold_wal;
@@ -652,16 +653,14 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         writer: 0,
         acked: 0,
         fault_fired: false,
-        stats: Vec::new(),
+        stats: Stats::default(),
         checkpoint_started: None,
-        checkpoints: Vec::new(),
         pages,
         snapshot,
         retained: START.into(),
         snapper: snapper.clone(),
         window: false,
         window_wanted: false,
-        snapshot_stats: Vec::new(),
         attach_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         append_retries: 0,
         snapshot_published_at: None,

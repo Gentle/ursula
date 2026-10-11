@@ -32,6 +32,29 @@ it("status reports an owner's health, and instrument() reports it as metrics", (
 	expect(callbacks.size).toBe(0);
 });
 
+// The extension keeps the newest 8,192 commits between two drains. Commits dropped past that still
+// reach the counters: their frame bytes in one add, and their number in `commit.unmeasured`, while
+// the histograms get the 8,192 kept.
+it("instrument() counts the commits dropped between two drains", () => {
+	const file = freshFile();
+	attach(file, ursulaUrl() + streamPath());
+	const { meter, records } = recordingMeter();
+	const stop = instrument(file, meter, { intervalMs: 60_000 });
+	const db = openPlain(file);
+	db.exec("CREATE TABLE t(x INTEGER)");
+	const insert = db.prepare("INSERT INTO t VALUES (?)");
+	for (let i = 0; i < 8_192 + 4; i++) insert.run(i);
+	db.close();
+	expect(status(file).commits).toBe(8_192 + 5);
+	stop();
+	expect(records.get("sqlite_ursula.commit.duration")).toHaveLength(8_192);
+	expect(records.get("sqlite_ursula.append.duration")).toHaveLength(8_192);
+	const bytes = records.get("sqlite_ursula.stream.bytes") ?? [];
+	expect(bytes).toHaveLength(8_192 + 1);
+	expect(bytes.at(-1)).toBeGreaterThan(0);
+	expect(records.get("sqlite_ursula.commit.unmeasured")).toEqual([5]);
+});
+
 it("snapshots show in the age and failure fields, and a poisoned owner logs a logfmt event", async () => {
 	const url = ursulaUrl() + streamPath();
 	// One row rewritten: the database stays small while the log outgrows it, so snapshots are taken.

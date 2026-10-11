@@ -183,14 +183,36 @@ export interface VfsSnapshotStat {
 	readonly total_us: number;
 }
 
+/**
+ * What the extension dropped since the last drain to keep at most 8,192 of each kind. The dropped
+ * commits' frame bytes and append retries are summed, so frame byte and retry totals built from the
+ * drains count every commit. Their durations are lost.
+ */
+export interface VfsDropped {
+	readonly commits: number;
+	/** The dropped commits' frame bytes. */
+	readonly commit_bytes: number;
+	/** The dropped commits' append attempts beyond the first. */
+	readonly append_retries: number;
+	readonly checkpoints: number;
+	readonly snapshots: number;
+}
+
 export interface VfsStats {
 	readonly commits: VfsCommitStat[];
 	/** Checkpoints of the file since the last drain (time holding the checkpoint lock). */
 	readonly checkpoints_us: number[];
 	readonly snapshots: VfsSnapshotStat[];
+	/** What was dropped since the last drain. An extension before 0.7.3 reports none: it kept up to 1,000,000 commits and checkpoints and 100,000 snapshots between drains, and dropped newer ones without counting them. */
+	readonly dropped?: VfsDropped;
 }
 
-/** Drains the per-commit and per-checkpoint stats of an attached file. */
+/**
+ * Drains the per-commit, per-checkpoint and per-snapshot stats of an attached file: everything kept
+ * since the last drain, oldest first. The extension keeps the newest 8,192 of each kind between
+ * drains, 512 KiB of commits, so a file nobody drains holds a bounded amount. `dropped` counts the
+ * rest.
+ */
 export function drainStats(file: string): VfsStats {
 	const row = loadUrsulaVfs().prepare("SELECT ursula_stats(?) AS s").get(file) as { s: string };
 	return JSON.parse(row.s) as VfsStats;
@@ -342,7 +364,9 @@ export interface MeterLike {
  *
  * - histograms `sqlite_ursula.commit.duration` (the VFS's commit hook: frame build, append, local
  *   WAL write) and `sqlite_ursula.append.duration`, in ms;
- * - counters `sqlite_ursula.append.retries` and `sqlite_ursula.stream.bytes`;
+ * - counters `sqlite_ursula.append.retries`, `sqlite_ursula.stream.bytes` and
+ *   `sqlite_ursula.commit.unmeasured` (commits whose durations the histograms did not get: each
+ *   drain hands over the newest 8,192 commits at most, while `status(file).commits` counts all);
  * - gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`
  *   (ms), `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned`, `sqlite_ursula.fenced`,
  *   `sqlite_ursula.payment_required` and `sqlite_ursula.writes_refused` (0 or 1; the latter is not
@@ -358,6 +382,7 @@ export function instrument(file: string, meter: MeterLike, options: { intervalMs
 	const append = meter.createHistogram("sqlite_ursula.append.duration", { unit: "ms", description: "Append requests of a commit" });
 	const retries = meter.createCounter("sqlite_ursula.append.retries", { description: "Append attempts beyond the first" });
 	const bytes = meter.createCounter("sqlite_ursula.stream.bytes", { unit: "By", description: "Frame bytes appended to the stream" });
+	const unmeasured = meter.createCounter("sqlite_ursula.commit.unmeasured", { description: "Commits whose durations were dropped between two drains" });
 	const drain = (): void => {
 		let stats: VfsStats;
 		try {
@@ -370,6 +395,13 @@ export function instrument(file: string, meter: MeterLike, options: { intervalMs
 			append.record(c.append_us / 1000, attributes);
 			if (c.attempts > 1) retries.add(c.attempts - 1, attributes);
 			bytes.add(c.bytes, attributes);
+		}
+		// Commits dropped between two drains still count, though their durations are lost.
+		const dropped = stats.dropped;
+		if (dropped !== undefined) {
+			if (dropped.append_retries > 0) retries.add(dropped.append_retries, attributes);
+			if (dropped.commit_bytes > 0) bytes.add(dropped.commit_bytes, attributes);
+			if (dropped.commits > 0) unmeasured.add(dropped.commits, attributes);
 		}
 	};
 	const gauges: [string, string | undefined, (s: AttachStatus) => number | null][] = [

@@ -30,7 +30,6 @@ use crate::client::append;
 use crate::client::recreated;
 use crate::client::stream_seq;
 use crate::config::abort_after_ack;
-use crate::db::CommitStat;
 use crate::db::Db;
 use crate::db::Mode;
 use crate::db::lock;
@@ -47,6 +46,7 @@ use crate::local::sidecar_line;
 use crate::local::write_sidecar;
 use crate::log;
 use crate::log::Level;
+use crate::stats::CommitStat;
 use crate::wal::FRAME;
 use crate::wal::FRAME_HDR;
 use crate::wal::FRAME_HDR_LEN;
@@ -850,16 +850,14 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
         db.record_wal_write(o, &d);
     }
     db.committed = true;
-    if db.stats.len() < 1_000_000 {
-        db.stats.push(CommitStat {
-            bytes: body.len(),
-            raw,
-            pages: pages.len(),
-            attempts,
-            append: append_time,
-            vfs: started.elapsed(),
-        });
-    }
+    db.stats.commit(CommitStat {
+        bytes: body.len(),
+        raw,
+        pages: pages.len(),
+        attempts,
+        append: append_time,
+        vfs: started.elapsed(),
+    });
     OK
 }
 
@@ -1056,10 +1054,8 @@ unsafe extern "C" fn x_shm_lock(
             unsafe { db.end_write_transaction(file) };
             return fwd!(file, xShmLock, offset, n, flags);
         }
-        if let Some(t) = db.checkpoint_started.take()
-            && db.checkpoints.len() < 1_000_000
-        {
-            db.checkpoints.push(t.elapsed());
+        if let Some(t) = db.checkpoint_started.take() {
+            db.stats.checkpoint(t.elapsed());
         }
         let rc = fwd!(file, xShmLock, offset, n, flags);
         // A snapshot waiting for this checkpoint to finish before it opens its window.

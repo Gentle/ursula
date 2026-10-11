@@ -1148,9 +1148,13 @@ pub(crate) fn stream_seq((epoch, seq): (u64, u64)) -> String {
 /// A stand-in for the stream in tests: canned answers, in order.
 #[cfg(test)]
 pub(crate) mod mock {
+    use std::io::ErrorKind;
     use std::io::Read as _;
     use std::io::Write as _;
     use std::net::TcpListener;
+    use std::net::TcpStream;
+    use std::time::Duration;
+    use std::time::Instant;
 
     /// Ends an append's retry budget with the answer that carries it: a Retry-After too large to
     /// wait for (or even add to now).
@@ -1159,15 +1163,19 @@ pub(crate) mod mock {
     /// Answers one connection per answer, in order, and returns each request's head. An empty
     /// answer closes the connection without one: the attempt's outcome is unknown. The request's
     /// body is read whole before the answer: a connection closed with unread bytes is reset, which
-    /// can drop the answer before the client reads it.
+    /// can drop the answer before the client reads it. A connection it waits for over a minute
+    /// fails it, so a client that sends fewer requests than answers fails the test's `join`
+    /// instead of hanging it.
     pub(crate) fn serve(answers: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/b/s", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             answers
                 .into_iter()
-                .map(|answer| {
-                    let (mut conn, _) = listener.accept().unwrap();
+                .enumerate()
+                .map(|(i, answer)| {
+                    let mut conn = accepted(&listener, i);
                     let mut request = Vec::new();
                     let mut byte = [0u8; 1];
                     while !request.ends_with(b"\r\n\r\n") {
@@ -1184,6 +1192,26 @@ pub(crate) mod mock {
                 .collect()
         });
         (url, server)
+    }
+
+    /// The `i`-th connection on `listener`, which does not block, within a minute.
+    fn accepted(listener: &TcpListener, i: usize) -> TcpStream {
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    conn.set_nonblocking(false).unwrap();
+                    return conn;
+                }
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock
+                        && start.elapsed() < Duration::from_secs(60) =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("no request {i}: {e}"),
+            }
+        }
     }
 
     /// An answer without a body: `head` is the status and the headers.
@@ -1787,32 +1815,65 @@ mod tests {
     // A body over 1 MiB whose outcome stays unknown is sent twice at most: a large snapshot that a
     // layer in front cuts off for its size, or a proxy times out, fails the same way again, and the
     // snapshot thread backs off instead. A refused token, sent again with the token read again,
-    // does not count. A smaller body (a small snapshot, a retention move) is retried within the
-    // budget, as before.
+    // does not count, and a 307 counts like a 503. A smaller body (a small snapshot, a retention
+    // move) is retried within the budget, as before. Each stand-in answers exactly the requests
+    // expected: one more would find nothing listening.
     #[test]
     fn a_large_body_is_sent_twice_at_most_while_its_outcome_stays_unknown() {
-        let (url, server) = serve(vec![
-            // The large snapshot: its token refused, then no answer, then a 503.
-            answer("401 Unauthorized"),
-            String::new(),
-            answer("503 Service Unavailable"),
-            // A small snapshot: three answers with an unknown outcome, then accepted.
-            answer("503 Service Unavailable"),
-            String::new(),
-            answer("502 Bad Gateway"),
-            answer("204 No Content"),
-        ]);
-        let snapshot = format!("{url}/snapshot/7");
-        let large = put_idempotent(&snapshot, "i1", &vec![7u8; (1 << 20) + 1], &|| false)
-            .err()
-            .unwrap();
-        assert!(matches!(large, Error::PutUnknown {
-            last: Attempt::Status { status: 503, .. },
-            ..
-        }));
-        let (status, _) = put_idempotent(&snapshot, "i1", &[7u8; 4096], &|| false).unwrap();
-        assert_eq!(status, 204);
-        assert_eq!(server.join().unwrap().len(), 7);
+        let large = vec![7u8; (1 << 20) + 1];
+        let sent = |answers: Vec<String>, body: &[u8]| {
+            let (url, server) = serve(answers);
+            let put = put_idempotent(&format!("{url}/snapshot/7"), "i1", body, &|| false);
+            (put, server)
+        };
+
+        // Its token refused, then no answer, then a 503.
+        let (put, server) = sent(
+            vec![
+                answer("401 Unauthorized"),
+                String::new(),
+                answer("503 Service Unavailable"),
+            ],
+            &large,
+        );
+        assert!(matches!(
+            put,
+            Err(Error::PutUnknown {
+                last: Attempt::Status { status: 503, .. },
+                ..
+            })
+        ));
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        // A redirect, which is never followed, then a 503.
+        let (put, server) = sent(
+            vec![
+                answer("307 Temporary Redirect\r\nlocation: http://127.0.0.1:9/b/s/snapshot/7"),
+                answer("503 Service Unavailable"),
+            ],
+            &large,
+        );
+        assert!(matches!(
+            put,
+            Err(Error::PutUnknown {
+                last: Attempt::Status { status: 503, .. },
+                ..
+            })
+        ));
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        // A small snapshot: three answers with an unknown outcome, then accepted.
+        let (put, server) = sent(
+            vec![
+                answer("503 Service Unavailable"),
+                String::new(),
+                answer("502 Bad Gateway"),
+                answer("204 No Content"),
+            ],
+            &[7u8; 4096],
+        );
+        assert!(matches!(put, Ok((204, _))));
+        assert_eq!(server.join().unwrap().len(), 4);
     }
 
     // One attempt whose outcome is unknown (no answer, an unmarked 5xx) and the append may be in

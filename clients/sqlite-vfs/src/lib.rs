@@ -46,8 +46,9 @@
 //!   fails the transaction alone with SQLITE_IOERR_AUTH: a 402 from a layer in front of the stream
 //!   (an authorizer, a quota or billing service) or a 4xx marked `x-ursula-not-applied` (an
 //!   authorizer's 403 among them) at once, and 401s, 429s and 5xx marked `x-ursula-not-applied`
-//!   (the server's ingress admission under pressure, a gateway that refused it before passing it
-//!   on) once the retry budget runs out on them. A marker counts only with the vouch
+//!   (the server, which refuses a write before it proposes it under write pressure or while it
+//!   knows no leader for the stream, a gateway that refused it before passing it on) once the
+//!   retry budget runs out on them. A marker counts only with the vouch
 //!   `x-ursula-not-applied-checked`, which Ursula's gateway adds from 0.7.3 on and a node never
 //!   sends (see `client::applied_nothing`): without a gateway, only a 401, 402 or 429 counts.
 //!   Nothing of it reached the stream, so the database is not poisoned, reads go on from the local

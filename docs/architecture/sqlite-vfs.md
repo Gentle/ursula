@@ -151,8 +151,10 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   and relays such an answer to a later exchange, since an earlier exchange may have applied the
   request. Such a layer may relay it only if every exchange was refused that way, so turn off
   retries and redirect following for writes in any proxy or service mesh in front of Ursula. Some
-  service meshes retry unless told not to: Istio's default retry policy for a VirtualService route
-  retries a 503 twice, POSTs included, and Envoy does the same when a retry policy is configured. A
+  service meshes retry unless told not to: before 1.24, Istio's default retry policy for a
+  VirtualService route retries a 503 twice, POSTs included, any version of Istio does on a route
+  whose `retryOn` includes `503`, `5xx`, `gateway-error` or `reset`, and Envoy does the same when a
+  retry policy is configured. A
   retry in front of the gateway can hide an applied first exchange behind the refusal of the retry,
   such as the gateway's vouched 503 while the servers are under pressure, and a retry between the
   gateway and the servers hides it from the gateway too. Set `retries: attempts: 0` on the Istio
@@ -722,7 +724,8 @@ What attach does in each case:
   (§3).
 - A proxy or service mesh in front of Ursula that retries writes, or follows redirects for them, can
   relay a refusal to a retry after an earlier exchange applied the write (§2). Some meshes retry by
-  default: Istio retries a 503 twice, POSTs included, unless a route sets `retries: attempts: 0`.
+  default: Istio before 1.24 retries a 503 twice, POSTs included, unless a route sets
+  `retries: attempts: 0`.
   The next commit is then answered as the refused commit's duplicate, and it poisons with a reason
   that names both commits the stream may hold (§2): attach again, and the database holds the refused
   transaction. If an attempt of that next commit got no answer, or an answer that proves nothing (a

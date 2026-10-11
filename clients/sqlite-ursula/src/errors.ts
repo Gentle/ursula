@@ -24,8 +24,8 @@ export class UrsulaReplicationError extends Error {
  *   poisons the file, since a filtering proxy can send one after the stream applied the write);
  * - `rate_limited`: `429` until the retry budget ran out, marked or not;
  * - `not_applied`: other answers marked `x-ursula-not-applied` and vouched for by a gateway (the server
- *   under write pressure, or a gateway that could not authorize the request) until the retry budget
- *   ran out, or another marked final answer;
+ *   under write pressure or while it knows no leader for the stream, or a gateway that could not
+ *   authorize the request) until the retry budget ran out, or another marked final answer;
  * - `too_large`: the transaction's commit frame is larger than one request may be, so it was never
  *   sent (over `URSULA_VFS_MAX_FRAME_BYTES`, 32 MiB by default), or a lower limit in front refused it
  *   with a marked and vouched `413`. The same transaction can never be sent: split it into smaller
@@ -39,13 +39,14 @@ export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden"
 
 /**
  * A write refused before it reached the stream, so that nothing of it was applied: by a layer in front
- * of the stream (an authorizer, a quota or billing service, a gateway or a proxy), by the server's
- * admission while it is under write pressure, or by the extension itself, which never sends a
- * transaction over its frame limit (kind `too_large`: only a smaller transaction succeeds). Unlike an
- * {@link UrsulaReplicationError}, it leaves the file usable. A refused commit was rolled back, but the file is not poisoned: reads go on from the
- * local file, and later commits are sent as usual and succeed once the refusals stop, with no new
- * attach. A refused attach claimed nothing: attach again later, or with `{ readOnly: true }` to read
- * the database meanwhile.
+ * of the stream (an authorizer, a quota or billing service, a gateway or a proxy), by the server
+ * before it proposed the write (under write pressure, or while it knows no leader for the stream),
+ * or by the extension itself, which never sends a transaction over its frame limit (kind
+ * `too_large`: only a smaller transaction succeeds). Unlike an {@link UrsulaReplicationError}, it
+ * leaves the file usable. A refused commit was rolled back, but the file is not poisoned: reads go on
+ * from the local file, and later commits are sent as usual and succeed once the refusals stop, with
+ * no new attach. A refused attach claimed nothing: attach again later, or with `{ readOnly: true }`
+ * to read the database meanwhile.
  *
  * With plain node:sqlite, a refused commit throws SQLite's error with `errcode` 7178
  * (SQLITE_IOERR_AUTH), and `status(file)` names the refusal (`refused_kind`, `refused_reason`). A

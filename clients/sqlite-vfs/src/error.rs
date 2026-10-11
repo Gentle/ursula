@@ -415,8 +415,9 @@ pub(crate) enum WriteRefusal {
     /// 429 until the retry budget ran out, marked or not.
     #[error("429{}: rate limited until the retry budget ran out", with_body(.body))]
     RateLimited { body: String },
-    /// A refusal marked `x-ursula-not-applied` (the server's ingress admission, a gateway or a
-    /// proxy refusing it before passing it on) and vouched for by a gateway
+    /// A refusal marked `x-ursula-not-applied` (the server refusing it at its ingress admission or
+    /// before it proposed it, a gateway or a proxy refusing it before passing it on) and vouched
+    /// for by a gateway
     /// (`x-ursula-not-applied-checked`, see `client::applied_nothing`): a final one, or the last
     /// one when the retry budget ran out. A 401, 402, 403 or 429 keeps its own kind. `reason` is
     /// the marker's token (`RaftLogPressure`, say), empty when it has none.

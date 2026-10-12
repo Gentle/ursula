@@ -146,6 +146,7 @@
 //! - `host`: the host's SQLite API, the "unix" VFS and private connections.
 //! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.
+//! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
 //! - `snapshotter`: the snapshot thread, snapshots and retention.
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
 //! - `status`: `ursula_status` and `ursula_stats`.
@@ -165,6 +166,7 @@ mod guard;
 mod host;
 mod local;
 mod log;
+mod net;
 pub mod snapshot;
 mod snapshotter;
 mod stats;

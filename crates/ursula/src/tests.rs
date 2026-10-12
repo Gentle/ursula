@@ -7180,9 +7180,10 @@ mod snapshot_driver {
     }
 
     async fn snapshot_index(response: Response) -> Option<u64> {
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: SnapshotResponse =
-            serde_json::from_slice(&body_bytes(response).await).expect("snapshot response JSON");
+        let status = response.status();
+        let body = body_bytes(response).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let body: SnapshotResponse = serde_json::from_slice(&body).expect("snapshot response JSON");
         body.snapshot_index
     }
 
@@ -7303,14 +7304,19 @@ mod snapshot_driver {
             .borrow_watched()
             .last_applied
             .as_ref()
-            .map(|log_id| log_id.index);
+            .map(|log_id| log_id.index)
+            .expect("group 0 applied its appends");
         let second = operator_snapshot(&admin, 0);
         tokio::time::sleep(Duration::from_millis(500)).await;
         store.release(2);
-        let first = snapshot_index(first.await.expect("the first request")).await;
-        let second = snapshot_index(second.await.expect("the second request")).await;
-        assert!(first < applied, "{first:?} {applied:?}");
-        assert!(second >= applied, "{second:?} {applied:?}");
+        let first = snapshot_index(first.await.expect("the first request"))
+            .await
+            .expect("the first snapshot");
+        let second = snapshot_index(second.await.expect("the second request"))
+            .await
+            .expect("the second snapshot");
+        assert!(first < applied, "{first} {applied}");
+        assert!(second >= applied, "{second} {applied}");
         assert_eq!(store.uploads().started, 2);
         node.shutdown().await;
     }

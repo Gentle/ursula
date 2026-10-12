@@ -269,6 +269,35 @@ mod tests {
     use super::*;
     use crate::metrics::RaftGroupView;
 
+    /// A loopback port nothing listens on: connects to it are refused while
+    /// this lives. The port is the local end of an open connection, so it
+    /// stays bound and no other test can take it. A socket that is only bound
+    /// would hold the port too, but macOS drops a connect to it instead of
+    /// refusing it, so the connect waits for its timeout.
+    struct RefusingPort {
+        url: Url,
+        _connection: (tokio::net::TcpStream, tokio::net::TcpStream),
+    }
+
+    impl RefusingPort {
+        async fn bind() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let connection = socket
+                .connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (accepted, _peer) = listener.accept().await.unwrap();
+            Self {
+                url: format!("http://{}", connection.local_addr().unwrap())
+                    .parse()
+                    .unwrap(),
+                _connection: (connection, accepted),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn wait_ready_uses_existing_probes_and_preserves_refusal_causes() {
         use axum::response::IntoResponse;
@@ -346,12 +375,13 @@ mod tests {
             let mut node = node(1);
             node.http_url = Some(format!("http://{address}").parse().unwrap());
             node.admin_url = format!("http://{address}").parse().unwrap();
-            if mode >= 7 {
-                let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let url = format!("http://{}", unavailable.local_addr().unwrap())
-                    .parse()
-                    .unwrap();
-                drop(unavailable);
+            let unavailable = if mode >= 7 {
+                Some(RefusingPort::bind().await)
+            } else {
+                None
+            };
+            if let Some(unavailable) = &unavailable {
+                let url = unavailable.url.clone();
                 if mode == 7 {
                     node.metrics_url = Some(url);
                 } else {

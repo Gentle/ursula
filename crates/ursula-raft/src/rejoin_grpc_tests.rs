@@ -1,6 +1,8 @@
 //! Recovery fault schedules over real TCP/gRPC, retaining the actual Raft handlers.
 
 use std::net::SocketAddr;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -30,6 +32,44 @@ struct RecoveryTestService {
     inner: RaftGrpcService,
     pause_replication: Arc<AtomicBool>,
     reject_barrier: Arc<AtomicBool>,
+    answers: Arc<Mutex<AppendAnswers>>,
+}
+
+impl RecoveryTestService {
+    fn new(registry: RaftGroupHandleRegistry) -> Self {
+        Self {
+            inner: RaftGrpcService::new(registry),
+            pause_replication: Arc::default(),
+            reject_barrier: Arc::default(),
+            answers: Arc::default(),
+        }
+    }
+}
+
+/// How a fixture node answered the Append calls it received, recorded when
+/// its service produced each answer. OpenRaft's leader metrics do not count
+/// the heartbeats of a ReadIndex round, so only this record tells a follower
+/// whose answers reach the leader too late from one that does not answer.
+#[derive(Default)]
+struct AppendAnswers {
+    acks: u64,
+    last_ack: Option<tokio::time::Instant>,
+    refusals: u64,
+    last_refusal: Option<tokio::time::Instant>,
+}
+
+impl AppendAnswers {
+    fn record(answers: &Mutex<Self>, acked: bool) {
+        let mut answers = answers.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Some(tokio::time::Instant::now());
+        if acked {
+            answers.acks = answers.acks.saturating_add(1);
+            answers.last_ack = now;
+        } else {
+            answers.refusals = answers.refusals.saturating_add(1);
+            answers.last_refusal = now;
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -67,6 +107,7 @@ impl RaftInternal for RecoveryTestService {
                             .await
                             .map(Response::into_inner)
                     };
+                    AppendAnswers::record(&service.answers, result.is_ok());
                     use pb::raft_append_stream_response_item::Result as WireResult;
                     items.push(pb::RaftAppendStreamResponseItem {
                         request_id: item.request_id,
@@ -234,19 +275,36 @@ enum AttemptError {
 
 type MetricsWatch = WatchReceiverOf<UrsulaRaftTypeConfig, RaftMetrics<UrsulaRaftTypeConfig>>;
 
-/// Each replica's metrics, readable while an attempt holds the replica.
-fn metrics_watches(engines: &[RaftGroupEngine]) -> Vec<MetricsWatch> {
-    engines.iter().map(|engine| engine.raft.metrics()).collect()
+/// What a retried fixture step reports about one replica when it gives up.
+struct ReplicaWatch {
+    metrics: MetricsWatch,
+    answers: Arc<Mutex<AppendAnswers>>,
+}
+
+/// Each replica's metrics and Append answers, readable while an attempt
+/// holds the replica.
+fn replica_watches(
+    engines: &[RaftGroupEngine],
+    services: &[RecoveryTestService],
+) -> Vec<ReplicaWatch> {
+    engines
+        .iter()
+        .zip(services)
+        .map(|(engine, service)| ReplicaWatch {
+            metrics: engine.raft.metrics(),
+            answers: service.answers.clone(),
+        })
+        .collect()
 }
 
 /// Runs `attempt` until it succeeds. `attempt` gets the time left in
 /// [`TRANSIENT_RETRY_WINDOW`], and a transient failure is retried until the
 /// window closes. A fatal failure, or a transient one once the window has
-/// closed, panics with every attempt's error and the Raft state of each
-/// replica in `replicas`.
+/// closed, panics with every attempt's error and the state of each replica
+/// in `replicas` ([`replica_states`]).
 async fn retry_transient<T>(
     step: &str,
-    replicas: &[MetricsWatch],
+    replicas: &[ReplicaWatch],
     mut attempt: impl AsyncFnMut(Duration) -> Result<T, AttemptError>,
 ) -> T {
     let began = tokio::time::Instant::now();
@@ -260,29 +318,59 @@ async fn retry_transient<T>(
         };
         failures.push(format!("  +{:.1?} {error}", began.elapsed()));
         if !retry || began.elapsed().saturating_add(RETRY_PAUSE) >= TRANSIENT_RETRY_WINDOW {
+            let attempts = match failures.len() {
+                1 => "1 attempt".to_owned(),
+                count => format!("{count} attempts"),
+            };
             panic!(
-                "{step}: no success in {} attempts over {:.1?}\n\
+                "{step}: no success after {attempts} over {:.1?}\n\
                  attempts, by when each ended:\n{}\n\
-                 Raft state:\n{}",
-                failures.len(),
+                 replica state:\n{}",
                 began.elapsed(),
                 failures.join("\n"),
-                raft_states(replicas),
+                replica_states(replicas),
             );
         }
         tokio::time::sleep(RETRY_PAUSE).await;
     }
 }
 
+/// A fresh quorum proof from leader `leader_id` at `endpoint`, retried as a
+/// recovery driver retries it ([`probe_attempt_error`]).
+async fn fresh_proof(
+    step: &str,
+    replicas: &[ReplicaWatch],
+    leader_id: u64,
+    endpoint: &str,
+) -> (UrsulaVote, u64) {
+    retry_transient(step, replicas, async |remaining| {
+        probe_rejoin_vote_barrier(
+            Arc::default(),
+            placement(),
+            leader_id,
+            endpoint,
+            PROBE_TIMEOUT.min(remaining),
+        )
+        .await
+        .map_err(probe_attempt_error)
+    })
+    .await
+}
+
 /// One line per replica: its role, the leader it knows, its vote, its last
-/// log and applied indexes, and on a leader how long ago a quorum last
-/// acknowledged it and each follower's matched index and last
-/// acknowledgement.
-fn raft_states(replicas: &[MetricsWatch]) -> String {
+/// log and applied indexes, and its Append answers ([`AppendAnswers`]). On a
+/// leader the line adds how long ago a quorum last acknowledged it, and each
+/// follower's matched index and last acknowledgement. These times come from
+/// OpenRaft's replication and heartbeat acknowledgements. A ReadIndex round
+/// does not update them, so a follower whose answers arrive late and one that
+/// does not answer look the same there. The Append answers tell them apart:
+/// a follower that keeps producing acks while no round reaches a quorum has
+/// its answers reach the leader too late.
+fn replica_states(replicas: &[ReplicaWatch]) -> String {
     replicas
         .iter()
         .map(|replica| {
-            let metrics = replica.borrow_watched();
+            let metrics = replica.metrics.borrow_watched();
             let leader_id = metrics.vote.leader_id();
             let mut line = format!(
                 "  node {}: {:?}, leader {:?}, vote term {} node {} committed {}, last log {:?}, \
@@ -296,9 +384,21 @@ fn raft_states(replicas: &[MetricsWatch]) -> String {
                 metrics.last_log_index,
                 metrics.last_applied.as_ref().map(|log_id| log_id.index()),
             );
+            {
+                let answers = replica
+                    .answers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                line.push_str(&format!(
+                    ", Append answers: acks {}, refusals {}",
+                    answer_count(answers.acks, answers.last_ack),
+                    answer_count(answers.refusals, answers.last_refusal),
+                ));
+            }
             if let Some(replication) = &metrics.replication {
                 let followers = replication
                     .iter()
+                    .filter(|(node, _)| **node != metrics.id)
                     .map(|(node, matched)| {
                         let acked = metrics
                             .heartbeat
@@ -337,6 +437,14 @@ fn ago(elapsed: Option<Duration>) -> String {
     )
 }
 
+/// A count of answers, with how long ago the last of them was produced.
+fn answer_count(count: u64, last: Option<tokio::time::Instant>) -> String {
+    match last {
+        Some(last) => format!("{count} (last {:.1?} ago)", last.elapsed()),
+        None => count.to_string(),
+    }
+}
+
 /// A failed probe's error, a gRPC error as its code and message.
 fn probe_error(error: &RecoveryProbeError) -> String {
     match error {
@@ -363,10 +471,12 @@ fn probe_attempt_error(error: RecoveryProbeError) -> AttemptError {
     }
 }
 
-/// The read failure a production client retries: a leader that could not
-/// confirm its leadership with a quorum in time refuses before reading and
-/// names no leader, which the HTTP layer answers with a retryable 503
-/// (#547). Any other failure is final.
+/// The read failure a production client retries: the leader-unknown refusal
+/// raised before anything was proposed, which the HTTP layer answers with a
+/// retryable 503. A leader that could not confirm its leadership with a
+/// quorum in time raises it (#547). So do a leader that did not apply the
+/// read index in time, an OpenRaft forward that names no leader, and a
+/// follower that could not reach the leader. Any other failure is final.
 fn read_attempt_error(error: GroupEngineError) -> AttemptError {
     let text = format!("{error:?}");
     match error {
@@ -535,11 +645,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     let mut wal_roots = Vec::new();
     for id in 1..=3 {
         let registry = RaftGroupHandleRegistry::default();
-        let service = RecoveryTestService {
-            inner: RaftGrpcService::new(registry.clone()),
-            pause_replication: Arc::new(AtomicBool::new(false)),
-            reject_barrier: Arc::new(AtomicBool::new(false)),
-        };
+        let service = RecoveryTestService::new(registry.clone());
         let (endpoint, server) = serve_fixture(service.clone()).await;
         endpoints.push(endpoint);
         servers.push(server);
@@ -593,23 +699,15 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .await
             .unwrap();
     }
-    // Establish the fixture with an actual fresh quorum proof. A loaded test
-    // runner can exhaust one ReadIndex round before any fault is injected:
-    // the round then ends unavailable, or at the probe's own deadline (#521).
-    let proof = retry_transient(
+    // Establish the fixture with an actual fresh quorum proof. A probe can
+    // fail before any fault is injected when none of the leader's ReadIndex
+    // rounds reaches a quorum in time: the leader then answers unavailable,
+    // or the probe reaches its own deadline first (#521).
+    let proof = fresh_proof(
         "fresh explicit barrier",
-        &metrics_watches(&engines),
-        async |remaining| {
-            probe_rejoin_vote_barrier(
-                Arc::default(),
-                placement(),
-                2,
-                &endpoints[1],
-                PROBE_TIMEOUT.min(remaining),
-            )
-            .await
-            .map_err(probe_attempt_error)
-        },
+        &replica_watches(&engines, &services),
+        2,
+        &endpoints[1],
     )
     .await;
     assert!(proof.1 >= baseline.log_id.index());
@@ -736,34 +834,41 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .unwrap();
     // Peers without the explicit protocol fail closed; no HEAD bridge remains.
     services[1].reject_barrier.store(true, Ordering::SeqCst);
-    let unsupported = probe_rejoin_vote_barrier(
-        Arc::default(),
-        placement(),
-        2,
-        &endpoints[1],
-        Duration::from_secs(1),
-    )
-    .await
-    .expect_err("unsupported recovery protocol is refused");
+    let unsupported =
+        probe_rejoin_vote_barrier(Arc::default(), placement(), 2, &endpoints[1], PROBE_TIMEOUT)
+            .await
+            .expect_err("unsupported recovery protocol is refused");
     assert!(
         matches!(unsupported, crate::grpc::RecoveryProbeError::Rpc(status) if status.code() == tonic::Code::Unimplemented)
     );
     services[1].reject_barrier.store(false, Ordering::SeqCst);
     {
-        let proof = probe_rejoin_vote_barrier(
-            Arc::default(),
-            placement(),
+        // A stays paused, so B's ReadIndex rounds need C's answers for a
+        // quorum, as in the fixture probe. These probes retry the same
+        // refusals.
+        let proof = fresh_proof(
+            "fresh recovery proof",
+            &replica_watches(&engines, &services),
             2,
             &endpoints[1],
-            Duration::from_secs(1),
         )
-        .await
-        .expect("fresh recovery proof");
+        .await;
         assert!(proof.1 >= acked.log_id.index());
-        let observed =
-            crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
+        let observed = retry_transient(
+            "fresh maintenance observation through the same probe",
+            &replica_watches(&engines, &services),
+            async |remaining| {
+                crate::confirm_quorum_prefix(
+                    placement(),
+                    2,
+                    &endpoints[1],
+                    PROBE_TIMEOUT.min(remaining),
+                )
                 .await
-                .expect("fresh maintenance observation through the same probe");
+                .map_err(probe_attempt_error)
+            },
+        )
+        .await;
         assert_eq!(observed.leader_id, 2);
         assert_eq!(observed.raft_group_id, placement().raft_group_id.0);
         assert!(observed.required_applied_index >= acked.log_id.index());
@@ -848,15 +953,9 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     engines[2].raft.runtime_config().tick(true);
     services[1].reject_barrier.store(true, Ordering::SeqCst);
     assert!(
-        probe_rejoin_vote_barrier(
-            Arc::default(),
-            placement(),
-            2,
-            &endpoints[1],
-            Duration::from_secs(1)
-        )
-        .await
-        .is_err(),
+        probe_rejoin_vote_barrier(Arc::default(), placement(), 2, &endpoints[1], PROBE_TIMEOUT)
+            .await
+            .is_err(),
         "an unsupported peer cannot supply a fresh proof"
     );
     // The leader metric may precede application of the new term's blank entry.
@@ -864,7 +963,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     // the production recovery driver also retries fresh outbound proofs.
     let proof = retry_transient(
         "fresh proof from new leader C",
-        &metrics_watches(&engines),
+        &replica_watches(&engines, &services),
         async |remaining| {
             probe_rejoin_vote_barrier(
                 Arc::default(),
@@ -944,11 +1043,7 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
     let mut wal_roots = Vec::new();
     for id in 1..=3 {
         let registry = RaftGroupHandleRegistry::default();
-        let service = RecoveryTestService {
-            inner: RaftGrpcService::new(registry.clone()),
-            pause_replication: Arc::new(AtomicBool::new(false)),
-            reject_barrier: Arc::new(AtomicBool::new(false)),
-        };
+        let service = RecoveryTestService::new(registry.clone());
         let (endpoint, server) = serve_fixture(service.clone()).await;
         endpoints.push(endpoint);
         servers.push(server);
@@ -1025,9 +1120,10 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
     // The follower forwards the read to the leader, which confirms that it
     // still leads with a ReadIndex round. When no round reaches a quorum in
     // time it refuses, and a client retries that refusal (#547).
+    let replicas = replica_watches(&engines, &services);
     let read = retry_transient(
         "read acknowledged cursor through lagging follower",
-        &metrics_watches(&engines),
+        &replicas,
         async |_remaining| {
             engines[0]
                 .read_stream(
@@ -1044,17 +1140,28 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
     .await;
     assert_eq!(read.payload, b"-ACK");
     assert_eq!(read.next_offset, 18);
-    let invalid = engines[0]
-        .read_stream(
-            ReadStreamRequest {
-                offset: 19,
-                ..read_req(stream_id.clone(), 4)
-            },
-            placement(),
-        )
-        .await
-        .expect_err("cursor beyond authoritative tail stays invalid");
-    assert_eq!(invalid.code(), Some(StreamErrorCode::OffsetOutOfRange));
+    // Only a leader that confirmed its leadership certifies the tail, so this
+    // read can meet the same refusal and retries it. Any outcome other than
+    // that refusal or `OffsetOutOfRange` fails the test.
+    retry_transient(
+        "cursor beyond authoritative tail stays invalid",
+        &replicas,
+        async |_remaining| match engines[0]
+            .read_stream(
+                ReadStreamRequest {
+                    offset: 19,
+                    ..read_req(stream_id.clone(), 4)
+                },
+                placement(),
+            )
+            .await
+        {
+            Err(error) if error.code() == Some(StreamErrorCode::OffsetOutOfRange) => Ok(()),
+            Err(error) => Err(read_attempt_error(error)),
+            Ok(read) => Err(AttemptError::Fatal(format!("read succeeded: {read:?}"))),
+        },
+    )
+    .await;
     // A remembered leader without a quorum cannot certify a permanent
     // boundary, even when its own tail currently rejects the cursor.
     services[2].pause_replication.store(true, Ordering::SeqCst);

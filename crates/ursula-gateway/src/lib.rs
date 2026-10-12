@@ -29,9 +29,9 @@
 //!
 //! A refusal the gateway decides from a request's head alone (access control,
 //! tenant admission) goes out once it has read the request's body, up to
-//! `max_request_body_bytes` and for 5 s at most, so that a client that sends
-//! its whole body before it reads the answer gets the refusal instead of a
-//! closed connection (#540).
+//! `max_request_body_bytes`, for 30 s at most and until no data arrived for
+//! 5 s, so that a client that sends its whole body before it reads the answer
+//! gets the refusal instead of a closed connection (#540).
 //!
 //! Module map:
 //!
@@ -127,10 +127,16 @@ const MAX_LEADER_REDIRECTS: usize = 3;
 /// hop under way runs to its answer: a long-poll or a large upload that
 /// reached the leader is not cut short.
 const LEADER_REDIRECT_DEADLINE: Duration = Duration::from_secs(5);
-/// How long the gateway reads the body of a request it refused from the head
-/// alone before it sends the refusal anyway ([`Gateway::refuse_unread`]). A
-/// client that sends its body slowly holds the connection this long at most.
-const REFUSED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the gateway waits for the next chunk of the body of a request it
+/// refused from the head alone before it sends the refusal anyway
+/// ([`Gateway::refuse_unread`]): a body that stops arriving holds the
+/// connection this long after its last chunk.
+const REFUSED_BODY_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the gateway reads such a body at most, however steadily it
+/// arrives: a client that sends its body slowly holds the connection this long
+/// at most. 32 MiB, the default `max_request_body_bytes`, takes this long at
+/// about 9 Mbit/s.
+const REFUSED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Default)]
@@ -173,14 +179,17 @@ struct GatewayMetricsSnapshot {
     /// Upstreams left out of selection now: inside their window, or with a
     /// probe outstanding.
     upstream_ejected: usize,
-    /// Requests refused from their head alone whose body the gateway read
-    /// before it answered ([`Gateway::refuse_unread`]), counted as the
-    /// reading starts.
+    /// Requests refused from their head alone that carried a body, which the
+    /// gateway reads before it answers ([`Gateway::refuse_unread`]), counted
+    /// as the reading starts.
     refusal_drains: u64,
-    /// Those whose reading stopped before the body ended: at
-    /// `max_request_body_bytes`, after [`REFUSED_BODY_DRAIN_TIMEOUT`], or on a
-    /// body that failed. The connection then closes after the refusal, and a
-    /// client still sending the body may see that instead of the refusal.
+    /// Those whose body the gateway did not read to its end: one over
+    /// `max_request_body_bytes` (by its declared length, then not read at
+    /// all, or as read), one that stopped arriving for
+    /// [`REFUSED_BODY_STALL_TIMEOUT`] or was still arriving after
+    /// [`REFUSED_BODY_DRAIN_TIMEOUT`], or one that failed. The connection then
+    /// closes after the refusal, and a client still sending the body may see
+    /// that instead of the refusal.
     refusal_drains_cut: u64,
 }
 
@@ -520,20 +529,27 @@ impl Gateway {
     /// HTTP client) does, then meets a failed write or a reset instead of the
     /// refusal, which says nothing about whether the request was applied.
     ///
-    /// Each request's reading is bounded: `max_request_body_bytes` at most,
-    /// the most the gateway buffers of a request it forwards, and
-    /// [`REFUSED_BODY_DRAIN_TIMEOUT`] at most. At either bound the refusal
-    /// goes out at once and the connection closes, as after the `413` for a
-    /// body over the limit. A reading keeps no byte of the body and adds no
-    /// task: it runs in the request's own handler. So the requests under way
-    /// bound the readings under way, as they bound the bodies the gateway
-    /// buffers whole for the requests it forwards, which have no time limit.
+    /// Each request's reading is bounded ([`drain`]): `max_request_body_bytes`
+    /// at most, the most the gateway buffers of a request it forwards,
+    /// [`REFUSED_BODY_STALL_TIMEOUT`] without a chunk, and
+    /// [`REFUSED_BODY_DRAIN_TIMEOUT`] in all. At any bound the refusal goes
+    /// out at once and the connection closes, as after the `413` for a body
+    /// over the limit. A body whose declared length is over the limit is not
+    /// read at all, since its connection closes either way. A reading keeps no
+    /// byte of the body and adds no task: it runs in the request's own
+    /// handler. So the requests under way bound the readings under way, as
+    /// they bound the bodies the gateway buffers whole for the requests it
+    /// forwards. The gateway puts no time limit on those bodies, on a slow
+    /// head or on an idle connection, so the reading gives a refused client
+    /// no new way to hold a connection.
     ///
     /// Reading the body of a request that carries `Expect: 100-continue` has
-    /// hyper send `100 Continue`, so such a client sends its body as well.
-    /// Answering it at once would spare it the upload, but a proxy that
-    /// answers `100 Continue` itself and passes the header on would then meet
-    /// the closed connection again.
+    /// hyper send `100 Continue`, so such a client sends its body before it
+    /// gets the refusal. Answering at once would spare it the upload only
+    /// while it still waits for `100 Continue`. It waits 1 s by default
+    /// (ureq 3, curl) and then sends the body anyway, and a decision that
+    /// waits on the token issuer or the authorizer can take longer: the client
+    /// would then meet the closed connection again.
     async fn refuse_unread(&self, refusal: Refusal, body: Body) -> AxumResponse {
         if !body.is_end_stream() {
             self.metrics.refusal_drains.fetch_add(1, Ordering::Relaxed);
@@ -1349,28 +1365,41 @@ fn mark_not_applied(response: &mut AxumResponse, token: &'static str) {
 enum Drained {
     /// The body ended: the connection can carry the next request.
     Whole,
-    /// The body went on past the limit.
+    /// The body is longer than the limit: by its declared length, and then
+    /// none of it was read, or by the bytes read.
     OverLimit,
+    /// No chunk of the body arrived for [`REFUSED_BODY_STALL_TIMEOUT`].
+    Stalled,
     /// The body was still arriving after [`REFUSED_BODY_DRAIN_TIMEOUT`].
     TimedOut,
     /// The body failed, as when the client goes away in the middle of it.
+    /// [`drain`] logs the body's error.
     Failed,
 }
 
 /// Reads `body` to its end and drops each chunk as it arrives: `limit` bytes
-/// at most, the limit `to_bytes` applies to a body the gateway forwards, and
-/// [`REFUSED_BODY_DRAIN_TIMEOUT`] at most.
+/// at most, the limit `to_bytes` applies to a body the gateway forwards,
+/// [`REFUSED_BODY_STALL_TIMEOUT`] without a chunk, and
+/// [`REFUSED_BODY_DRAIN_TIMEOUT`] in all. Reads none of a body whose declared
+/// length is over `limit`.
 async fn drain(body: Body, limit: usize) -> Drained {
+    if body.size_hint().lower() > u64::try_from(limit).unwrap_or(u64::MAX) {
+        return Drained::OverLimit;
+    }
     let mut body = http_body_util::Limited::new(body, limit);
     let read = async {
         loop {
-            match body.frame().await {
-                None => return Drained::Whole,
-                Some(Ok(_dropped)) => {}
-                Some(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
+            match tokio::time::timeout(REFUSED_BODY_STALL_TIMEOUT, body.frame()).await {
+                Err(_stalled) => return Drained::Stalled,
+                Ok(None) => return Drained::Whole,
+                Ok(Some(Ok(_dropped))) => {}
+                Ok(Some(Err(error))) if error.is::<http_body_util::LengthLimitError>() => {
                     return Drained::OverLimit;
                 }
-                Some(Err(_failed)) => return Drained::Failed,
+                Ok(Some(Err(error))) => {
+                    debug!(%error, "the body of a refused request failed");
+                    return Drained::Failed;
+                }
             }
         }
     };

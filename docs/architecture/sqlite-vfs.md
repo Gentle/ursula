@@ -842,8 +842,9 @@ The crate refuses to build with `panic = "abort"`.
   as `too_large`. The gateway's per-bucket body limit reads the whole body before it answers, so
   its 413 reaches the client. So do the refusals the gateway decides from a write's head alone (a
   refused token, an authorizer's denial, a bucket's rate limit): from 0.7.4 it reads the body
-  before it answers them, up to its `--max-request-body-bytes` and for 5 s at most (#540). Before,
-  a commit larger than one read of the gateway often met a reset instead, an unknown outcome. Its
+  before it answers them, up to its `--max-request-body-bytes`, for 30 s at most, which outlasts a
+  commit's 10 s request timeout, and until no data arrived for 5 s (#540). Before, a commit larger
+  than one read of the gateway often met a reset instead, an unknown outcome. Its
   `--max-request-body-bytes` still stops reading at the limit, answers a vouched 413, and closes
   the connection with the rest of the body unread. A commit a little over the limit may still get
   the 413 and fail alone as `too_large`. One far over it usually meets a failed write, an unknown

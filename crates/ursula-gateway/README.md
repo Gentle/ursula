@@ -262,19 +262,31 @@ outcome until its retry budget ran out, and poisoned the database. A proxy in
 front of the gateway could also turn the closed connection into an error of
 its own.
 
-The gateway reads at most `--max-request-body-bytes` of such a body, for 5 s
-at most. A body that goes on past the limit, or is still arriving after 5 s,
-gets the refusal at once, and the connection closes with the rest of the body
-unread. The `413` for a body over `--max-request-body-bytes` is sent the same
-way: the gateway stops reading at the limit, so a client still sending the
-body may see the connection close instead of the `413`. Keep bodies below the
-limit on the client, as the SQLite extension does for commits with
-`URSULA_VFS_MAX_FRAME_BYTES`. A request with `Expect: 100-continue` gets
-`100 Continue` and sends its body before it gets the refusal.
+The gateway reads at most `--max-request-body-bytes` of such a body, for 30 s
+at most, and stops early when no data arrives for 5 s. A body that goes on
+past the limit, stops arriving for 5 s, or is still arriving after 30 s gets
+the refusal at once, and the connection closes with the rest of the body
+unread. A body whose `Content-Length` is over the limit is not read at all,
+since the connection closes either way. A client that cannot send its body
+within 30 s, such as 32 MiB at less than about 9 Mbit/s, may still see the
+connection close instead of the refusal. The `413` for a body over
+`--max-request-body-bytes` is sent the same way: the gateway stops reading at
+the limit, so a client still sending the body may see the connection close
+instead of the `413`. Keep bodies below the limit on the client, as the SQLite
+extension does for commits with `URSULA_VFS_MAX_FRAME_BYTES`.
+
+A request with `Expect: 100-continue` gets `100 Continue` and sends its body
+before it gets such a refusal. Answering at once would spare the client the
+upload only while it still waits for `100 Continue`. Common clients wait about
+a second (ureq 3 and curl) and then send the body anyway, and a decision that
+waits on the token issuer or the authorizer can take longer.
 
 `/__ursula/gateway/metrics` reports `refusal_drains`, the refused requests
-whose body the gateway read this way, and `refusal_drains_cut`, those whose
-body it stopped reading at the limit, after 5 s, or because the body failed.
+with a body that the gateway handled this way, and `refusal_drains_cut`, those
+whose body it did not read to the end: one over the limit, one that stopped
+arriving for 5 s or was still arriving after 30 s, or one that failed. Only a
+gateway with access control refuses requests from their head, so only its
+counters move.
 
 ## SSE Behavior
 

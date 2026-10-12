@@ -2,10 +2,14 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use openraft::error::Fatal;
 use tokio::time::Instant;
+use ursula_raft::OwnerRaftHandle;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::SnapshotBuildCoordinator;
+use ursula_raft::SnapshotBuildPermit;
+use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::snapshot_cadence::DriveLimits;
 use ursula_raft::snapshot_cadence::GroupDriveState;
 use ursula_raft::snapshot_cadence::GroupLogProgress;
@@ -89,29 +93,66 @@ async fn trigger_snapshot_build(
             return Trigger::NoSlot;
         }
     };
+    match hand_off_and_trigger(&raft, coordinator, raft_group_id, permit).await {
+        Handoff::Claimed => Trigger::Started,
+        Handoff::Unclaimed { timed_out } => {
+            // Each such trigger holds the pass up for the whole wait.
+            tracing::warn!(
+                raft_group_id,
+                timed_out,
+                "snapshot driver: the group did not claim its build permit within \
+                 {SNAPSHOT_HANDOFF_WAIT:?}; taking it back"
+            );
+            Trigger::NotStarted
+        }
+        Handoff::TriggerFailed(err) => {
+            tracing::error!("snapshot driver trigger group {raft_group_id} error: {err}");
+            Trigger::NotStarted
+        }
+    }
+}
+
+/// What became of a build permit handed to a group with its snapshot trigger.
+#[derive(Debug)]
+pub(crate) enum Handoff {
+    /// The group claimed the permit, so its build runs.
+    Claimed,
+    /// The group did not claim the permit within [`SNAPSHOT_HANDOFF_WAIT`],
+    /// and it was taken back: OpenRaft dropped the trigger, for example
+    /// because a build of the group was already running. `timed_out` is
+    /// false when the wait ended early because the coordinator closed.
+    Unclaimed { timed_out: bool },
+    /// The trigger failed, and the permit was taken back.
+    TriggerFailed(Fatal<UrsulaRaftTypeConfig>),
+}
+
+/// Hands `permit` to `raft_group_id`, triggers the group's snapshot and waits
+/// for its build to claim the permit. A triggered build only *tries* for a
+/// permit and is refused while other groups hold every one, so a caller that
+/// needs the build to run takes a permit first and hands it over (#519,
+/// #529).
+pub(crate) async fn hand_off_and_trigger(
+    raft: &OwnerRaftHandle,
+    coordinator: &SnapshotBuildCoordinator,
+    raft_group_id: u32,
+    permit: SnapshotBuildPermit,
+) -> Handoff {
     coordinator.hand_off(raft_group_id, permit);
     if let Err(err) = raft.trigger().snapshot().await {
         coordinator.reclaim_handoff(raft_group_id);
-        tracing::error!("snapshot driver trigger group {raft_group_id} error: {err}");
-        return Trigger::NotStarted;
+        return Handoff::TriggerFailed(err);
     }
     let waited = tokio::time::timeout(
         SNAPSHOT_HANDOFF_WAIT,
         coordinator.handoff_claimed(raft_group_id),
     )
     .await;
-    // Unclaimed: OpenRaft dropped the trigger (e.g. a build was already running).
     if coordinator.reclaim_handoff(raft_group_id) {
-        // Each such trigger holds the pass up for the whole wait.
-        tracing::warn!(
-            raft_group_id,
-            timed_out = waited.is_err(),
-            "snapshot driver: the group did not claim its build permit within \
-             {SNAPSHOT_HANDOFF_WAIT:?}; taking it back"
-        );
-        Trigger::NotStarted
+        Handoff::Unclaimed {
+            timed_out: waited.is_err(),
+        }
     } else {
-        Trigger::Started
+        Handoff::Claimed
     }
 }
 

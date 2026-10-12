@@ -29,6 +29,8 @@ pub use runtime::SpawnRuntimeError;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
 pub(crate) use runtime::spawn_runtime_with_maintenance_drain;
+pub(crate) use snapshot::Handoff;
+pub(crate) use snapshot::hand_off_and_trigger;
 // Internals the crate's unit tests exercise directly.
 #[cfg(test)]
 pub(crate) use test_reexports::*;

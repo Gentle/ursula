@@ -6380,9 +6380,16 @@ mod snapshot_driver {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use axum::Router;
+    use axum::body::Body;
     use axum::body::Bytes;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+    use openraft::rt::WatchReceiver;
     use tokio::sync::watch;
+    use tokio::task::JoinHandle;
     use tokio::time::Instant;
+    use ursula_proto::admin::SnapshotResponse;
     use ursula_raft::RaftEngineConfig;
     use ursula_raft::RaftGroupMetricsSnapshot;
     use ursula_raft::snapshot_cadence::DriveLimits;
@@ -6401,7 +6408,11 @@ mod snapshot_driver {
 
     use super::StaticGrpcTestNode;
     use super::StaticGrpcTestNodeStorage;
+    use super::body_bytes;
+    use super::send;
     use super::spawn_static_grpc_test_node;
+    use crate::HttpState;
+    use crate::admin_router;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::StoreGateInputs;
     use crate::bootstrap::group_log_progress;
@@ -6780,6 +6791,18 @@ mod snapshot_driver {
         store: &Arc<GatedStore>,
         appends: &[usize],
     ) -> (StaticGrpcTestNode, Vec<BucketStreamId>) {
+        // The driver snapshots, not OpenRaft's entry policy.
+        node_with_permits(store, appends, 4, 100).await
+    }
+
+    /// [`loaded_node`] with `permits` build permits and a snapshot driver
+    /// that runs every `drive_interval_ms` (0: never).
+    async fn node_with_permits(
+        store: &Arc<GatedStore>,
+        appends: &[usize],
+        permits: usize,
+        drive_interval_ms: u64,
+    ) -> (StaticGrpcTestNode, Vec<BucketStreamId>) {
         assert_eq!(appends.len(), group_count());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -6797,9 +6820,8 @@ mod snapshot_driver {
             group_count(),
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
-                    // The driver snapshots, not OpenRaft's entry policy.
-                    snapshot_drive_interval_ms: 100,
-                    snapshot_build_max_concurrency: 4,
+                    snapshot_drive_interval_ms: drive_interval_ms,
+                    snapshot_build_max_concurrency: permits,
                     ..RaftEngineConfig::default()
                 }),
                 snapshot_store: Some(store.clone()),
@@ -7076,6 +7098,131 @@ mod snapshot_driver {
         assert_eq!(store.uploads().started, 4);
         store.open();
         wait_for_log_at_most(&node, cadence.pressure_target_bytes()).await;
+        node.shutdown().await;
+    }
+
+    /// A node with one build permit and no snapshot driver, so snapshots run
+    /// only when an operator asks for them, and its admin router.
+    async fn operator_node(store: &Arc<GatedStore>) -> (StaticGrpcTestNode, Router) {
+        let (node, _) = node_with_permits(store, &vec![1; group_count()], 1, 0).await;
+        let admin = admin_router(HttpState::with_raft_registry(
+            node.runtime.clone(),
+            node.registry.clone(),
+        ));
+        (node, admin)
+    }
+
+    /// Asks for a snapshot of `group` as an operator does.
+    fn operator_snapshot(admin: &Router, group: u32) -> JoinHandle<Response> {
+        let admin = admin.clone();
+        tokio::spawn(async move {
+            send(
+                &admin,
+                "POST",
+                &format!("/__ursula/raft/{group}/snapshot"),
+                &[],
+                Body::empty(),
+            )
+            .await
+        })
+    }
+
+    async fn snapshot_index(response: Response) -> Option<u64> {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: SnapshotResponse =
+            serde_json::from_slice(&body_bytes(response).await).expect("snapshot response JSON");
+        body.snapshot_index
+    }
+
+    /// While another group's build holds the node's only permit, an
+    /// operator's snapshot waits for it and then builds, where it answered
+    /// 500 once its 10 s wait for a refused build ran out (#529).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_operator_snapshot_waits_for_a_build_permit() {
+        let store = GatedStore::new();
+        let (node, admin) = operator_node(&store).await;
+        let first = operator_snapshot(&admin, 0);
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        let second = operator_snapshot(&admin, 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(store.uploads().started, 1, "group 1 waits for the permit");
+        store.release(2);
+        assert!(
+            snapshot_index(first.await.expect("group 0's request"))
+                .await
+                .is_some()
+        );
+        assert!(
+            snapshot_index(second.await.expect("group 1's request"))
+                .await
+                .is_some()
+        );
+        assert_eq!(store.uploads().started, 2);
+        node.shutdown().await;
+    }
+
+    /// An operator's snapshot that gets no permit in time answers 503 with
+    /// `Retry-After`, since a busy permit is transient (#529).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_operator_snapshot_answers_503_while_every_permit_stays_in_use() {
+        let store = GatedStore::new();
+        let (node, admin) = operator_node(&store).await;
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger group 0's snapshot");
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        let second = operator_snapshot(&admin, 1)
+            .await
+            .expect("group 1's request");
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            second
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(store.uploads().started, 1);
+        store.open();
+        node.shutdown().await;
+    }
+
+    /// An operator's snapshot of a group whose build already runs waits for
+    /// that build, which covers less than the request asks for, and builds
+    /// the group again. OpenRaft drops a trigger while the group builds, so
+    /// the request used to wait for a snapshot that never came (#529).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_operator_snapshot_builds_again_after_a_running_build() {
+        let store = GatedStore::new();
+        let (node, admin) = operator_node(&store).await;
+        let first = operator_snapshot(&admin, 0);
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        let stream = (0..10_000)
+            .map(|index| BucketStreamId::new("log-pressure", format!("stream-{index}")))
+            .find(|stream_id| node.runtime.locate(stream_id).raft_group_id == RaftGroupId(0))
+            .expect("a stream of group 0");
+        append(&node, &stream, 4).await;
+        let applied = node
+            .registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .as_ref()
+            .map(|log_id| log_id.index);
+        let second = operator_snapshot(&admin, 0);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        store.release(2);
+        let first = snapshot_index(first.await.expect("the first request")).await;
+        let second = snapshot_index(second.await.expect("the second request")).await;
+        assert!(first < applied, "{first:?} {applied:?}");
+        assert!(second >= applied, "{second:?} {applied:?}");
+        assert_eq!(store.uploads().started, 2);
         node.shutdown().await;
     }
 }

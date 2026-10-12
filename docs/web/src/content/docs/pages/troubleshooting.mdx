@@ -222,7 +222,19 @@ probe flapping.
 
 `RaftLogPressure` means the node's unsnapshotted Raft log is over twice
 `raft.snapshot_log_budget`. The node refuses writes with a body until
-snapshots bring the log below 1.5 times the budget.
+snapshots bring the log below 1.5 times the budget. Before it gets there, the
+snapshot driver runs more snapshot builds at once the further the log is past
+the budget, up to `raft.snapshot_build_max_concurrency`. When writes still
+reach the limit, the node's metrics show how far the log got
+(`raft_log_bytes_high_watermark`), whether the driver used every build
+(`raft_snapshot_builds_in_flight_max`), and how long a build's upload takes
+(`raft_snapshot_build_ns` over `raft_snapshot_builds`). If every build was in
+use, raise `raft.snapshot_build_max_concurrency` (the chart's
+`raft.snapshotBuildMaxConcurrency`) or the budget. Each build holds its group's
+captured state and, while it uploads, the compressed snapshot, so raise the
+builds only as far as the node's memory holds that many builds of its largest
+groups. Set it to `1` to keep one build at a time, as before 0.7.4.
+
 `IngressBodyBytesLimitReached` means the write bodies in flight on the node
 leave too little of `server.http_inflight_body_size` for this one.
 

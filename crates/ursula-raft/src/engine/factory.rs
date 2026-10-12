@@ -629,6 +629,26 @@ mod tests {
         assert_eq!(engine_config.max_in_snapshot_log_to_keep, 128);
     }
 
+    /// The config's build concurrency reaches the engine: 2 by default
+    /// (#519). An engine built without a config keeps one build at a time.
+    #[test]
+    fn engine_config_carries_the_configs_build_concurrency() {
+        let engine_config = RaftEngineConfig::from(&ursula_config::RaftConfig::default());
+        assert_eq!(engine_config.snapshot_build_max_concurrency, 2);
+        let four = ursula_config::RaftConfig {
+            snapshot_build_max_concurrency: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            RaftEngineConfig::from(&four).snapshot_build_max_concurrency,
+            4
+        );
+        assert_eq!(
+            RaftEngineConfig::default().snapshot_build_max_concurrency,
+            1
+        );
+    }
+
     #[test]
     fn automatic_snapshot_thresholds_are_bounded_and_spread() {
         let placement = |group_id| ShardPlacement {

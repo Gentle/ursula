@@ -38,9 +38,15 @@ impl RuntimeMetrics {
         }
     }
 
-    /// Records one aggregate Raft-log pressure snapshot pass.
-    pub fn record_raft_snapshot_pressure(&self, groups: u64) {
-        self.inner.record_raft_snapshot_pressure(groups);
+    /// Records one Raft-log pressure pass of the snapshot driver that
+    /// planned a build: the builds it started and how long it took.
+    pub fn record_raft_snapshot_pressure(&self, groups: u64, pass_ns: u64) {
+        self.inner.record_raft_snapshot_pressure(groups, pass_ns);
+    }
+
+    /// Records what the snapshot driver's log-pressure monitor sees.
+    pub fn record_raft_log_pressure(&self, sample: RaftLogPressureSample) {
+        self.inner.record_raft_log_pressure(sample);
     }
 }
 
@@ -420,6 +426,17 @@ runtime_metrics! {
     counter cold_pressure_flush_candidates;
     counter raft_snapshot_pressure_passes;
     counter raft_snapshot_pressure_groups;
+    counter raft_snapshot_pressure_pass_ns;
+    // Gauges of the snapshot driver's log-pressure monitor (#519): the
+    // pressure level (0 calm, 1 watermark, 2 escalated), the builds a pass
+    // keeps in flight at that level, the builds holding a permit now and at
+    // most, and the unsnapshotted Raft log now and at most.
+    counter raft_snapshot_pressure_level;
+    counter raft_snapshot_pressure_builds;
+    counter raft_snapshot_builds_in_flight;
+    counter raft_snapshot_builds_in_flight_max;
+    counter raft_log_bytes;
+    counter raft_log_bytes_high_watermark;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
     // must be able to recover after a flush. The separate per-group `*_max`
@@ -735,9 +752,25 @@ impl RuntimeMetricsInner {
         self.cold_flush_upload_ns.fetch_add_relaxed(upload_ns);
     }
 
-    fn record_raft_snapshot_pressure(&self, groups: u64) {
+    fn record_raft_snapshot_pressure(&self, groups: u64, pass_ns: u64) {
         self.raft_snapshot_pressure_passes.fetch_add_relaxed(1);
         self.raft_snapshot_pressure_groups.fetch_add_relaxed(groups);
+        self.raft_snapshot_pressure_pass_ns
+            .fetch_add_relaxed(pass_ns);
+    }
+
+    fn record_raft_log_pressure(&self, sample: RaftLogPressureSample) {
+        self.raft_snapshot_pressure_level
+            .store_relaxed(sample.level);
+        self.raft_snapshot_pressure_builds
+            .store_relaxed(sample.builds);
+        self.raft_snapshot_builds_in_flight
+            .store_relaxed(sample.builds_in_flight);
+        self.raft_snapshot_builds_in_flight_max
+            .fetch_max_relaxed(sample.builds_in_flight);
+        self.raft_log_bytes.store_relaxed(sample.log_bytes);
+        self.raft_log_bytes_high_watermark
+            .fetch_max_relaxed(sample.log_bytes);
     }
 
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
@@ -1009,13 +1042,14 @@ impl PaddedAtomicU64 {
 mod metric_manifest_tests {
     use std::sync::Arc;
 
+    use crate::metrics::RaftLogPressureSample;
     use crate::metrics::RuntimeMetrics;
     use crate::metrics::RuntimeMetricsInner;
 
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 163] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 170] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1168,6 +1202,13 @@ mod metric_manifest_tests {
         "cold_pressure_flush_candidates",
         "raft_snapshot_pressure_passes",
         "raft_snapshot_pressure_groups",
+        "raft_snapshot_pressure_pass_ns",
+        "raft_snapshot_pressure_level",
+        "raft_snapshot_pressure_builds",
+        "raft_snapshot_builds_in_flight",
+        "raft_snapshot_builds_in_flight_max",
+        "raft_log_bytes",
+        "raft_log_bytes_high_watermark",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",
@@ -1235,6 +1276,61 @@ mod metric_manifest_tests {
         assert_eq!(snapshot.raft_snapshot_body_bytes, 16);
         assert_eq!(snapshot.raft_snapshot_body_bytes_max, 11);
     }
+
+    /// #519: the log-pressure gauges follow the latest poll while their
+    /// highs stay, and pressure passes add up their builds and time.
+    #[test]
+    fn raft_log_pressure_gauges_keep_their_highs() {
+        let metrics = metrics_for_test();
+        metrics.record_raft_log_pressure(RaftLogPressureSample {
+            log_bytes: 3_000,
+            level: 2,
+            builds: 3,
+            builds_in_flight: 3,
+        });
+        metrics.record_raft_log_pressure(RaftLogPressureSample {
+            log_bytes: 1_000,
+            level: 1,
+            builds: 1,
+            builds_in_flight: 1,
+        });
+        metrics.record_raft_snapshot_pressure(32, 7_000);
+        metrics.record_raft_snapshot_pressure(16, 3_000);
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            (
+                snapshot.raft_log_bytes,
+                snapshot.raft_log_bytes_high_watermark,
+                snapshot.raft_snapshot_pressure_level,
+                snapshot.raft_snapshot_pressure_builds,
+                snapshot.raft_snapshot_builds_in_flight,
+                snapshot.raft_snapshot_builds_in_flight_max,
+            ),
+            (1_000, 3_000, 1, 1, 1, 3)
+        );
+        assert_eq!(
+            (
+                snapshot.raft_snapshot_pressure_passes,
+                snapshot.raft_snapshot_pressure_groups,
+                snapshot.raft_snapshot_pressure_pass_ns,
+            ),
+            (2, 48, 10_000)
+        );
+    }
+}
+
+/// What the snapshot driver's log-pressure monitor sees on one poll
+/// (#519).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RaftLogPressureSample {
+    /// Unsnapshotted Raft log held by the groups that can still snapshot.
+    pub log_bytes: u64,
+    /// 0 calm, 1 at the watermark, 2 escalated past the budget.
+    pub level: u64,
+    /// Builds a snapshot pass keeps in flight at this level.
+    pub builds: u64,
+    /// Snapshot builds that hold a build permit.
+    pub builds_in_flight: u64,
 }
 
 /// What one journal write reports beyond its own latency.

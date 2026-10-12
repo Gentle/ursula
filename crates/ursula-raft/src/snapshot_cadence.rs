@@ -9,16 +9,35 @@
 //!
 //! A node pressure pass keeps unpurged log within the node budget: once the
 //! log bytes held across the node's groups reach three quarters of the
-//! budget, it snapshots the groups that free the most log per snapshot byte
-//! first, until the node would fall to half of the budget.
+//! budget, it snapshots the groups that hold the most reclaimable log
+//! first, until the node would fall to half of the budget. Most of a
+//! build's time is a fixed chain of snapshot-store round trips, so under
+//! pressure the builds, not the snapshot bytes, bound how fast the log
+//! shrinks. Ordered by log per snapshot byte instead, a group that applied
+//! a few entries over a near-empty snapshot came before every group being
+//! written, and in #519 such groups took about 7% of the builds.
+//!
+//! At or past the budget the pass escalates ([`LogPressure::Escalated`],
+//! #519) and keeps more builds in flight: one at the budget and more in
+//! even steps toward the hard limit (twice the budget, where admission
+//! refuses client writes), rounded up so that every build the node allows
+//! runs before the log gets there. It starts as many more groups, so it
+//! lasts about as long as a pass below the budget. Before each build a pass
+//! weighs the log again ([`SnapshotCadence::pass_step`]): it keeps only as
+//! many builds in flight as the pressure now calls for, one once its builds
+//! brought the log below the budget, and it ends once the log climbed to a
+//! higher pressure, so the next pass plans for that.
 //!
 //! Groups the Raft WAL reports lagging (their live log keeps old journal
 //! segments on disk) go first, ahead of the cadence and the pressure pass,
-//! as long as they applied log since their last snapshot.
+//! as long as they applied log since their last snapshot. A group whose
+//! build is in flight is not planned again: OpenRaft drops a trigger while
+//! a build runs, and the log that build covers counts as freed.
 //!
 //! The policy is pure: the snapshot driver feeds it each group's
 //! [`GroupLogProgress`], read from the [`GroupLogGauge`] its state machine
-//! maintains, and the state probe feeds it simulated groups.
+//! maintains, with the builds in flight, and the state probe feeds it
+//! simulated groups.
 
 use std::cmp::Ordering;
 use std::sync::atomic::AtomicBool;
@@ -47,6 +66,110 @@ pub struct GroupLogProgress {
     pub last_snapshot_bytes: u64,
     /// Whether the group holds any snapshot yet.
     pub has_snapshot: bool,
+}
+
+/// How hard the log held across the node's groups presses on the node
+/// budget, which sets how a snapshot pass works against it. Ordered from
+/// calm to the most builds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogPressure {
+    /// Below three quarters of the budget: the groups due on their own
+    /// cadence.
+    #[default]
+    Calm,
+    /// From three quarters of the budget up to it: any group that holds
+    /// log, the most reclaimable log first, one build at a time.
+    Watermark,
+    /// At or past the budget: the most reclaimable log first, `builds` at a
+    /// time, and `builds` times as many groups per pass.
+    Escalated {
+        /// One at the budget and more in even steps, up to the node's build
+        /// concurrency before the hard limit.
+        builds: usize,
+    },
+}
+
+impl LogPressure {
+    /// Whether the node's log reached the pressure watermark.
+    pub fn is_pressure(self) -> bool {
+        !matches!(self, Self::Calm)
+    }
+
+    /// Snapshot builds a pass keeps in flight.
+    pub fn builds(self) -> usize {
+        match self {
+            Self::Calm | Self::Watermark => 1,
+            Self::Escalated { builds } => builds,
+        }
+    }
+
+    /// The level a metric reports: 0 calm, 1 watermark, 2 escalated.
+    pub fn level(self) -> u64 {
+        match self {
+            Self::Calm => 0,
+            Self::Watermark => 1,
+            Self::Escalated { .. } => 2,
+        }
+    }
+}
+
+/// What a pass of the snapshot driver does before it starts its next build
+/// (#519), from [`SnapshotCadence::pass_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassStep {
+    /// The log climbed to a higher pressure than the pass was planned for.
+    /// The pass ends, so the next one plans for the pressure now, with its
+    /// group count, order and builds.
+    Outgrown,
+    /// The next build starts once fewer than `builds` run: as many as the
+    /// pressure now calls for, never more than the pass was planned for.
+    Start {
+        /// Builds the pass keeps in flight now.
+        builds: usize,
+    },
+}
+
+/// What the snapshot driver knows of one group when it plans a pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupDriveState {
+    /// Log applied since the group's last snapshot. It counts toward the
+    /// node's log until a snapshot that covers it completes.
+    pub progress: GroupLogProgress,
+    /// Whether the Raft WAL reports the group keeping old journal segments.
+    pub lagging: bool,
+    /// Log bytes the group's build in flight will still free, `None` while
+    /// no build runs. The snapshot driver also sets `Some(0)` for a group it
+    /// holds out of its passes after a trigger of it went unclaimed: never
+    /// planned, and none of its log counted as freed.
+    pub building: Option<u64>,
+}
+
+impl GroupDriveState {
+    /// Log a build started now would free. None while a build is in
+    /// flight: OpenRaft drops the trigger, and that build frees the log.
+    pub fn reclaimable_bytes(&self) -> u64 {
+        match self.building {
+            Some(_) => 0,
+            None => self.progress.log_bytes,
+        }
+    }
+
+    /// Whether a build can start now: the group applied log since its last
+    /// snapshot and runs no build.
+    fn startable(&self) -> bool {
+        self.building.is_none() && self.progress.log_entries > 0
+    }
+}
+
+/// How much one pass of the snapshot driver may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveLimits {
+    /// Groups a pass starts below the budget
+    /// (`raft.snapshot_pressure_max_groups_per_tick`). An escalated pass
+    /// starts this many per build it keeps in flight.
+    pub max_groups: usize,
+    /// Builds the node runs at once (`raft.snapshot_build_max_concurrency`).
+    pub max_builds: usize,
 }
 
 /// The F12e policy for one node.
@@ -103,89 +226,167 @@ impl SnapshotCadence {
         self.node_budget_bytes / 2
     }
 
+    /// Node log bytes over which admission refuses client writes: twice the
+    /// budget. The driver normally holds the log near the budget, and this
+    /// is the bound for when it cannot keep up.
+    pub fn hard_limit_bytes(&self) -> u64 {
+        self.node_budget_bytes.saturating_mul(2)
+    }
+
+    /// Node log bytes under which refused client writes are admitted again:
+    /// one and a half budgets.
+    pub fn resume_bytes(&self) -> u64 {
+        self.node_budget_bytes.saturating_mul(3) / 2
+    }
+
+    /// The pressure of `node_log_bytes` held across the node's groups, on a
+    /// node that runs at most `max_builds` builds at once. At or past the
+    /// budget a pass keeps `1 + ceil((max_builds - 1) × over / budget)`
+    /// builds in flight, at most `max_builds`, `over` being the log past the
+    /// budget. With four: two past the budget, three past a third of the way
+    /// to the hard limit and four past two thirds.
+    pub fn pressure(&self, node_log_bytes: u64, max_builds: usize) -> LogPressure {
+        if node_log_bytes < self.pressure_watermark_bytes() {
+            return LogPressure::Calm;
+        }
+        if node_log_bytes < self.node_budget_bytes {
+            return LogPressure::Watermark;
+        }
+        let steps = max_builds.saturating_sub(1);
+        // One budget separates the budget from the hard limit.
+        let span = self
+            .hard_limit_bytes()
+            .saturating_sub(self.node_budget_bytes)
+            .max(1);
+        let over = node_log_bytes
+            .saturating_sub(self.node_budget_bytes)
+            .min(span);
+        // ceil(over × steps / span), at most `steps`. Each factor is below
+        // 2^64, so the product fits `u128`.
+        let taken = u128::from(over)
+            .saturating_mul(u128::try_from(steps).unwrap_or(u128::MAX))
+            .saturating_add(u128::from(span).saturating_sub(1))
+            .checked_div(u128::from(span))
+            .map_or(steps, |taken| usize::try_from(taken).unwrap_or(steps))
+            .min(steps);
+        LogPressure::Escalated {
+            builds: taken.saturating_add(1),
+        }
+    }
+
+    /// What a pass planned under `planned` does before its next build, the
+    /// node's log now holding `node_log_bytes`, on a node that runs at most
+    /// `max_builds` builds at once. A pass whose log climbed past `planned`
+    /// ends. Otherwise its builds follow the pressure down as they bring the
+    /// log down: a pass planned past the budget keeps one build in flight
+    /// once the log is below it, as a pass planned there does.
+    pub fn pass_step(
+        &self,
+        planned: LogPressure,
+        node_log_bytes: u64,
+        max_builds: usize,
+    ) -> PassStep {
+        let now = self.pressure(node_log_bytes, max_builds);
+        if now > planned {
+            PassStep::Outgrown
+        } else {
+            PassStep::Start {
+                builds: now.builds(),
+            }
+        }
+    }
+
     /// Groups to snapshot now, at most `max_groups` of them, by index into
-    /// `groups`. Below the pressure watermark these are the due groups; at or
-    /// above it, the groups that free the most log per snapshot byte, until
-    /// the node would fall to the pressure target. Either way the order is
-    /// most log freed per snapshot byte first, then the lowest index.
+    /// `groups`: [`SnapshotCadence::plan_pass`] for groups that neither lag
+    /// nor build, on a node that builds one group at a time.
     pub fn plan(&self, groups: &[GroupLogProgress], max_groups: usize) -> SnapshotPlan {
-        self.plan_with_lagging(groups, &[], max_groups)
-    }
-
-    /// [`SnapshotCadence::plan`], with the groups whose `lagging` flag is set
-    /// first, most log first, whenever they hold log since their last
-    /// snapshot. A missing flag counts as unset.
-    pub fn plan_with_lagging(
-        &self,
-        groups: &[GroupLogProgress],
-        lagging: &[bool],
-        max_groups: usize,
-    ) -> SnapshotPlan {
-        let is_lagging = |index: usize| {
-            lagging.get(index).copied().unwrap_or(false)
-                && groups
-                    .get(index)
-                    .is_some_and(|progress| progress.log_entries > 0)
-        };
-        let mut forced = (0..groups.len())
-            .filter(|index| is_lagging(*index))
+        let groups = groups
+            .iter()
+            .map(|progress| GroupDriveState {
+                progress: *progress,
+                ..GroupDriveState::default()
+            })
             .collect::<Vec<_>>();
-        forced.sort_by(|left, right| {
-            let bytes = |index: &usize| groups.get(*index).map_or(0, |progress| progress.log_bytes);
-            bytes(right).cmp(&bytes(left)).then_with(|| left.cmp(right))
-        });
-        forced.truncate(max_groups);
-        let mut plan = self.plan_cadence(groups, &forced, max_groups.saturating_sub(forced.len()));
-        let mut selected = forced;
-        selected.append(&mut plan.groups);
-        plan.groups = selected;
-        plan
+        self.plan_pass(&groups, DriveLimits {
+            max_groups,
+            max_builds: 1,
+        })
     }
 
-    /// The cadence and pressure plan over the groups not in `skip`.
-    fn plan_cadence(
-        &self,
-        groups: &[GroupLogProgress],
-        skip: &[usize],
-        max_groups: usize,
-    ) -> SnapshotPlan {
+    /// One pass of the snapshot driver: the groups to snapshot, by index
+    /// into `groups`, in the order to start them.
+    ///
+    /// Lagging groups that hold log go first, most log first. Below the
+    /// pressure watermark the rest are the groups due on their own cadence,
+    /// the most log freed per snapshot byte first. At or above it they are
+    /// any group that holds log, the most reclaimable log first, until the
+    /// node would fall to the pressure target once the builds in flight and
+    /// the planned ones complete, and due groups after that. Below the
+    /// budget a pass starts at most `max_groups`, and at or past it
+    /// `max_groups` per build it keeps in flight. Ties go to the lowest
+    /// index. A group whose build is in flight is never planned.
+    pub fn plan_pass(&self, groups: &[GroupDriveState], limits: DriveLimits) -> SnapshotPlan {
         let node_log_bytes = groups
             .iter()
-            .map(|progress| progress.log_bytes)
+            .map(|group| group.progress.log_bytes)
             .fold(0u64, u64::saturating_add);
-        let pressure = node_log_bytes >= self.pressure_watermark_bytes();
+        let pressure = self.pressure(node_log_bytes, limits.max_builds);
+        let max_groups = limits.max_groups.max(1).saturating_mul(pressure.builds());
+        let at = |index: &usize| groups.get(*index);
+        let mut selected = (0..groups.len())
+            .filter(|index| at(index).is_some_and(|group| group.lagging && group.startable()))
+            .collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            let bytes = |index: &usize| at(index).map_or(0, GroupDriveState::reclaimable_bytes);
+            bytes(right).cmp(&bytes(left)).then_with(|| left.cmp(right))
+        });
+        selected.truncate(max_groups);
+        // The log left once the builds in flight and the planned ones
+        // complete.
+        let in_flight = groups
+            .iter()
+            .filter_map(|group| group.building)
+            .fold(0u64, u64::saturating_add);
+        let planned = selected
+            .iter()
+            .filter_map(at)
+            .map(|group| group.progress.log_bytes)
+            .fold(0u64, u64::saturating_add);
+        let mut remaining = node_log_bytes
+            .saturating_sub(in_flight)
+            .saturating_sub(planned);
         let mut order = (0..groups.len())
-            .filter(|index| !skip.contains(index))
+            .filter(|index| !selected.contains(index))
             .filter(|index| {
-                groups.get(*index).is_some_and(|progress| {
-                    if pressure {
-                        progress.log_entries > 0
-                    } else {
-                        self.is_due(progress)
-                    }
+                at(index).is_some_and(|group| {
+                    group.startable() && (pressure.is_pressure() || self.is_due(&group.progress))
                 })
             })
             .collect::<Vec<_>>();
         order.sort_by(|left, right| {
-            match (groups.get(*left), groups.get(*right)) {
-                (Some(left), Some(right)) => compare_yield(right, left),
+            match (at(left), at(right)) {
+                (Some(left), Some(right)) if pressure.is_pressure() => {
+                    right.reclaimable_bytes().cmp(&left.reclaimable_bytes())
+                }
+                (Some(left), Some(right)) => compare_yield(&right.progress, &left.progress),
                 _ => Ordering::Equal,
             }
             .then_with(|| left.cmp(right))
         });
-        let mut selected = Vec::new();
-        let mut remaining = node_log_bytes;
         for index in order {
             if selected.len() >= max_groups {
                 break;
             }
-            let Some(progress) = groups.get(index) else {
+            let Some(group) = at(&index) else {
                 continue;
             };
-            if pressure && remaining <= self.pressure_target_bytes() && !self.is_due(progress) {
+            if pressure.is_pressure()
+                && remaining <= self.pressure_target_bytes()
+                && !self.is_due(&group.progress)
+            {
                 continue;
             }
-            remaining = remaining.saturating_sub(progress.log_bytes);
+            remaining = remaining.saturating_sub(group.progress.log_bytes);
             selected.push(index);
         }
         SnapshotPlan {
@@ -208,14 +409,15 @@ fn compare_yield(left: &GroupLogProgress, right: &GroupLogProgress) -> Ordering 
         .cmp(&u128::from(right.log_bytes).saturating_mul(left_cost))
 }
 
-/// One planning decision of [`SnapshotCadence::plan`].
+/// One planning decision of [`SnapshotCadence::plan_pass`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnapshotPlan {
     /// Indexes of the groups to snapshot, in order.
     pub groups: Vec<usize>,
-    /// Whether node log bytes reached the pressure watermark.
-    pub pressure: bool,
-    /// Log bytes held across the node's groups.
+    /// How hard the node's log presses on its budget.
+    pub pressure: LogPressure,
+    /// Log bytes held across the node's groups, the log of builds in
+    /// flight included.
     pub node_log_bytes: u64,
 }
 
@@ -281,6 +483,11 @@ impl GroupLogGauge {
         self.has_snapshot.store(true, AtomicOrdering::Relaxed);
     }
 
+    /// Applied log bytes the latest snapshot covers.
+    pub(crate) fn snapshot_mark_bytes(&self) -> u64 {
+        self.snapshot_bytes_mark.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn progress(&self) -> GroupLogProgress {
         let applied_bytes = self.applied_bytes.load(AtomicOrdering::Relaxed);
         let applied_entries = self.applied_entries.load(AtomicOrdering::Relaxed);
@@ -297,9 +504,19 @@ impl GroupLogGauge {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::DriveLimits;
+    use super::GroupDriveState;
+    use super::GroupLogGauge;
+    use super::GroupLogMark;
+    use super::GroupLogProgress;
+    use super::LogPressure;
+    use super::MAX_SNAPSHOT_FLOOR_BYTES;
+    use super::MIN_SNAPSHOT_FLOOR_BYTES;
+    use super::PassStep;
+    use super::SnapshotCadence;
 
     const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
 
     fn progress(log_bytes: u64, last_snapshot_bytes: u64) -> GroupLogProgress {
         GroupLogProgress {
@@ -307,6 +524,24 @@ mod tests {
             log_entries: (log_bytes / 256).saturating_add(1),
             last_snapshot_bytes,
             has_snapshot: true,
+        }
+    }
+
+    /// The groups as the driver sees them when none lags or builds.
+    fn drive(groups: &[GroupLogProgress]) -> Vec<GroupDriveState> {
+        groups
+            .iter()
+            .map(|progress| GroupDriveState {
+                progress: *progress,
+                ..GroupDriveState::default()
+            })
+            .collect()
+    }
+
+    fn limits(max_groups: usize, max_builds: usize) -> DriveLimits {
+        DriveLimits {
+            max_groups,
+            max_builds,
         }
     }
 
@@ -358,13 +593,13 @@ mod tests {
             progress(9 * MIB, 512 << 10),
         ];
         let plan = cadence.plan(&groups, 16);
-        assert!(!plan.pressure);
+        assert_eq!(plan.pressure, LogPressure::Calm);
         assert_eq!(plan.groups, vec![3, 0, 2]);
         assert_eq!(cadence.plan(&groups, 1).groups, vec![3]);
     }
 
     #[test]
-    fn pressure_pass_frees_the_most_log_per_snapshot_byte_down_to_half_the_budget() {
+    fn pressure_pass_frees_the_most_log_first_down_to_half_the_budget() {
         let cadence = SnapshotCadence::new(64 * MIB, 4, 100_000);
         assert_eq!(cadence.floor_bytes, 8 * MIB);
         // Large snapshots hold every group below its own threshold while the
@@ -377,10 +612,11 @@ mod tests {
         ];
         assert!(groups.iter().all(|group| !cadence.is_due(group)));
         let plan = cadence.plan(&groups, 16);
-        assert!(plan.pressure);
+        assert_eq!(plan.pressure, LogPressure::Watermark);
         assert_eq!(plan.node_log_bytes, 50 * MIB);
-        // 14/8 > 10/6 > 14/10 > 12/16; stop once at or below 32 MiB.
-        assert_eq!(plan.groups, vec![0, 3]);
+        // 14 and 14 MiB, the lower index first, then 22 MiB is at or below
+        // 32 MiB.
+        assert_eq!(plan.groups, vec![0, 2]);
     }
 
     /// Lagging groups go first, most log first, ahead of due groups and
@@ -400,18 +636,175 @@ mod tests {
             },
         ];
         assert!(!cadence.is_due(&groups[2]) && !cadence.is_due(&groups[3]));
-        let plan = cadence.plan_with_lagging(&groups, &[false, false, true, true, true], 16);
+        let lagging = |flags: &[bool]| {
+            groups
+                .iter()
+                .enumerate()
+                .map(|(index, progress)| GroupDriveState {
+                    progress: *progress,
+                    lagging: flags.get(index).copied().unwrap_or(false),
+                    building: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let plan = cadence.plan_pass(&lagging(&[false, false, true, true, true]), limits(16, 1));
         assert_eq!(plan.groups, vec![3, 2, 0]);
         assert_eq!(
             cadence
-                .plan_with_lagging(&groups, &[false, false, true, true], 1)
+                .plan_pass(&lagging(&[false, false, true, true]), limits(1, 1))
                 .groups,
             vec![3]
         );
         assert_eq!(
-            cadence.plan_with_lagging(&groups, &[], 16),
+            cadence.plan_pass(&lagging(&[]), limits(16, 1)),
             cadence.plan(&groups, 16)
         );
+    }
+
+    /// #519: past the budget a pass keeps more builds in flight, from one
+    /// at the budget to the node's build concurrency before the hard limit.
+    #[test]
+    fn pressure_escalates_from_the_budget_to_the_hard_limit() {
+        let cadence = SnapshotCadence::new(GIB, 128, 100_000);
+        assert_eq!(cadence.hard_limit_bytes(), 2 * GIB);
+        assert_eq!(cadence.resume_bytes(), 3 * GIB / 2);
+        let at = |bytes: u64| cadence.pressure(bytes, 4);
+        assert_eq!(at(0), LogPressure::Calm);
+        assert_eq!(at(3 * GIB / 4 - 1), LogPressure::Calm);
+        assert_eq!(at(3 * GIB / 4), LogPressure::Watermark);
+        assert_eq!(at(GIB - 1), LogPressure::Watermark);
+        assert_eq!(at(GIB), LogPressure::Escalated { builds: 1 });
+        assert_eq!(at(GIB + 1), LogPressure::Escalated { builds: 2 });
+        // Thirds of the way up: 357_913_941 × 3 < 2^30 < 357_913_942 × 3.
+        assert_eq!(at(GIB + 357_913_941), LogPressure::Escalated { builds: 2 });
+        assert_eq!(at(GIB + 357_913_942), LogPressure::Escalated { builds: 3 });
+        assert_eq!(at(GIB + 715_827_882), LogPressure::Escalated { builds: 3 });
+        assert_eq!(at(GIB + 715_827_883), LogPressure::Escalated { builds: 4 });
+        assert_eq!(at(2 * GIB), LogPressure::Escalated { builds: 4 });
+        assert_eq!(at(u64::MAX), LogPressure::Escalated { builds: 4 });
+        // A node that builds one group at a time only changes the order.
+        assert_eq!(cadence.pressure(2 * GIB, 1), LogPressure::Escalated {
+            builds: 1
+        });
+        assert_eq!(cadence.pressure(2 * GIB, 0), LogPressure::Escalated {
+            builds: 1
+        });
+        assert_eq!(
+            (at(0).level(), at(GIB - 1).level(), at(GIB).level()),
+            (0, 1, 2)
+        );
+        assert!(!at(0).is_pressure() && at(3 * GIB / 4).is_pressure());
+        assert_eq!(at(GIB - 1).builds(), 1);
+    }
+
+    /// #519: before each build a pass weighs the log again. Its builds
+    /// follow the pressure down, so a pass planned near the hard limit keeps
+    /// one build in flight once its builds brought the log below the budget,
+    /// and a log that climbs past the pressure the pass was planned for ends
+    /// it, so the next pass plans for more.
+    #[test]
+    fn a_pass_follows_the_log_down_and_ends_when_it_climbs() {
+        let cadence = SnapshotCadence::new(GIB, 128, 100_000);
+        let step = |planned: LogPressure, bytes: u64| cadence.pass_step(planned, bytes, 4);
+        let four = LogPressure::Escalated { builds: 4 };
+        let two = LogPressure::Escalated { builds: 2 };
+        assert_eq!(step(four, 2 * GIB), PassStep::Start { builds: 4 });
+        assert_eq!(step(four, GIB + GIB / 2), PassStep::Start { builds: 3 });
+        assert_eq!(step(four, GIB + 1), PassStep::Start { builds: 2 });
+        assert_eq!(step(four, GIB), PassStep::Start { builds: 1 });
+        assert_eq!(step(four, GIB - 1), PassStep::Start { builds: 1 });
+        assert_eq!(step(four, 0), PassStep::Start { builds: 1 });
+        assert_eq!(step(two, GIB + 1), PassStep::Start { builds: 2 });
+        // The log climbed past the pressure the pass was planned for.
+        assert_eq!(step(two, GIB + GIB / 2), PassStep::Outgrown);
+        assert_eq!(step(LogPressure::Watermark, GIB), PassStep::Outgrown);
+        assert_eq!(step(LogPressure::Calm, 3 * GIB / 4), PassStep::Outgrown);
+        assert_eq!(step(LogPressure::Watermark, 3 * GIB / 4), PassStep::Start {
+            builds: 1
+        });
+        assert_eq!(step(LogPressure::Calm, 0), PassStep::Start { builds: 1 });
+    }
+
+    /// #519: under pressure the builds are what runs short, so a pass starts
+    /// with the groups that free the most log per build. Ordered by log per
+    /// snapshot byte, a group that applied a few entries over a near-empty
+    /// snapshot came before every group being written.
+    #[test]
+    fn a_pressure_pass_starts_with_the_most_reclaimable_log() {
+        // A group of #519 that took no writes: 14 entries over a 22-byte
+        // snapshot, 81 log bytes per snapshot byte.
+        let idle = GroupLogProgress {
+            log_bytes: 1792,
+            log_entries: 14,
+            last_snapshot_bytes: 22,
+            has_snapshot: true,
+        };
+        let groups = drive(&[
+            idle,
+            progress(30 * MIB, 30 * MIB),
+            progress(20 * MIB, MIB),
+            progress(16 * MIB, 2 * MIB),
+        ]);
+        // An entry backstop no group reaches: only log bytes make one due.
+        let backstop = 1 << 20;
+        // 66 MiB against an 80 MiB budget is at the watermark: floor 10 MiB,
+        // target 40 MiB. 66 MiB left, then only due groups: 20 and 16 MiB
+        // are past the floor, the idle group's 1792 bytes are not.
+        let watermark = SnapshotCadence::new(80 * MIB, 4, backstop);
+        let plan = watermark.plan_pass(&groups, limits(16, 1));
+        assert_eq!(plan.pressure, LogPressure::Watermark);
+        assert_eq!(plan.groups, vec![1, 2, 3]);
+        // Against a 64 MiB budget it is past the budget, target 32 MiB: 66
+        // and 36 MiB left, then the due 16 MiB group.
+        let escalated = SnapshotCadence::new(64 * MIB, 4, backstop);
+        let plan = escalated.plan_pass(&groups, limits(16, 1));
+        assert_eq!(plan.pressure, LogPressure::Escalated { builds: 1 });
+        assert_eq!(plan.groups, vec![1, 2, 3]);
+        // In calm only due groups run, the most log freed per snapshot byte
+        // first: 20 MiB over 1 MiB before 16 MiB over 2 MiB.
+        let calm = SnapshotCadence::new(GIB, 4, backstop);
+        let plan = calm.plan_pass(&groups, limits(16, 1));
+        assert_eq!(plan.pressure, LogPressure::Calm);
+        assert_eq!(plan.groups, vec![2, 3]);
+    }
+
+    /// #519: an escalated pass starts `max_groups` groups per build it
+    /// keeps in flight, so it lasts about as long as a pass below the
+    /// budget.
+    #[test]
+    fn an_escalated_pass_starts_more_groups_the_more_builds_it_runs() {
+        // 8 MiB of log over 8 MiB snapshots: no group is due on its own.
+        let cadence = SnapshotCadence::new(64 * MIB, 16, 100_000);
+        let groups = drive(&[progress(8 * MIB, 8 * MIB); 16]);
+        assert!(!cadence.is_due(&groups[0].progress));
+        // 128 MiB is the hard limit: four builds, eight groups.
+        let plan = cadence.plan_pass(&groups, limits(2, 4));
+        assert_eq!(plan.pressure, LogPressure::Escalated { builds: 4 });
+        assert_eq!(plan.groups, (0..8).collect::<Vec<_>>());
+        // At the budget: one build, two groups.
+        let plan = cadence.plan_pass(&groups[..8], limits(2, 4));
+        assert_eq!(plan.pressure, LogPressure::Escalated { builds: 1 });
+        assert_eq!(plan.groups, vec![0, 1]);
+    }
+
+    /// A group whose build is in flight is never planned again (OpenRaft
+    /// drops the trigger), and the log that build will free counts as freed.
+    #[test]
+    fn a_pass_skips_builds_in_flight_and_counts_their_log_as_freed() {
+        // Four 16 MiB groups over 16 MiB snapshots, none due, fill a 64 MiB
+        // budget, whose target is 32 MiB.
+        let cadence = SnapshotCadence::new(64 * MIB, 4, 100_000);
+        let mut groups = drive(&[progress(16 * MIB, 16 * MIB); 4]);
+        assert_eq!(cadence.plan_pass(&groups, limits(16, 1)).groups, vec![0, 1]);
+        groups[0].building = Some(16 * MIB);
+        assert_eq!(groups[0].reclaimable_bytes(), 0);
+        let plan = cadence.plan_pass(&groups, limits(16, 1));
+        // The node still holds the log of the build in flight.
+        assert_eq!(plan.node_log_bytes, 64 * MIB);
+        assert_eq!(plan.groups, vec![1]);
+        // A lagging group waits for its build in flight too.
+        groups[0].lagging = true;
+        assert_eq!(cadence.plan_pass(&groups, limits(16, 1)).groups, vec![1]);
     }
 
     #[test]
@@ -422,7 +815,9 @@ mod tests {
         let mark = gauge.mark();
         // Applied while the snapshot builds: counts toward the next one.
         gauge.record_applied(25);
+        assert_eq!(gauge.snapshot_mark_bytes(), 0);
         gauge.record_snapshot(mark, 1_000);
+        assert_eq!(gauge.snapshot_mark_bytes(), 150);
         assert_eq!(gauge.progress(), GroupLogProgress {
             log_bytes: 25,
             log_entries: 1,
@@ -432,5 +827,189 @@ mod tests {
         // An older mark never moves the counters back.
         gauge.record_snapshot(GroupLogMark::default(), 900);
         assert_eq!(gauge.progress().log_bytes, 25);
+    }
+}
+
+/// Properties of the pass policy over random nodes (#519). Not under
+/// madsim: the runner draws its seeds from the host.
+#[cfg(all(test, not(madsim)))]
+mod proptests {
+    use std::cmp::Reverse;
+    use std::collections::BTreeSet;
+
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    use super::DriveLimits;
+    use super::GroupDriveState;
+    use super::GroupLogProgress;
+    use super::LogPressure;
+    use super::PassStep;
+    use super::SnapshotCadence;
+
+    const MIB: u64 = 1 << 20;
+
+    fn sum(values: impl Iterator<Item = u64>) -> u64 {
+        values.fold(0, u64::saturating_add)
+    }
+
+    /// One group holding up to `max_log` bytes of log.
+    fn group(max_log: u64) -> impl Strategy<Value = GroupDriveState> {
+        (
+            0..=max_log,
+            0..=max_log,
+            proptest::bool::weighted(0.2),
+            proptest::option::weighted(0.25, 0..=max_log),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(log_bytes, last_snapshot_bytes, lagging, building, applied)| GroupDriveState {
+                    progress: GroupLogProgress {
+                        log_bytes,
+                        // Every entry carries log bytes, but a group may
+                        // hold entries the estimate counts as nothing.
+                        log_entries: if log_bytes > 0 || applied {
+                            (log_bytes / 4096).saturating_add(1)
+                        } else {
+                            0
+                        },
+                        last_snapshot_bytes,
+                        has_snapshot: last_snapshot_bytes > 0,
+                    },
+                    lagging,
+                    // A build in flight frees at most the log its group holds.
+                    building: building.map(|pending| pending.min(log_bytes)),
+                },
+            )
+    }
+
+    /// A node from calm to past its hard limit: up to an eighth of the
+    /// budget per group.
+    fn node() -> impl Strategy<Value = (SnapshotCadence, Vec<GroupDriveState>, DriveLimits)> {
+        (1u64..=256, 0usize..=40, 1usize..=6, 1usize..=4).prop_flat_map(
+            |(budget_mib, count, max_groups, max_builds)| {
+                let budget = budget_mib.saturating_mul(MIB);
+                (
+                    Just(SnapshotCadence::new(budget, count, 100_000)),
+                    vec(group((budget / 8).max(1)), count..=count),
+                    Just(DriveLimits {
+                        max_groups,
+                        max_builds,
+                    }),
+                )
+            },
+        )
+    }
+
+    /// A budget and two log sizes up to three budgets.
+    fn logs() -> impl Strategy<Value = (u64, u64, u64)> {
+        (1u64..=(8 << 30)).prop_flat_map(|budget| {
+            let top = budget.saturating_mul(3);
+            (Just(budget), 0..=top, 0..=top)
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// The pressure only rises with the log, never asks for more builds
+        /// than the node runs, and asks for all of them at the hard limit.
+        #[test]
+        fn prop_pressure_rises_with_the_log(
+            (budget, first, second) in logs(),
+            max_builds in 0usize..=8,
+        ) {
+            let cadence = SnapshotCadence::new(budget, 128, 100_000);
+            let (low, high) = (first.min(second), first.max(second));
+            let pressure = cadence.pressure(high, max_builds);
+            prop_assert!(cadence.pressure(low, max_builds) <= pressure);
+            prop_assert!((1..=max_builds.max(1)).contains(&pressure.builds()));
+            prop_assert_eq!(pressure.is_pressure(), high >= cadence.pressure_watermark_bytes());
+            if high < cadence.node_budget_bytes {
+                prop_assert_eq!(pressure.builds(), 1);
+            }
+            if high >= cadence.hard_limit_bytes() {
+                prop_assert_eq!(pressure, LogPressure::Escalated { builds: max_builds.max(1) });
+            }
+        }
+
+        /// Before each build a pass keeps as many builds in flight as the
+        /// pressure now calls for, never more than it was planned for, and
+        /// ends exactly when the log climbed past the pressure it was
+        /// planned for.
+        #[test]
+        fn prop_a_pass_never_runs_more_builds_than_planned(
+            (budget, planned_log, now_log) in logs(),
+            max_builds in 0usize..=8,
+        ) {
+            let cadence = SnapshotCadence::new(budget, 128, 100_000);
+            let planned = cadence.pressure(planned_log, max_builds);
+            let now = cadence.pressure(now_log, max_builds);
+            match cadence.pass_step(planned, now_log, max_builds) {
+                PassStep::Outgrown => prop_assert!(now > planned),
+                PassStep::Start { builds } => {
+                    prop_assert!(now <= planned);
+                    prop_assert_eq!(builds, now.builds());
+                    prop_assert!(builds <= planned.builds());
+                    prop_assert!((1..=max_builds.max(1)).contains(&builds));
+                }
+            }
+            if now_log <= planned_log {
+                prop_assert_ne!(cadence.pass_step(planned, now_log, max_builds), PassStep::Outgrown);
+            }
+        }
+
+        /// A pass never plans a group that cannot build, a group twice, or
+        /// more groups than its cap. Lagging groups lead, a pass under
+        /// pressure orders the rest by reclaimable log, and one that stops
+        /// short of its cap either plans the node down to the target or
+        /// plans every group it could.
+        #[test]
+        fn prop_a_pass_keeps_its_limits((cadence, groups, limits) in node()) {
+            let plan = cadence.plan_pass(&groups, limits);
+            let node_log = sum(groups.iter().map(|group| group.progress.log_bytes));
+            prop_assert_eq!(plan.node_log_bytes, node_log);
+            prop_assert_eq!(plan.pressure, cadence.pressure(node_log, limits.max_builds));
+            let cap = limits.max_groups.saturating_mul(plan.pressure.builds());
+            prop_assert!(plan.groups.len() <= cap);
+            let startable = |group: &GroupDriveState| {
+                group.building.is_none() && group.progress.log_entries > 0
+            };
+            let mut seen = BTreeSet::new();
+            for index in &plan.groups {
+                prop_assert!(seen.insert(*index), "group {} planned twice", index);
+                let group = groups[*index];
+                prop_assert!(startable(&group), "group {} cannot build", index);
+                if !plan.pressure.is_pressure() && !group.lagging {
+                    prop_assert!(cadence.is_due(&group.progress));
+                }
+            }
+            let led = plan
+                .groups
+                .iter()
+                .take_while(|index| groups[**index].lagging)
+                .count();
+            let lagging = groups.iter().filter(|group| group.lagging && startable(group)).count();
+            prop_assert_eq!(led, lagging.min(cap));
+            prop_assert!(plan.groups[led..].iter().all(|index| !groups[*index].lagging));
+            let key = |index: usize| (Reverse(groups[index].reclaimable_bytes()), index);
+            prop_assert!(plan.groups[..led].windows(2).all(|pair| key(pair[0]) < key(pair[1])));
+            if plan.pressure.is_pressure() {
+                prop_assert!(plan.groups[led..].windows(2).all(|pair| key(pair[0]) < key(pair[1])));
+            }
+            if plan.pressure.is_pressure() && plan.groups.len() < cap {
+                let left = node_log
+                    .saturating_sub(sum(groups.iter().filter_map(|group| group.building)))
+                    .saturating_sub(sum(plan.groups.iter().map(|index| groups[*index].progress.log_bytes)));
+                let all = groups.iter().filter(|group| startable(group)).count();
+                prop_assert!(
+                    left <= cadence.pressure_target_bytes() || plan.groups.len() == all,
+                    "stopped at {} of {} groups with {} bytes left",
+                    plan.groups.len(),
+                    all,
+                    left
+                );
+            }
+        }
     }
 }

@@ -466,7 +466,8 @@ container receives only chart-managed container settings plus explicit
 | `raft.resumeAvailableBytes` | `1073741824` | Free bytes required before WAL disk pressure clears; must exceed the minimum. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
 | `raft.snapshotLogsSinceLast` | `5000` | Committed log entries per group between automatic full-state snapshots. Higher values trade log memory for lower snapshot CPU and tail latency. |
-| `raft.snapshotPressureMaxGroupsPerTick` | `16` | Maximum groups snapshotted by one pressure pass. |
+| `raft.snapshotPressureMaxGroupsPerTick` | `16` | Maximum groups snapshotted by one pressure pass while the node's Raft log is below its budget. Past the budget a pass starts this many for each snapshot build it keeps in flight. |
+| `raft.snapshotBuildMaxConcurrency` | `null` | Snapshot builds a node runs at once. Each holds a copy of its group's state and its compressed upload. The snapshot driver keeps one in flight while the node's Raft log is below its budget, and past it more, up to this many before the hard limit of twice the budget. Renders `raft.snapshot_build_max_concurrency` when set. Unset, each server keeps its own default (2 from 0.7.4, 1 before), so a pod that still runs an older image keeps the setting it was validated with. |
 | `raft.maxInSnapshotLogToKeep` | `64` | Payload-bearing Raft log entries retained per group after snapshot coverage. Renders `raft.max_in_snapshot_log_to_keep`. |
 
 ### Persistence

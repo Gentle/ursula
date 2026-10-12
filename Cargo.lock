@@ -4632,6 +4632,7 @@ dependencies = [
  "openraft-rt-tokio",
  "opentelemetry",
  "pin-project-lite",
+ "proptest",
  "prost 0.13.5",
  "protoc-bin-vendored",
  "raft-log",

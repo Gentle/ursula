@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use futures_util::Stream;
 use futures_util::TryStreamExt;
@@ -65,6 +66,7 @@ use crate::log_store::elapsed_ns;
 use crate::log_store::replace_file;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
+use crate::rt::sync::watch;
 use crate::rt::time::Instant;
 use crate::snapshot_cadence::GroupLogGauge;
 use crate::snapshot_cadence::GroupLogMark;
@@ -84,15 +86,104 @@ pub struct SnapshotBuildCoordinator {
 #[derive(Debug)]
 struct SnapshotBuildCoordinatorInner {
     semaphore: Arc<Semaphore>,
+    /// The semaphore's permits: the builds the node runs at once at most.
+    max_concurrency: usize,
     /// Per-group log gauges (F12e), shared node-wide like the permit, so
     /// the snapshot driver reads what every group's state machine counts.
     log_gauges: Arc<Mutex<BTreeMap<u32, Arc<GroupLogGauge>>>>,
-    /// Build permits the snapshot driver took for a group it is about to
-    /// trigger; that group's next build uses it instead of competing for one.
-    handoffs: Mutex<BTreeMap<u32, OwnedSemaphorePermit>>,
+    /// Build permits handed to a group about to be triggered, one per group
+    /// at a time; that group's next build uses it instead of competing for
+    /// one.
+    handoffs: Mutex<BTreeMap<u32, HandedOff>>,
+    /// Numbers the hand-offs in `handoffs`.
+    next_handoff: AtomicU64,
+    /// The builds that hold a permit, by build number. The snapshot driver
+    /// reads them to skip groups that already build and to wait for a free
+    /// slot (#519).
+    builds: watch::Sender<BTreeMap<u64, BuildInFlight>>,
+    /// Numbers the builds in `builds`.
+    next_build: AtomicU64,
     /// Set while the node's unsnapshotted Raft log is over its hard limit;
     /// client writes are refused with 503 until snapshots bring it back.
     log_pressure: Arc<AtomicBool>,
+}
+
+/// What became of a build permit handed to a group with its snapshot trigger
+/// ([`SnapshotBuildCoordinator::hand_off_and_trigger`]).
+#[derive(Debug)]
+pub enum Handoff<E> {
+    /// The group's build claimed the permit, so it runs.
+    Claimed,
+    /// The group's build did not claim the permit in time, and it went back
+    /// to the node's permits. OpenRaft drops a trigger while it counts a
+    /// build of the group as running, which it does until RaftCore handles
+    /// the build's end, and that can come after the build released its
+    /// permit. A build that waits behind its group's applies claims too
+    /// late as well.
+    Unclaimed,
+    /// The trigger failed, and the permit went back to the node's permits.
+    TriggerFailed(E),
+    /// A permit handed to the group earlier is still pending, so this one
+    /// went back to the node's permits and nothing was triggered: the
+    /// group's next build claims the earlier one.
+    Busy,
+}
+
+/// A build permit handed to a group, with its hand-off's number.
+#[derive(Debug)]
+struct HandedOff {
+    token: u64,
+    permit: OwnedSemaphorePermit,
+}
+
+/// A hand-off its caller still waits on. Dropped before a build claimed the
+/// permit, it takes the permit back, so a caller that stops waiting (its
+/// future dropped, or its trigger panicking) never leaves the permit parked
+/// under the group.
+struct PendingHandoff<'a> {
+    coordinator: &'a SnapshotBuildCoordinator,
+    raft_group_id: u32,
+    token: u64,
+}
+
+impl PendingHandoff<'_> {
+    /// Takes the permit back unless a build claimed it; returns whether it
+    /// did.
+    fn reclaim(&self) -> bool {
+        self.coordinator
+            .reclaim_handoff(self.raft_group_id, self.token)
+    }
+}
+
+impl Drop for PendingHandoff<'_> {
+    fn drop(&mut self) {
+        self.reclaim();
+    }
+}
+
+/// One snapshot build that holds a permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BuildInFlight {
+    raft_group_id: u32,
+    /// Applied log bytes the build covers ([`GroupLogMark::bytes`]).
+    log_mark: u64,
+}
+
+/// One snapshot build's hold on a node-wide build permit. While it lives
+/// the build counts in [`SnapshotBuildCoordinator::builds_in_flight`].
+#[derive(Debug)]
+pub(crate) struct SnapshotBuildLease {
+    _permit: OwnedSemaphorePermit,
+    build: u64,
+    builds: watch::Sender<BTreeMap<u64, BuildInFlight>>,
+}
+
+impl Drop for SnapshotBuildLease {
+    fn drop(&mut self) {
+        let build = self.build;
+        self.builds
+            .send_if_modified(|builds| builds.remove(&build).is_some());
+    }
 }
 
 impl Default for SnapshotBuildCoordinator {
@@ -103,61 +194,89 @@ impl Default for SnapshotBuildCoordinator {
 
 impl SnapshotBuildCoordinator {
     pub fn new(max_concurrency: usize) -> Self {
-        Self {
-            inner: Arc::new(SnapshotBuildCoordinatorInner {
-                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
-                log_gauges: Arc::default(),
-                handoffs: Mutex::default(),
-                log_pressure: Arc::default(),
-            }),
-        }
+        Self::with_shared(max_concurrency, Arc::default(), Arc::default())
     }
 
     /// A coordinator with a new build concurrency that keeps this one's log
     /// gauges.
     pub fn with_max_concurrency(&self, max_concurrency: usize) -> Self {
+        Self::with_shared(
+            max_concurrency,
+            Arc::clone(&self.inner.log_gauges),
+            Arc::clone(&self.inner.log_pressure),
+        )
+    }
+
+    fn with_shared(
+        max_concurrency: usize,
+        log_gauges: Arc<Mutex<BTreeMap<u32, Arc<GroupLogGauge>>>>,
+        log_pressure: Arc<AtomicBool>,
+    ) -> Self {
+        let max_concurrency = max_concurrency.max(1);
         Self {
             inner: Arc::new(SnapshotBuildCoordinatorInner {
-                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
-                log_gauges: Arc::clone(&self.inner.log_gauges),
+                semaphore: Arc::new(Semaphore::new(max_concurrency)),
+                max_concurrency,
+                log_gauges,
                 handoffs: Mutex::default(),
-                log_pressure: Arc::clone(&self.inner.log_pressure),
+                next_handoff: AtomicU64::new(0),
+                builds: watch::Sender::new(BTreeMap::new()),
+                next_build: AtomicU64::new(0),
+                log_pressure,
             }),
         }
     }
 
+    /// The builds the node runs at once at most.
+    pub fn max_concurrency(&self) -> usize {
+        self.inner.max_concurrency
+    }
+
     /// The log gauge of `raft_group_id`, created on first use (F12e).
     pub fn log_gauge(&self, raft_group_id: u32) -> Arc<GroupLogGauge> {
-        let mut gauges = self
-            .inner
-            .log_gauges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut gauges = self.log_gauges();
         Arc::clone(gauges.entry(raft_group_id).or_default())
     }
 
     /// Actual log progress, including retained stopped-group history.
     pub fn log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
-        self.inner
-            .log_gauges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.log_gauges()
             .iter()
             .map(|(group, gauge)| (*group, gauge.progress()))
             .collect()
     }
 
-    /// Stopped groups cannot snapshot and must not permanently hold the
-    /// snapshot-driven write-pressure gate closed for healthy groups.
-    pub fn reclaimable_log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
-        self.inner
-            .log_gauges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(_, gauge)| !gauge.apply_stopped())
-            .map(|(group, gauge)| (*group, gauge.progress()))
-            .collect()
+    /// The unsnapshotted log the groups that can still snapshot hold: what
+    /// the hard limit and the snapshot driver's pressure weigh. Stopped
+    /// groups cannot snapshot, so their log must not hold the write gate
+    /// closed for healthy groups for good.
+    pub fn node_log_bytes(&self) -> u64 {
+        self.log_gauges()
+            .values()
+            .filter(|gauge| !gauge.apply_stopped())
+            .map(|gauge| gauge.progress().log_bytes)
+            .fold(0, u64::saturating_add)
+    }
+
+    /// The groups whose snapshot build holds a permit, each with the log
+    /// bytes its build will still free: none once the build recorded its
+    /// snapshot, while it still publishes the snapshot's reference.
+    pub fn builds_in_flight(&self) -> BTreeMap<u32, u64> {
+        let gauges = self.log_gauges();
+        let mut groups = BTreeMap::<u32, u64>::new();
+        for build in self.inner.builds.borrow().values() {
+            let freed = gauges
+                .get(&build.raft_group_id)
+                .map_or(0, |gauge| gauge.snapshot_mark_bytes());
+            let pending = groups.entry(build.raft_group_id).or_default();
+            *pending = pending.saturating_add(build.log_mark.saturating_sub(freed));
+        }
+        groups
+    }
+
+    /// Snapshot builds that hold a permit now.
+    pub fn running_builds(&self) -> usize {
+        self.inner.builds.borrow().len()
     }
 
     pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, GroupEngineError> {
@@ -169,42 +288,194 @@ impl SnapshotBuildCoordinator {
             .map_err(|err| GroupEngineError::new(format!("snapshot build gate closed: {err}")))
     }
 
+    /// Waits until fewer builds hold a permit than `limit` asks for, then
+    /// takes one. `limit` is asked again whenever a build starts or ends and
+    /// at least every `poll`, since what the snapshot driver weighs (its log
+    /// pressure, #519) moves with the builds and between them. `None` ends
+    /// the wait without a permit. A build that starts in between can take
+    /// the node past the limit for a while: the driver paces its own builds
+    /// with it, and the permits bound every build.
+    pub async fn acquire_below(
+        &self,
+        poll: Duration,
+        mut limit: impl FnMut() -> Option<usize>,
+    ) -> Result<Option<OwnedSemaphorePermit>, GroupEngineError> {
+        let mut builds = self.inner.builds.subscribe();
+        loop {
+            let Some(slots) = limit() else {
+                return Ok(None);
+            };
+            // Marked seen before the comparison, so a build that starts or
+            // ends after it wakes the wait below.
+            let running = builds.borrow_and_update().len();
+            if running < slots.max(1) {
+                return self.acquire().await.map(Some);
+            }
+            crate::rt::select! {
+                changed = builds.changed() => changed.map_err(|_closed| {
+                    GroupEngineError::new("snapshot build registry closed")
+                })?,
+                () = crate::rt::time::sleep(poll) => {}
+            }
+        }
+    }
+
+    /// Hands `permit` to `raft_group_id`, runs `trigger` (the group's
+    /// snapshot trigger) and waits up to `wait` for the group's next build
+    /// to claim the permit. The permit goes back to the node's permits
+    /// unless the build claimed it, also when the caller stops waiting or
+    /// the trigger panics. While a permit handed to the group earlier is
+    /// pending, this one goes back at once ([`Handoff::Busy`]).
+    ///
+    /// A triggered build otherwise only *tries* for a permit and is refused
+    /// while other groups hold every one, so a driver firing many groups at
+    /// once built about one per tick and the Raft log outgrew memory under
+    /// sustained writes (#519). A caller that needs the build to run takes a
+    /// permit first (waiting until fewer builds run than it allows, as
+    /// [`SnapshotBuildCoordinator::acquire_below`] does) and hands it over.
+    pub async fn hand_off_and_trigger<E>(
+        &self,
+        raft_group_id: u32,
+        permit: OwnedSemaphorePermit,
+        wait: Duration,
+        trigger: impl Future<Output = Result<(), E>>,
+    ) -> Handoff<E> {
+        let Ok(token) = self.hand_off(raft_group_id, permit) else {
+            return Handoff::Busy;
+        };
+        let pending = PendingHandoff {
+            coordinator: self,
+            raft_group_id,
+            token,
+        };
+        if let Err(err) = trigger.await {
+            pending.reclaim();
+            return Handoff::TriggerFailed(err);
+        }
+        let _claimed_or_late =
+            crate::rt::time::timeout(wait, self.handoff_claimed(raft_group_id, token)).await;
+        if pending.reclaim() {
+            Handoff::Unclaimed
+        } else {
+            Handoff::Claimed
+        }
+    }
+
+    /// Waits until hand-off `token` to `raft_group_id` is no longer
+    /// pending: a build claimed it, or it was taken back. A claim registers
+    /// its build, which wakes the wait.
+    pub(crate) async fn handoff_claimed(&self, raft_group_id: u32, token: u64) {
+        // Subscribed before the check, so a claim right after it still
+        // wakes the wait.
+        let mut builds = self.inner.builds.subscribe();
+        while self.handoff_pending(raft_group_id, token) {
+            if builds.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Reserves `permit` for the next snapshot build of `raft_group_id`
+    /// ([`SnapshotBuildCoordinator::hand_off_and_trigger`]) and returns the
+    /// hand-off's number, unless a permit handed to the group is still
+    /// pending: `permit` then comes back.
+    pub(crate) fn hand_off(
+        &self,
+        raft_group_id: u32,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<u64, OwnedSemaphorePermit> {
+        let mut handoffs = self.handoffs();
+        if handoffs.contains_key(&raft_group_id) {
+            return Err(permit);
+        }
+        let token = self.inner.next_handoff.fetch_add(1, Ordering::Relaxed);
+        handoffs.insert(raft_group_id, HandedOff { token, permit });
+        Ok(token)
+    }
+
+    /// Whether hand-off `token` to `raft_group_id` is still unclaimed.
+    pub(crate) fn handoff_pending(&self, raft_group_id: u32, token: u64) -> bool {
+        self.handoffs()
+            .get(&raft_group_id)
+            .is_some_and(|handed| handed.token == token)
+    }
+
+    /// Takes back hand-off `token` to `raft_group_id` unless a build claimed
+    /// it; returns whether it did. Another hand-off to the group stays.
+    pub(crate) fn reclaim_handoff(&self, raft_group_id: u32, token: u64) -> bool {
+        let mut handoffs = self.handoffs();
+        let ours = handoffs
+            .get(&raft_group_id)
+            .is_some_and(|handed| handed.token == token);
+        let taken = if ours {
+            handoffs.remove(&raft_group_id)
+        } else {
+            None
+        };
+        // The permit goes back to the node's permits outside the lock.
+        drop(handoffs);
+        taken.is_some()
+    }
+
+    /// Claims the permit handed off to `raft_group_id` for a build covering
+    /// `log_mark`. The build counts as in flight before the handoff is gone,
+    /// so the driver never sees neither.
+    fn claim_handoff(&self, raft_group_id: u32, log_mark: u64) -> Option<SnapshotBuildLease> {
+        let mut handoffs = self.handoffs();
+        let handed = handoffs.remove(&raft_group_id)?;
+        let lease = self.lease(handed.permit, raft_group_id, log_mark);
+        drop(handoffs);
+        Some(lease)
+    }
+
     /// Takes a build permit only if one is free right now. The policy path
     /// uses this so that one group's apply worker never waits behind another
     /// group's snapshot build (bounded-stream-state F12d).
-    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
-        self.inner.semaphore.clone().try_acquire_owned().ok()
+    fn try_lease(&self, raft_group_id: u32, log_mark: u64) -> Option<SnapshotBuildLease> {
+        let permit = self.inner.semaphore.clone().try_acquire_owned().ok()?;
+        Some(self.lease(permit, raft_group_id, log_mark))
     }
 
-    /// Reserves `permit` for the next snapshot build of `raft_group_id`.
-    ///
-    /// The snapshot driver acquires a permit (waiting for the previous build
-    /// to finish) and hands it to the group it triggers. A triggered build
-    /// otherwise only *tries* for a permit and is refused while another group
-    /// builds, so a driver firing many groups at once built about one per
-    /// tick and the Raft log outgrew memory under sustained writes.
-    pub fn hand_off(&self, raft_group_id: u32, permit: OwnedSemaphorePermit) {
-        self.handoffs().insert(raft_group_id, permit);
+    /// Waits for a build permit.
+    async fn wait_lease(
+        &self,
+        raft_group_id: u32,
+        log_mark: u64,
+    ) -> Result<SnapshotBuildLease, GroupEngineError> {
+        let permit = self.acquire().await?;
+        Ok(self.lease(permit, raft_group_id, log_mark))
     }
 
-    /// Whether `raft_group_id`'s handed-off permit is still unclaimed.
-    pub fn handoff_pending(&self, raft_group_id: u32) -> bool {
-        self.handoffs().contains_key(&raft_group_id)
+    fn lease(
+        &self,
+        permit: OwnedSemaphorePermit,
+        raft_group_id: u32,
+        log_mark: u64,
+    ) -> SnapshotBuildLease {
+        let build = self.inner.next_build.fetch_add(1, Ordering::Relaxed);
+        self.inner.builds.send_modify(|builds| {
+            builds.insert(build, BuildInFlight {
+                raft_group_id,
+                log_mark,
+            });
+        });
+        SnapshotBuildLease {
+            _permit: permit,
+            build,
+            builds: self.inner.builds.clone(),
+        }
     }
 
-    /// Takes back an unclaimed handed-off permit (the trigger was dropped);
-    /// returns whether there was one.
-    pub fn reclaim_handoff(&self, raft_group_id: u32) -> bool {
-        self.handoffs().remove(&raft_group_id).is_some()
-    }
-
-    fn take_handoff(&self, raft_group_id: u32) -> Option<OwnedSemaphorePermit> {
-        self.handoffs().remove(&raft_group_id)
-    }
-
-    fn handoffs(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, OwnedSemaphorePermit>> {
+    fn handoffs(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, HandedOff>> {
         self.inner
             .handoffs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn log_gauges(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, Arc<GroupLogGauge>>> {
+        self.inner
+            .log_gauges
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -759,9 +1030,9 @@ impl RaftGroupStateMachine {
         self.engine.install_snapshot(snapshot).await
     }
 
-    async fn snapshot_builder_with_permit(
+    async fn snapshot_builder_with_lease(
         &mut self,
-        build_permit: OwnedSemaphorePermit,
+        build: SnapshotBuildLease,
     ) -> RaftGroupSnapshotBuilder {
         let snapshot = self.engine.snapshot(self.placement).await.map(Arc::new);
         RaftGroupSnapshotBuilder {
@@ -773,7 +1044,7 @@ impl RaftGroupStateMachine {
             metadata_serial: self.metadata_serial.clone(),
             snapshot_store: self.snapshot_store.clone(),
             metrics: self.metrics.clone(),
-            _build_permit: build_permit,
+            _build: build,
             snapshot_metadata_path: self.snapshot_metadata_path.clone(),
             log_gauge: Arc::clone(&self.log_gauge),
             log_mark: self.log_gauge.mark(),
@@ -905,41 +1176,41 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         if force {
             return Some(self.get_snapshot_builder().await);
         }
+        let raft_group_id = self.placement.raft_group_id.0;
+        // Nothing applies on this worker until the builder captured the
+        // group, so the log applied now is what the snapshot covers.
+        let log_mark = self.log_gauge.mark().bytes();
         // The snapshot driver hands the permit over before it triggers.
-        if let Some(build_permit) = self
-            .snapshot_build
-            .take_handoff(self.placement.raft_group_id.0)
-        {
-            return Some(self.snapshot_builder_with_permit(build_permit).await);
+        if let Some(build) = self.snapshot_build.claim_handoff(raft_group_id, log_mark) {
+            return Some(self.snapshot_builder_with_lease(build).await);
         }
         // A policy-triggered build defers instead of waiting for the
         // node-wide permit on this group's state-machine worker; OpenRaft
         // retries on a later trigger.
-        let Some(build_permit) = self.snapshot_build.try_acquire() else {
+        let Some(build) = self.snapshot_build.try_lease(raft_group_id, log_mark) else {
             tracing::debug!(
-                raft_group_id = self.placement.raft_group_id.0,
-                "deferring OpenRaft snapshot build while another group holds the build permit"
+                raft_group_id,
+                "deferring OpenRaft snapshot build while other groups hold every build permit"
             );
             return None;
         };
-        Some(self.snapshot_builder_with_permit(build_permit).await)
+        Some(self.snapshot_builder_with_lease(build).await)
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        let raft_group_id = self.placement.raft_group_id.0;
+        let log_mark = self.log_gauge.mark().bytes();
         // A permit already handed to this group would otherwise be held
         // while this build waits for another one.
-        let build_permit = match self
-            .snapshot_build
-            .take_handoff(self.placement.raft_group_id.0)
-        {
-            Some(build_permit) => build_permit,
+        let build = match self.snapshot_build.claim_handoff(raft_group_id, log_mark) {
+            Some(build) => build,
             None => self
                 .snapshot_build
-                .acquire()
+                .wait_lease(raft_group_id, log_mark)
                 .await
                 .expect("snapshot build coordinator should not close"),
         };
-        self.snapshot_builder_with_permit(build_permit).await
+        self.snapshot_builder_with_lease(build).await
     }
 
     async fn begin_receiving_snapshot(
@@ -1057,7 +1328,8 @@ pub struct RaftGroupSnapshotBuilder {
     metadata_serial: Arc<crate::rt::sync::Mutex<MetadataPublicationState>>,
     snapshot_store: SharedSnapshotStore,
     metrics: Option<GroupEngineMetrics>,
-    _build_permit: OwnedSemaphorePermit,
+    /// The build's permit, counted in flight until the builder is dropped.
+    _build: SnapshotBuildLease,
     snapshot_metadata_path: Option<PathBuf>,
     log_gauge: Arc<GroupLogGauge>,
     /// The applied log this snapshot covers (F12e).
@@ -1359,16 +1631,9 @@ mod tests {
         let healthy = coordinator.log_gauge(1);
         stopped.record_applied(10_000);
         healthy.record_applied(1);
-        assert_eq!(coordinator.reclaimable_log_progress().len(), 2);
+        assert_eq!(coordinator.node_log_bytes(), 10_001);
         stopped.stop_apply();
-        assert_eq!(
-            coordinator
-                .reclaimable_log_progress()
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
+        assert_eq!(coordinator.node_log_bytes(), 1);
         assert_eq!(
             stopped.progress().log_bytes,
             10_000,
@@ -1499,9 +1764,9 @@ mod tests {
     }
 
     #[cfg(not(madsim))]
-    async fn test_build_permit() -> OwnedSemaphorePermit {
+    async fn test_build_lease() -> SnapshotBuildLease {
         SnapshotBuildCoordinator::default()
-            .acquire()
+            .wait_lease(7, 0)
             .await
             .expect("test snapshot build permit")
     }
@@ -1533,7 +1798,7 @@ mod tests {
             metadata_serial: Arc::default(),
             snapshot_store: default_snapshot_store(),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build: test_build_lease().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1598,7 +1863,7 @@ mod tests {
             metadata_serial: Arc::default(),
             snapshot_store: default_snapshot_store(),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build: test_build_lease().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1738,7 +2003,7 @@ mod tests {
             metadata_serial: Arc::default(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build: test_build_lease().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1757,7 +2022,7 @@ mod tests {
             metadata_serial: Arc::default(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build: test_build_lease().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1793,7 +2058,7 @@ mod tests {
             metadata_serial: Arc::default(),
             snapshot_store,
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build: test_build_lease().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1877,7 +2142,7 @@ mod tests {
             metadata_serial: Arc::default(),
             snapshot_store: Arc::new(FailingSnapshotStore),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build: test_build_lease().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1990,15 +2255,15 @@ mod tests {
             test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
         let group = state_machine.placement.raft_group_id.0;
         let permit = build.acquire().await.expect("driver's build permit");
-        build.hand_off(group, permit);
-        assert!(build.handoff_pending(group));
+        let token = build.hand_off(group, permit).expect("no hand-off pending");
+        assert!(build.handoff_pending(group, token));
 
         let builder = state_machine
             .try_create_snapshot_builder(false)
             .await
             .expect("a handed-off permit builds");
-        assert!(!build.handoff_pending(group));
-        assert!(!build.reclaim_handoff(group));
+        assert!(!build.handoff_pending(group, token));
+        assert!(!build.reclaim_handoff(group, token));
         assert_eq!(build.available_permits(), 0);
         // The next trigger without a handoff defers while this build runs.
         assert!(
@@ -2011,9 +2276,296 @@ mod tests {
         assert_eq!(build.available_permits(), 1);
 
         // An unclaimed handoff is taken back.
-        build.hand_off(group, build.acquire().await.expect("permit"));
-        assert!(build.reclaim_handoff(group));
+        let token = build
+            .hand_off(group, build.acquire().await.expect("permit"))
+            .expect("no hand-off pending");
+        assert!(build.reclaim_handoff(group, token));
         assert_eq!(build.available_permits(), 1);
+    }
+
+    /// #519: a permit handed to a group with its trigger goes back to the
+    /// node's permits when the trigger fails or no build claims it in time,
+    /// and stays with the build that claims it until the build ends.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_handed_off_permit_comes_back_unless_a_build_claims_it() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        let never = Duration::from_secs(3_600);
+
+        let permit = build.acquire().await.expect("driver's build permit");
+        let failed = build
+            .hand_off_and_trigger(group, permit, never, async {
+                Err::<(), _>("the group stopped")
+            })
+            .await;
+        assert!(matches!(
+            failed,
+            Handoff::TriggerFailed("the group stopped")
+        ));
+        assert_eq!(build.available_permits(), 2);
+
+        // No build claims it, as when OpenRaft dropped the trigger.
+        let permit = build.acquire().await.expect("driver's build permit");
+        let unclaimed = build
+            .hand_off_and_trigger(group, permit, Duration::from_millis(20), async {
+                Ok::<(), &str>(())
+            })
+            .await;
+        assert!(matches!(unclaimed, Handoff::Unclaimed));
+        assert_eq!(build.available_permits(), 2);
+
+        // The trigger starts the group's build, which claims the permit.
+        let permit = build.acquire().await.expect("driver's build permit");
+        let mut builder = None;
+        let claimed = build
+            .hand_off_and_trigger(group, permit, never, async {
+                builder = state_machine.try_create_snapshot_builder(false).await;
+                Ok::<(), &str>(())
+            })
+            .await;
+        assert!(matches!(claimed, Handoff::Claimed));
+        assert!(builder.is_some());
+        assert_eq!(build.available_permits(), 1);
+        drop(builder);
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// A hand-off whose caller stops waiting, during its trigger or its wait
+    /// for the claim, or whose trigger panics, still gives its permit back:
+    /// an operator's request that times out or whose client went away must
+    /// not park a permit (#558).
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_dropped_or_panicking_handoff_gives_its_permit_back() {
+        use futures_util::FutureExt as _;
+
+        let build = SnapshotBuildCoordinator::new(2);
+        let group = 7;
+        let never = Duration::from_secs(3_600);
+        let soon = Duration::from_millis(20);
+
+        let permit = build.acquire().await.expect("a permit");
+        let triggering = build.hand_off_and_trigger(
+            group,
+            permit,
+            never,
+            std::future::pending::<Result<(), &str>>(),
+        );
+        let _elapsed = tokio::time::timeout(soon, triggering)
+            .await
+            .expect_err("the caller stops waiting during the trigger");
+        assert_eq!(build.available_permits(), 2);
+
+        let permit = build.acquire().await.expect("a permit");
+        let waiting =
+            build.hand_off_and_trigger(group, permit, never, async { Ok::<(), &str>(()) });
+        let _elapsed = tokio::time::timeout(soon, waiting)
+            .await
+            .expect_err("the caller stops waiting for the claim");
+        assert_eq!(build.available_permits(), 2);
+
+        let permit = build.acquire().await.expect("a permit");
+        let panics = std::future::poll_fn(|_| -> std::task::Poll<Result<(), &str>> {
+            panic!("the trigger panicked")
+        });
+        let _panic =
+            std::panic::AssertUnwindSafe(build.hand_off_and_trigger(group, permit, never, panics))
+                .catch_unwind()
+                .await
+                .expect_err("the trigger panics");
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// One hand-off per group at a time: a second one while the first is
+    /// pending gives its permit back at once, and each caller takes back
+    /// only its own permit.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_group_takes_one_handoff_at_a_time() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        let never = Duration::from_secs(3_600);
+
+        let first = build.hand_off_and_trigger(
+            group,
+            build.acquire().await.expect("a permit"),
+            never,
+            async { Ok::<(), &str>(()) },
+        );
+        tokio::pin!(first);
+        assert!(futures_util::poll!(&mut first).is_pending());
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            build.hand_off_and_trigger(
+                group,
+                build.acquire().await.expect("a permit"),
+                never,
+                async { Ok::<(), &str>(()) },
+            ),
+        )
+        .await
+        .expect("a second hand-off returns at once");
+        assert!(matches!(second, Handoff::Busy));
+        assert_eq!(build.available_permits(), 1);
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("the first hand-off's permit builds");
+        assert!(matches!(first.await, Handoff::Claimed));
+        assert_eq!(build.available_permits(), 1);
+        drop(builder);
+
+        // A caller takes back only its own hand-off, never one made to the
+        // group since its own was claimed.
+        let token = build
+            .hand_off(group, build.acquire().await.expect("a permit"))
+            .expect("no hand-off pending");
+        let claimed_earlier = token.wrapping_sub(1);
+        assert!(!build.reclaim_handoff(group, claimed_earlier));
+        assert!(build.handoff_pending(group, token));
+        assert!(build.reclaim_handoff(group, token));
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// #519: a build counts in flight, with the log it will still free,
+    /// from the moment it claims its permit until its builder is dropped,
+    /// and the log it covers stops counting once it recorded its snapshot.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_build_counts_in_flight_while_it_holds_its_permit() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        let gauge = build.log_gauge(group);
+        gauge.record_applied(300);
+        assert!(build.builds_in_flight().is_empty());
+        assert_eq!(build.node_log_bytes(), 300);
+
+        let token = build
+            .hand_off(group, build.acquire().await.expect("driver's build permit"))
+            .expect("no hand-off pending");
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("a handed-off permit builds");
+        assert!(!build.handoff_pending(group, token));
+        assert_eq!(build.builds_in_flight(), BTreeMap::from([(group, 300)]));
+        // Log applied after the capture is not this build's to free.
+        gauge.record_applied(50);
+        assert_eq!(build.builds_in_flight(), BTreeMap::from([(group, 300)]));
+        assert_eq!(build.node_log_bytes(), 350);
+        // Once the build recorded its snapshot it frees nothing more, while
+        // it still holds its permit to publish the snapshot's reference.
+        gauge.record_snapshot(builder.log_mark, 10);
+        assert_eq!(build.builds_in_flight(), BTreeMap::from([(group, 0)]));
+        assert_eq!(build.node_log_bytes(), 50);
+        drop(builder);
+        assert!(build.builds_in_flight().is_empty());
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// #519: the snapshot driver waits on the build registry, not a timer,
+    /// for the group it triggered to claim its permit.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_claim_wakes_the_driver_waiting_for_it() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        build.log_gauge(group).record_applied(300);
+        let token = build
+            .hand_off(group, build.acquire().await.expect("driver's build permit"))
+            .expect("no hand-off pending");
+        let claimed = build.handoff_claimed(group, token);
+        tokio::pin!(claimed);
+        assert!(futures_util::poll!(&mut claimed).is_pending());
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("a handed-off permit builds");
+        // No timer wakes the wait: the claim does, so the next poll ends it.
+        assert!(futures_util::poll!(&mut claimed).is_ready());
+        assert!(!build.handoff_pending(group, token));
+        drop(builder);
+        // Nothing pending: the wait returns at once.
+        tokio::time::timeout(Duration::from_secs(5), build.handoff_claimed(group, token))
+            .await
+            .expect("no handoff to wait for");
+    }
+
+    /// #519: the snapshot driver paces its builds below a limit under the
+    /// node's permits. It waits until fewer builds run than the limit asks
+    /// for, asks again whenever a build ends and on every poll, and stops
+    /// waiting when the limit says so.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn acquire_below_waits_until_fewer_builds_run_than_the_limit_asks() {
+        let build = SnapshotBuildCoordinator::new(4);
+        assert_eq!(build.max_concurrency(), 4);
+        let first = build.try_lease(1, 0).expect("a free permit");
+        let second = build.try_lease(2, 0).expect("a free permit");
+        assert_eq!(build.running_builds(), 2);
+        let wait = Duration::from_secs(5);
+        let never = Duration::from_secs(3_600);
+
+        // Two builds run: a third may start under a limit of three.
+        let third = tokio::time::timeout(wait, build.acquire_below(never, || Some(3)))
+            .await
+            .expect("a free slot")
+            .expect("the registry stays open")
+            .expect("a permit");
+        // The driver's own permit is not a build until a group claims it.
+        assert_eq!(build.running_builds(), 2);
+        drop(third);
+
+        // Under a limit of two it waits, and a build that ends lets it go
+        // without waiting for a poll.
+        let paced = build.acquire_below(never, || Some(2));
+        tokio::pin!(paced);
+        assert!(futures_util::poll!(&mut paced).is_pending());
+        drop(first);
+        let permit = tokio::time::timeout(wait, paced)
+            .await
+            .expect("a slot frees once a build ends")
+            .expect("the registry stays open")
+            .expect("a permit");
+        assert_eq!(build.available_permits(), 2);
+        drop(permit);
+
+        // The limit is asked again on every poll, so a limit that rises
+        // with no build ending lets the wait go too.
+        let limit = AtomicU64::new(1);
+        let rising = build.acquire_below(Duration::from_millis(10), || {
+            Some(usize::try_from(limit.load(Ordering::Relaxed)).unwrap())
+        });
+        tokio::pin!(rising);
+        assert!(futures_util::poll!(&mut rising).is_pending());
+        limit.store(2, Ordering::Relaxed);
+        let permit = tokio::time::timeout(wait, rising)
+            .await
+            .expect("a poll sees the higher limit")
+            .expect("the registry stays open")
+            .expect("a permit");
+        drop(permit);
+        // A limit that says stop ends the wait without a permit.
+        let stopped = tokio::time::timeout(wait, build.acquire_below(never, || None))
+            .await
+            .expect("no wait")
+            .expect("the registry stays open");
+        assert!(stopped.is_none());
+
+        drop(second);
+        assert_eq!(build.available_permits(), 4);
+        assert_eq!(build.running_builds(), 0);
+        // The node's permits still bound every build.
+        assert_eq!(SnapshotBuildCoordinator::new(0).max_concurrency(), 1);
     }
 
     #[test]

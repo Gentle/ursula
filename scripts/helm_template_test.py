@@ -592,11 +592,41 @@ class HelmTemplateConfigTest(unittest.TestCase):
             "--set",
             "raft.snapshotPressureMaxGroupsPerTick=8",
             "--set",
+            "raft.snapshotBuildMaxConcurrency=1",
+            "--set",
             "s3.bucket=bkt",
         )
         parsed = tomllib.loads(config)
 
         self.assertEqual(parsed["raft"]["snapshot_pressure_max_groups_per_tick"], 8)
+        self.assertEqual(parsed["raft"]["snapshot_build_max_concurrency"], 1)
+
+    def test_snapshot_build_concurrency_defaults_to_the_server_default(self) -> None:
+        # Unset, the key is not rendered, so each server keeps its own
+        # default: a pod that still runs an older image too.
+        parsed = tomllib.loads(render_config("--set", "s3.bucket=bkt"))
+
+        self.assertNotIn("snapshot_build_max_concurrency", parsed["raft"])
+
+    def test_snapshot_build_concurrency_below_one_is_refused(self) -> None:
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                "charts/ursula",
+                "--set",
+                "s3.bucket=bkt",
+                "--set",
+                "raft.snapshotBuildMaxConcurrency=0",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("snapshotBuildMaxConcurrency", result.stderr)
 
     def test_snapshot_s3_renders_complete_config(self) -> None:
         config = render_config("--set", "snapshotStore.backend=s3", "--set", "s3.bucket=bkt")

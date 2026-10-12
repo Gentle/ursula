@@ -1714,7 +1714,12 @@
         "snapshotPressureMaxGroupsPerTick": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum groups snapshotted in one pressure pass."
+          "description": "Maximum groups snapshotted in one pressure pass while the node's Raft log is below its budget. Past the budget a pass starts this many for each snapshot build it keeps in flight."
+        },
+        "snapshotBuildMaxConcurrency": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Snapshot builds a node runs at once. The snapshot driver keeps one in flight while the node's Raft log is below its budget, and past it more, up to this many before the hard limit of twice the budget. Null keeps each server's own default (2 from 0.7.4, 1 before)."
         },
         "maxInSnapshotLogToKeep": {
           "type": "integer",

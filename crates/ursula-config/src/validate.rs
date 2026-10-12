@@ -4,6 +4,7 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::config::ColdBackend;
+use crate::config::RaftConfig;
 use crate::config::UrsulaConfig;
 use crate::config::WalConfig;
 
@@ -33,6 +34,13 @@ pub enum ValidationError {
     /// state, so every peer would look unable to campaign.
     #[error("governance.leadership_balance.peer_timeout must be non-zero")]
     ZeroPeerTimeout,
+    /// No build could run with 0, which used to be taken as 1 without a
+    /// word, and every build holds a copy of its group's state.
+    #[error(
+        "raft.snapshot_build_max_concurrency ({value}) must be between 1 and {}",
+        RaftConfig::MAX_SNAPSHOT_BUILD_CONCURRENCY
+    )]
+    SnapshotBuildConcurrency { value: usize },
     #[error("{0}")]
     Other(String),
 }
@@ -116,6 +124,10 @@ impl UrsulaConfig {
             self.validate_groups(&peer_ids)?;
         }
         self.validate_non_zero_durations()?;
+        let builds = self.raft.snapshot_build_max_concurrency;
+        if !(1..=RaftConfig::MAX_SNAPSHOT_BUILD_CONCURRENCY).contains(&builds) {
+            return Err(ValidationError::SnapshotBuildConcurrency { value: builds });
+        }
         if self.raft.snapshot_pressure_max_groups_per_tick == 0 {
             return Err(ValidationError::Other(
                 "raft.snapshot_pressure_max_groups_per_tick must be non-zero".into(),

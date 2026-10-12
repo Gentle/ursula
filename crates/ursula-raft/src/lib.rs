@@ -181,6 +181,7 @@ pub use state_machine::RaftGroupSnapshotBuilder;
 pub use state_machine::RaftGroupStateMachine;
 pub use state_machine::SNAPSHOT_HANDOFF_WAIT;
 pub use state_machine::SnapshotBuildCoordinator;
+pub use state_machine::SnapshotPermitError;
 pub use state_machine::SnapshotStartError;
 pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;

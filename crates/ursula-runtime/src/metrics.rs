@@ -39,7 +39,9 @@ impl RuntimeMetrics {
     }
 
     /// Records one Raft-log pressure pass of the snapshot driver that
-    /// planned a build: the builds it started and how long it took.
+    /// planned a build, held groups out or ended because the log outgrew it:
+    /// the builds it started and how long it took. A pass that found nothing
+    /// to start while builds run is not recorded.
     pub fn record_raft_snapshot_pressure(&self, groups: u64, pass_ns: u64) {
         self.inner.record_raft_snapshot_pressure(groups, pass_ns);
     }

@@ -2144,38 +2144,54 @@ pub(crate) async fn trigger_raft_snapshot(
     };
     let coordinator = registry.snapshot_build_coordinator();
     let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
-    // Ends once a snapshot covers what the group had applied when the
-    // request arrived, such as one a build that began since then made.
-    let covered = || {
+    // Whether a snapshot OpenRaft published covers what the group had
+    // applied when the request arrived, such as one a build that began
+    // since then made.
+    let published = |metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>| {
         snapshot_log_id.as_ref().is_some_and(|wanted| {
-            raft.metrics()
-                .borrow_watched()
+            metrics
                 .snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot >= wanted)
         })
+    };
+    // The group's latest build covers it too: OpenRaft publishes that
+    // snapshot only after the build released its permit (#561).
+    let covered = || {
+        published(&raft.metrics().borrow_watched())
+            || snapshot_log_id.as_ref().is_some_and(|wanted| {
+                coordinator
+                    .built_snapshot(raft_group_id.0)
+                    .is_some_and(|built| &built >= wanted)
+            })
+    };
+    let covering = async {
+        let waited = raft
+            .wait(Some(ADMIN_SNAPSHOT_START_WAIT))
+            .metrics(published, "admin snapshot start covered")
+            .await;
+        if waited.is_err() {
+            // The start's own wait ends the request.
+            std::future::pending::<()>().await;
+        }
     };
     if let Err(err) = coordinator
         .start_snapshot(
             raft_group_id.0,
             ADMIN_SNAPSHOT_START_WAIT,
             covered,
+            covering,
             || async { raft.trigger().snapshot().await },
         )
         .await
     {
         return snapshot_not_started(&err);
     }
-    if let Some(snapshot_log_id) = snapshot_log_id
+    if let Some(snapshot_log_id) = &snapshot_log_id
         && let Err(err) = raft
             .wait(Some(Duration::from_secs(10)))
             .metrics(
-                |metrics| {
-                    metrics
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot >= &snapshot_log_id)
-                },
+                published,
                 format!("admin snapshot trigger .snapshot >= {snapshot_log_id}"),
             )
             .await
@@ -2562,10 +2578,6 @@ pub(crate) async fn accept_unsynced_loss(
     }
 }
 
-/// Resolves the raft registry, parses the group id, and looks up the live group
-/// handle — the preamble shared by every raft admin endpoint. Returns the
-/// appropriate error response (`400`/`404`) when any step fails, so handlers can
-/// `?`-style early-return and focus on their actual operation.
 /// The answer to an operator's snapshot whose build did not start: `503`
 /// with `Retry-After` when no build of the group could start in time, since
 /// builds end, and `500` when the permits closed or the trigger failed.
@@ -2590,6 +2602,10 @@ fn snapshot_not_started(err: &SnapshotStartError<Fatal<UrsulaRaftTypeConfig>>) -
     }
 }
 
+/// Resolves the raft registry, parses the group id, and looks up the live group
+/// handle — the preamble shared by every raft admin endpoint. Returns the
+/// appropriate error response (`400`/`404`) when any step fails, so handlers can
+/// `?`-style early-return and focus on their actual operation.
 fn resolve_raft_group(
     state: &HttpState,
     raft_group_id: u64,

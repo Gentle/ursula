@@ -109,6 +109,32 @@ struct SnapshotBuildCoordinatorInner {
     log_pressure: Arc<AtomicBool>,
 }
 
+/// Longest a handed-off permit waits for the triggered group's build to claim
+/// it ([`SnapshotBuildCoordinator::hand_off_and_trigger`]).
+pub const SNAPSHOT_HANDOFF_WAIT: Duration = Duration::from_secs(5);
+
+/// Why a snapshot build of a group did not start
+/// ([`SnapshotBuildCoordinator::start_snapshot`]).
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotStartError<E: std::error::Error + 'static> {
+    /// No build of the group started within the wait: other builds held
+    /// every permit, a build of the group ran, or the group's build did not
+    /// claim its permit in time. Builds end, so a later request may start
+    /// one.
+    #[error("no snapshot build of group {raft_group_id} started within {wait:?}")]
+    NotStarted { raft_group_id: u32, wait: Duration },
+    /// The node's build permits are closed.
+    #[error("take a snapshot build permit")]
+    Permit(#[source] GroupEngineError),
+    /// The group's snapshot trigger failed.
+    #[error("trigger the snapshot of group {raft_group_id}")]
+    Trigger {
+        raft_group_id: u32,
+        #[source]
+        source: E,
+    },
+}
+
 /// What became of a build permit handed to a group with its snapshot trigger
 /// ([`SnapshotBuildCoordinator::hand_off_and_trigger`]).
 #[derive(Debug)]
@@ -376,8 +402,65 @@ impl SnapshotBuildCoordinator {
         }
     }
 
+    /// Starts a snapshot build of `raft_group_id` that covers what the
+    /// caller asks for, within `wait`: an operator's snapshot (#529).
+    ///
+    /// Each round first waits until no hand-off to the group is pending and
+    /// no build of it runs, since OpenRaft drops a trigger while the group
+    /// builds and a permit handed to it would sit idle. The round then ends
+    /// the start when `covered` says a snapshot of the group covers the
+    /// request (a build that began after the request does), or takes a
+    /// permit, hands it to the group and triggers the group with `trigger`.
+    /// A trigger that went unclaimed, or a hand-off another caller made
+    /// first, starts the next round. OpenRaft can still count a build that
+    /// just ended, until RaftCore handles its end: a trigger then goes
+    /// unclaimed for [`SNAPSHOT_HANDOFF_WAIT`], and the next round finds the
+    /// snapshot that build made.
+    pub async fn start_snapshot<F, E>(
+        &self,
+        raft_group_id: u32,
+        wait: Duration,
+        mut covered: impl FnMut() -> bool,
+        mut trigger: impl FnMut() -> F,
+    ) -> Result<(), SnapshotStartError<E>>
+    where
+        F: Future<Output = Result<(), E>>,
+        E: std::error::Error + 'static,
+    {
+        let rounds = async {
+            loop {
+                self.handoff_settled(raft_group_id).await;
+                self.build_ended(raft_group_id).await;
+                if covered() {
+                    return Ok(());
+                }
+                let permit = self.acquire().await.map_err(SnapshotStartError::Permit)?;
+                match self
+                    .hand_off_and_trigger(raft_group_id, permit, SNAPSHOT_HANDOFF_WAIT, trigger())
+                    .await
+                {
+                    Handoff::Claimed => return Ok(()),
+                    Handoff::Unclaimed | Handoff::Busy => {}
+                    Handoff::TriggerFailed(source) => {
+                        return Err(SnapshotStartError::Trigger {
+                            raft_group_id,
+                            source,
+                        });
+                    }
+                }
+            }
+        };
+        match crate::rt::time::timeout(wait, rounds).await {
+            Ok(started) => started,
+            Err(_elapsed) => Err(SnapshotStartError::NotStarted {
+                raft_group_id,
+                wait,
+            }),
+        }
+    }
+
     /// Waits until no build of `raft_group_id` holds a permit.
-    pub async fn build_ended(&self, raft_group_id: u32) {
+    pub(crate) async fn build_ended(&self, raft_group_id: u32) {
         // Subscribed before the check, so a build that ends right after it
         // still wakes the wait.
         let mut builds = self.inner.builds.subscribe();
@@ -394,7 +477,7 @@ impl SnapshotBuildCoordinator {
 
     /// Waits until no permit handed to `raft_group_id` is pending: a build
     /// claimed it, or its caller took it back ([`Handoff::Busy`]).
-    pub async fn handoff_settled(&self, raft_group_id: u32) {
+    pub(crate) async fn handoff_settled(&self, raft_group_id: u32) {
         // Subscribed before the check, so a claim or a take-back right after
         // it still wakes the wait.
         let mut builds = self.inner.builds.subscribe();
@@ -442,14 +525,15 @@ impl SnapshotBuildCoordinator {
         } else {
             None
         };
-        // The permit goes back to the node's permits outside the lock.
         drop(handoffs);
-        let taken = taken.is_some();
-        if taken {
-            // Wakes the waits on hand-offs.
+        let reclaimed = taken.is_some();
+        // The permit goes back to the node's permits, outside the lock and
+        // before the waits on hand-offs wake.
+        drop(taken);
+        if reclaimed {
             self.inner.builds.send_modify(|_builds| {});
         }
-        taken
+        reclaimed
     }
 
     /// Claims the permit handed off to `raft_group_id` for a build covering
@@ -2503,6 +2587,214 @@ mod tests {
         assert!(futures_util::poll!(&mut ended).is_pending());
         drop(builder);
         assert!(futures_util::poll!(&mut ended).is_ready());
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// #529: an operator's snapshot start waits, holding no permit, while a
+    /// build of its group runs, and then hands a permit over and triggers
+    /// once.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_snapshot_start_waits_for_the_groups_build_without_a_permit() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        let running = build.try_lease(group, 0).expect("a free permit");
+        let triggers = AtomicU64::new(0);
+        let start = build.start_snapshot(
+            group,
+            Duration::from_secs(3_600),
+            || false,
+            || async {
+                triggers.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), std::fmt::Error>(())
+            },
+        );
+        tokio::pin!(start);
+        assert!(futures_util::poll!(&mut start).is_pending());
+        assert_eq!(triggers.load(Ordering::Relaxed), 0);
+        assert_eq!(build.available_permits(), 1);
+        drop(running);
+        assert!(futures_util::poll!(&mut start).is_pending());
+        assert_eq!(triggers.load(Ordering::Relaxed), 1);
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("the handed-off permit builds");
+        assert!(matches!(
+            futures_util::poll!(&mut start),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        drop(builder);
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// #529: a start waits, holding no permit, while another caller's
+    /// hand-off to its group is pending, and goes on once that hand-off is
+    /// taken back.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_snapshot_start_waits_for_a_pending_handoff_without_a_permit() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        let other = build
+            .hand_off(group, build.acquire().await.expect("a permit"))
+            .expect("no hand-off pending");
+        let triggers = AtomicU64::new(0);
+        let start = build.start_snapshot(
+            group,
+            Duration::from_secs(3_600),
+            || false,
+            || async {
+                triggers.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), std::fmt::Error>(())
+            },
+        );
+        tokio::pin!(start);
+        assert!(futures_util::poll!(&mut start).is_pending());
+        assert_eq!(triggers.load(Ordering::Relaxed), 0);
+        assert_eq!(build.available_permits(), 1);
+        assert!(build.reclaim_handoff(group, other));
+        assert!(futures_util::poll!(&mut start).is_pending());
+        assert_eq!(triggers.load(Ordering::Relaxed), 1);
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("the handed-off permit builds");
+        assert!(matches!(
+            futures_util::poll!(&mut start),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        drop(builder);
+    }
+
+    /// #529: a start whose group has a snapshot covering the request once
+    /// the group's build ended needs no build of its own.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_snapshot_start_ends_when_a_snapshot_covers_the_request() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let group = 7;
+        let running = build.try_lease(group, 0).expect("a free permit");
+        let covered = AtomicBool::new(false);
+        let triggers = AtomicU64::new(0);
+        let start = build.start_snapshot(
+            group,
+            Duration::from_secs(3_600),
+            || covered.load(Ordering::Relaxed),
+            || async {
+                triggers.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), std::fmt::Error>(())
+            },
+        );
+        tokio::pin!(start);
+        assert!(futures_util::poll!(&mut start).is_pending());
+        covered.store(true, Ordering::Relaxed);
+        drop(running);
+        assert!(matches!(
+            futures_util::poll!(&mut start),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(triggers.load(Ordering::Relaxed), 0);
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// #529: a trigger that went unclaimed starts the next round, which here
+    /// finds a snapshot covering the request, and the permit comes back.
+    #[cfg(not(madsim))]
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_start_tries_again_after_an_unclaimed_trigger() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let rounds = AtomicU64::new(0);
+        let triggers = AtomicU64::new(0);
+        let started = build
+            .start_snapshot(
+                7,
+                Duration::from_secs(60),
+                || rounds.fetch_add(1, Ordering::Relaxed) > 0,
+                || async {
+                    triggers.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), std::fmt::Error>(())
+                },
+            )
+            .await;
+        assert!(matches!(started, Ok(())));
+        assert_eq!(
+            (
+                rounds.load(Ordering::Relaxed),
+                triggers.load(Ordering::Relaxed)
+            ),
+            (2, 1)
+        );
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// #529: a start that no build could begin within its wait fails as not
+    /// started, and one whose trigger failed fails with that failure, its
+    /// permit back either way.
+    #[cfg(not(madsim))]
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_start_fails_as_not_started_or_as_its_trigger() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let running = build.try_lease(7, 0).expect("a free permit");
+        let late = build
+            .start_snapshot(
+                7,
+                Duration::from_secs(10),
+                || false,
+                || async { Ok::<(), std::fmt::Error>(()) },
+            )
+            .await;
+        assert!(matches!(
+            late,
+            Err(SnapshotStartError::NotStarted {
+                raft_group_id: 7,
+                ..
+            })
+        ));
+        assert_eq!(build.available_permits(), 1);
+        drop(running);
+        let failed = build
+            .start_snapshot(
+                7,
+                Duration::from_secs(10),
+                || false,
+                || async { Err(std::fmt::Error) },
+            )
+            .await;
+        assert!(matches!(
+            failed,
+            Err(SnapshotStartError::Trigger {
+                raft_group_id: 7,
+                ..
+            })
+        ));
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// #529: a start dropped while its own hand-off is pending, because its
+    /// request timed out or its client went away, gives its permit back.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_dropped_snapshot_start_gives_its_permit_back() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let triggers = AtomicU64::new(0);
+        let mut start = Box::pin(build.start_snapshot(
+            7,
+            Duration::from_secs(3_600),
+            || false,
+            || async {
+                triggers.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), std::fmt::Error>(())
+            },
+        ));
+        assert!(futures_util::poll!(&mut start).is_pending());
+        assert_eq!(triggers.load(Ordering::Relaxed), 1);
+        assert_eq!(build.available_permits(), 1);
+        drop(start);
         assert_eq!(build.available_permits(), 2);
     }
 

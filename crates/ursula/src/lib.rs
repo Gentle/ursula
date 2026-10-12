@@ -79,6 +79,7 @@ pub use bootstrap::spawn_runtime;
 use chrono::DateTime;
 use futures_util::stream;
 use openraft::BasicNode;
+use openraft::error::Fatal;
 use openraft::rt::WatchReceiver;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
@@ -88,7 +89,6 @@ use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
-use ursula_raft::Handoff;
 use ursula_raft::IncomingTransferError;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::OwnerRaftHandle;
@@ -104,6 +104,8 @@ use ursula_raft::RAFT_GRPC_VOTE_PATH;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGrpcService;
 use ursula_raft::SelfElectionError;
+use ursula_raft::SnapshotStartError;
+use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::raft_internal_proto;
 use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendExternalRequest;
@@ -2133,76 +2135,36 @@ pub(crate) async fn trigger_raft_snapshot(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
 ) -> Response {
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+    let Some(registry) = state.raft_registry() else {
+        return *no_raft_registry();
+    };
+    let (raft_group_id, raft) = match resolve_registered_raft_group(registry, raft_group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
-    let Some(coordinator) = state
-        .raft_registry()
-        .map(RaftGroupHandleRegistry::snapshot_build_coordinator)
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
+    let coordinator = registry.snapshot_build_coordinator();
     let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
-    // The wait drops the hand-off when it runs out, which gives its permit
-    // back.
-    let started = tokio::time::timeout(ADMIN_SNAPSHOT_START_WAIT, async {
-        loop {
-            // A triggered build that finds every permit taken is refused, so
-            // the request takes one first, in line with the snapshot driver
-            // (#529).
-            let permit = match coordinator.acquire().await {
-                Ok(permit) => permit,
-                Err(err) => return Err(format!("take a snapshot build permit: {err}")),
-            };
-            match coordinator
-                .hand_off_and_trigger(
-                    raft_group_id.0,
-                    permit,
-                    bootstrap::SNAPSHOT_HANDOFF_WAIT,
-                    raft.trigger().snapshot(),
-                )
-                .await
-            {
-                Handoff::Claimed => return Ok(()),
-                // OpenRaft dropped the trigger, for example because a build
-                // of the group was already running, which may cover less than
-                // the request asks for. Trigger again once that build ended.
-                Handoff::Unclaimed => coordinator.build_ended(raft_group_id.0).await,
-                // The snapshot driver handed the group a permit first.
-                // Trigger again once that hand-off settled and the build it
-                // started, if any, ended.
-                Handoff::Busy => {
-                    coordinator.handoff_settled(raft_group_id.0).await;
-                    coordinator.build_ended(raft_group_id.0).await;
-                }
-                Handoff::TriggerFailed(err) => {
-                    return Err(format!("trigger raft snapshot: {err}"));
-                }
-            }
-        }
-    })
-    .await;
-    match started {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
-        Err(_elapsed) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(axum::http::header::RETRY_AFTER, "1")],
-                format!(
-                    "no snapshot build of group {} started within \
-                     {ADMIN_SNAPSHOT_START_WAIT:?}, usually because other builds held every \
-                     permit; retry",
-                    raft_group_id.0
-                ),
-            )
-                .into_response();
-        }
+    // Ends once a snapshot covers what the group had applied when the
+    // request arrived, such as one a build that began since then made.
+    let covered = || {
+        snapshot_log_id.as_ref().is_some_and(|wanted| {
+            raft.metrics()
+                .borrow_watched()
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot >= wanted)
+        })
+    };
+    if let Err(err) = coordinator
+        .start_snapshot(
+            raft_group_id.0,
+            ADMIN_SNAPSHOT_START_WAIT,
+            covered,
+            || async { raft.trigger().snapshot().await },
+        )
+        .await
+    {
+        return snapshot_not_started(&err);
     }
     if let Some(snapshot_log_id) = snapshot_log_id
         && let Err(err) = raft
@@ -2604,19 +2566,56 @@ pub(crate) async fn accept_unsynced_loss(
 /// handle — the preamble shared by every raft admin endpoint. Returns the
 /// appropriate error response (`400`/`404`) when any step fails, so handlers can
 /// `?`-style early-return and focus on their actual operation.
+/// The answer to an operator's snapshot whose build did not start: `503`
+/// with `Retry-After` when no build of the group could start in time, since
+/// builds end, and `500` when the permits closed or the trigger failed.
+fn snapshot_not_started(err: &SnapshotStartError<Fatal<UrsulaRaftTypeConfig>>) -> Response {
+    match err {
+        SnapshotStartError::NotStarted { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            format!("{err}; retry"),
+        )
+            .into_response(),
+        SnapshotStartError::Permit(source) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{err}: {source}"),
+        )
+            .into_response(),
+        SnapshotStartError::Trigger { source, .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{err}: {source}"),
+        )
+            .into_response(),
+    }
+}
+
 fn resolve_raft_group(
     state: &HttpState,
     raft_group_id: u64,
 ) -> Result<(RaftGroupId, OwnerRaftHandle), Box<Response>> {
     let Some(registry) = state.raft_registry() else {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                "raft registry is not configured for this server",
-            )
-                .into_response(),
-        ));
+        return Err(no_raft_registry());
     };
+    resolve_registered_raft_group(registry, raft_group_id)
+}
+
+fn no_raft_registry() -> Box<Response> {
+    Box::new(
+        (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response(),
+    )
+}
+
+/// The group `raft_group_id` of `registry`: `400` for an id out of range,
+/// and `404` for a group the node does not run.
+fn resolve_registered_raft_group(
+    registry: &RaftGroupHandleRegistry,
+    raft_group_id: u64,
+) -> Result<(RaftGroupId, OwnerRaftHandle), Box<Response>> {
     let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
         return Err(Box::new(
             (StatusCode::BAD_REQUEST, "invalid raft group id").into_response(),

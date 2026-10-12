@@ -71,7 +71,10 @@ identifies the Raft leader.
   counters `leader_redirects` (hops that followed a redirect, search hops
   included), `leader_redirect_ns` (time spent by the requests that followed
   one), `leader_searches` (search hops) and `leader_not_found` (requests
-  answered `503` because no upstream answered without redirecting).
+  answered `503` because no upstream answered without redirecting). A
+  gateway with access control answers the path `404` unless
+  `--auth-public-metrics` is set (see
+  [Access Control and Logical Tenancy](#access-control-and-logical-tenancy)).
 
 ## Access Control and Logical Tenancy
 
@@ -98,6 +101,17 @@ bucket the caller cannot see. Validated bearer credentials terminate at the
 gateway and are not forwarded to Ursula nodes. Once access control is enabled,
 unrecognized and internal Ursula paths fail closed with `404`; a hosted binary
 can mount its own health or operator routes outside the gateway fallback.
+
+The gateway's own metrics path, `/__ursula/gateway/metrics`, is one of those
+internal paths. `--auth-public-metrics` on `ursula gateway`, or
+`AccessControl::with_public_metrics(true)` in a hosted binary, serves the
+counters there to every caller, with or without a token, as a gateway without
+access control does. The gateway then does not check a presented token on that
+path, so an invalid or expired one gets the counters too. The counters hold no
+tenant data, but they show traffic volume. Make them public only where
+untrusted clients cannot reach the gateway, or where a proxy in front of it
+denies `/__ursula/*`. Gateways before 0.7.4 served the path to every caller,
+with or without access control.
 
 ## Redirects
 

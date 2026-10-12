@@ -173,7 +173,9 @@ beforeAll(async () => {
 		url.hostname = "localhost";
 		return url.origin;
 	});
-	gateway = await AuthGateway.start(unresolvable, dir);
+	// The test reads `leader_searches` from the gateway's metrics, which a gateway that checks tokens
+	// serves only with `--auth-public-metrics` (#548).
+	gateway = await AuthGateway.start(unresolvable, dir, ["--auth-public-metrics"]);
 	proxy = await RedirectCounter.start(gateway.url);
 });
 
@@ -253,7 +255,9 @@ it.runIf(nodes.length === 3)(
 		} finally {
 			moved = await loop.stop();
 		}
-		const metrics = (await (await fetch(`${(gateway as AuthGateway).url}/__ursula/gateway/metrics`)).json()) as {
+		const answer = await fetch(`${(gateway as AuthGateway).url}/__ursula/gateway/metrics`);
+		expect(answer.status, "the gateway's metrics").toBe(200);
+		const metrics = (await answer.json()) as {
 			leader_redirects: number;
 			leader_searches: number;
 			leader_not_found: number;

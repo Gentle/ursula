@@ -83,7 +83,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `max_idle_age` after its last request. Resolving and connecting time out after
 /// `CONNECT_TIMEOUT` each. The pool keeps ureq's bounds: at most 3 idle connections per host and
 /// 10 in all. Hosts resolve through the shared cache of `net::Resolver`, and a failure to resolve
-/// or to connect proves the request never went out (`net`).
+/// or to connect proves the request never went out (`net`). ureq's proxy from the environment
+/// applies, as it always did (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`): a CONNECT
+/// proxy's host resolves through the same cache, and a failure to reach the proxy, or to have it
+/// open the tunnel, proves nothing went out either.
 fn new_agent(timeout: Duration, max_idle_age: Duration) -> ureq::Agent {
     new_agent_with(timeout, max_idle_age, net::Resolver::shared())
 }
@@ -92,7 +95,7 @@ fn new_agent(timeout: Duration, max_idle_age: Duration) -> ureq::Agent {
 fn new_agent_with<R: ureq::unversioned::resolver::Resolver>(
     timeout: Duration,
     max_idle_age: Duration,
-    resolver: R,
+    resolver: net::Resolver<R>,
 ) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -107,7 +110,7 @@ fn new_agent_with<R: ureq::unversioned::resolver::Resolver>(
         .max_idle_age(max_idle_age)
         .tls_config(tls())
         .build();
-    ureq::Agent::with_parts(config, net::Connector::default(), resolver)
+    ureq::Agent::with_parts(config, net::Connector::new(resolver.clone()), resolver)
 }
 
 /// TLS for `https://` stream URLs: the bundled Mozilla roots, or only the certificate authorities
@@ -3092,6 +3095,64 @@ mod tests {
         }
         assert_eq!(server.join().unwrap().len(), 3);
         assert_eq!(lookups.made(), 1);
+    }
+
+    // A connection that fails makes its host's lookup due: the next request looks the host up
+    // again and reaches the endpoint at its new address, where the cached address kept failing.
+    #[test]
+    fn a_failed_connection_looks_the_host_up_again() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let moved_from = closed.local_addr().unwrap();
+        drop(closed);
+        let (url, server) = serve(vec![answer("200 OK")]);
+        let lookups = Lookups::new(vec![Ok(moved_from), Ok(served(&url))]);
+        let agent = agent_over(&lookups);
+        let e = agent.head("http://gw.test/b/s").call().unwrap_err();
+        assert!(net::is_not_sent(&e), "{e}");
+        let r = agent.head("http://gw.test/b/s").call().unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert_eq!(lookups.made(), 2);
+    }
+
+    // Through a CONNECT proxy (ureq's proxy from the environment), the tunnel goes through the
+    // marking resolver and connector, and then the connector's own marking: a proxy whose host
+    // does not resolve still fails as never sent, once, so the failure is no answer, and a read is
+    // sent again, as before the marking.
+    #[test]
+    fn a_proxy_that_does_not_resolve_fails_as_never_sent_once() {
+        let lookups = Lookups::new(vec![Err(ureq::Timeout::Resolve)]);
+        let resolver = net::Resolver::new(lookups.clone());
+        let config = ureq::Agent::config_builder()
+            .proxy(Some(ureq::Proxy::new("http://proxy.test:3128").unwrap()))
+            .build();
+        let agent =
+            ureq::Agent::with_parts(config, net::Connector::new(resolver.clone()), resolver);
+        let e = agent.get("http://gw.test/b/s").call().unwrap_err();
+        assert!(no_answer(&e) && before_connection(&e), "{e}");
+        assert!(matches!(
+            net::sent_nothing(e),
+            (ureq::Error::Timeout(ureq::Timeout::Resolve), true)
+        ));
+        assert_eq!(lookups.made(), 1);
+    }
+
+    // ureq completes the TLS handshake in its connector, before any byte of the request: a
+    // handshake that fails (an endpoint that answers plain HTTP) is marked as never sent, which
+    // the proof that such a failure applied nothing relies on (`net`).
+    #[test]
+    fn a_failed_tls_handshake_sends_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}/b/s", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let e = agent().get(&url).call().unwrap_err();
+        server.join().unwrap();
+        assert!(net::is_not_sent(&e), "{e}");
     }
 
     // A commit that cannot reach its endpoint, every attempt refused by the host before a

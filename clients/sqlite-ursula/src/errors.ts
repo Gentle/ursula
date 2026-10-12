@@ -30,10 +30,11 @@ export class UrsulaReplicationError extends Error {
  *   sent (over `URSULA_VFS_MAX_FRAME_BYTES`, 32 MiB by default), or a lower limit in front refused it
  *   with a marked and vouched `413`. The same transaction can never be sent: split it into smaller
  *   ones;
- * - `unreachable`: no attempt reached the stream's endpoint until the retry budget ran out, and the
- *   last one failed before any byte of it went out: its host did not resolve, or no connection to it
- *   was made (the TLS handshake included). Commit again once the endpoint is reachable. The reason is
- *   the last attempt's failure (such as `timeout: resolve`). From 0.7.4.
+ * - `unreachable`: every attempt failed before any byte of it went out, or was refused as above,
+ *   until the retry budget ran out, and the last one failed before it went out: its host did not
+ *   resolve, or no connection to it was made (the TLS handshake included). Commit again once the
+ *   endpoint is reachable. The reason is the last attempt's failure (such as `timeout: resolve`).
+ *   From 0.7.4.
  *
  * The marker counts only with the vouch, which `ursula gateway` adds from 0.7.3 on. Without such a
  * gateway in front of the servers, only a `401`, `402` or `429`, or the extension's own frame limit,

@@ -724,17 +724,20 @@ What attach does in each case:
   time (only the first requests to a host, before a lookup of it ended, look it up each). ureq looks
   a host up before it takes a pooled connection, so that request waits for the lookup, up to the
   resolve timeout of 5 s, even when a pooled connection is ready, while the host's other requests go
-  on with its last addresses. While lookups fail, the client keeps using the host's last addresses
-  for up to 10 minutes after the last successful lookup (`net::DNS_STALE_LIMIT`), and looks the host
-  up again 5 s after each failed lookup ends (`net::DNS_RETRY`, logged as `dns_stale`). A lookup
-  that fails gives way to one that succeeded since it started: its request uses those addresses, and
-  the failure is not kept. A failed connection makes the host's next lookup due, no sooner than 5 s
-  after its last lookup ended. So a DNS outage shorter than 10 minutes delays one request per host
-  by up to 5 s, at most once every 5 s, and fails nothing. Past it, and for a host that has not
-  resolved yet, a failed lookup fails the host's requests before they go out, as it failed, until
-  the next lookup, 5 s later, ends, and commits fail alone as `unreachable` (above). Before 0.7.4
-  every request looked its host up, a pooled connection's included, and an outage of 30 s or more
-  poisoned the databases of every owner whose commits met it.
+  on with its last addresses (older than the 10 minutes below too, when no lookup failed since the
+  last successful one and no request needed the host for that long). While lookups fail, the client
+  keeps using the host's last addresses for up to 10 minutes after the last successful lookup
+  (`net::DNS_STALE_LIMIT`), and looks the host up again 5 s after each failed lookup ends
+  (`net::DNS_RETRY`, logged as `dns_stale`). A lookup that fails gives way to one that succeeded
+  since it started: its request uses those addresses, and the failure is not kept, though the next
+  lookup still comes no sooner than 5 s after it ended. A failed connection makes the host's next
+  lookup due, no sooner than 5 s after its last lookup ended. So a DNS outage shorter than
+  10 minutes delays one request per host by up to 5 s, at most once every 5 s, and fails nothing.
+  Past it, and for a host that has not resolved yet, a failed lookup fails the host's requests
+  before they go out, as it failed, until the next lookup, 5 s later, ends, and commits fail alone
+  as `unreachable` (above). Before 0.7.4 every request looked its host up, a pooled connection's
+  included, and an outage of 30 s or more poisoned the databases of every owner whose commits met
+  it.
 - A server that refuses writes for a while (its Raft log over its hard limit under sustained
   write load, its WAL disk full) marks its refusals `x-ursula-not-applied`. So does a gateway that
   refuses a request before it forwards it, such as one whose token issuer is down for a few
@@ -1040,23 +1043,25 @@ must say in its release notes to stop every owner of a stream before upgrading.
   other, and one request at a time looks a host up while the others use its last addresses: a second
   request while the lookup is held open, and one due after another lookup that started with no
   addresses ended while this one runs. With no addresses, while a lookup after a failed one is held
-  open, a second request fails as the failed one did. A failed lookup serves the last addresses
-  until the retry, 5 s later and no later than the stale limit, and then the host is looked up
-  again. Past the limit a failed lookup fails as never sent, and one with no addresses fails the
-  host's requests the same way until the retry, with no lookup of theirs, printing as that lookup's
-  failure did (an I/O error's message or OS error code, a timeout's kind). A lookup settles, without
-  threads, from what the cache knows when it ends: a success is the newest addresses, a failure
-  gives way to a success that ended since it started, the addresses that stand in when it ended
-  serve (none once they passed the stale limit while it ran), the next lookup is due after it ended,
-  and a failure the cache cannot make again is not kept. A failed connection makes the lookup due,
-  5 s after the last lookup ended at the soonest, and keeps the addresses. An IP address is never
-  cached, each port of a host is its own entry, and a failure is marked once. Through an agent,
-  requests to a host share one lookup, and a failed connection looks the host up again and reaches
-  its new address. A CONNECT proxy whose host does not resolve and a failed TLS handshake fail as
-  never sent, the stand-in endpoint receiving no byte of the request. An append whose every attempt
-  fails before sending (connections refused, or lookups that time out) fails alone as `unreachable`
-  with its sequence free, a later proven refusal still fails it alone, and an attempt that got no
-  answer on a connection keeps it unknown.
+  open, a second request fails as the failed one did, and past the stale limit, with no failure
+  since the last successful lookup, a second request uses those addresses. A failed lookup serves
+  the last addresses until the retry, 5 s later and no later than the stale limit, and then the host
+  is looked up again. Past the limit a failed lookup fails as never sent, and one with no addresses
+  fails the host's requests the same way until the retry, with no lookup of theirs, printing as that
+  lookup's failure did (an I/O error's message or OS error code, a timeout's kind). A lookup
+  settles, without threads, from what the cache knows when it ends: a success is the newest
+  addresses, a failure gives way to a success that ended since it started (keeping the next lookup
+  5 s after its end even when a failed connection made it due sooner), the addresses that stand in
+  when it ended serve (none once they passed the stale limit while it ran), the next lookup is due
+  after it ended, and a failure the cache cannot make again is not kept. A failed connection makes
+  the lookup due, 5 s after the last lookup ended at the soonest, and keeps the addresses. An IP
+  address is never cached, each port of a host is its own entry, and a failure is marked once.
+  Through an agent, requests to a host share one lookup, and a failed connection looks the host up
+  again and reaches its new address. A CONNECT proxy whose host does not resolve and a failed TLS
+  handshake fail as never sent, the stand-in endpoint receiving no byte of the request. An append
+  whose every attempt fails before sending (connections refused, or lookups that time out) fails
+  alone as `unreachable` with its sequence free, a later proven refusal still fails it alone, and an
+  attempt that got no answer on a connection keeps it unknown.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is

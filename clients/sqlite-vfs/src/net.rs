@@ -8,11 +8,11 @@
 //! its request after `CONNECT_TIMEOUT` (`client::new_agent`) with a pooled connection ready. With
 //! the cache, a host is looked up at most once every [`DNS_FRESH`] (every [`DNS_RETRY`] while
 //! lookups fail), by one request at a time: while it waits for the lookup, up to the resolve
-//! timeout (5 s), the host's other requests go on with its last addresses, and only requests that
-//! find none (the first ones to a host) look it up each, until one of their lookups fails, which
-//! fails the host's requests for [`DNS_RETRY`]. A connection that fails makes its host's lookup
-//! due, no sooner than [`DNS_RETRY`] after the last one ended, so an endpoint that moved is looked
-//! up again at the next attempt.
+//! timeout (5 s), the host's other requests go on with its last addresses, or fail as its last
+//! lookup did when that left none (`settle`). Only the first requests to a host, before a lookup
+//! of it ended, look it up each. A connection that fails makes its host's lookup due, no sooner
+//! than [`DNS_RETRY`] after the last one ended, so an endpoint that moved is looked up again at the
+//! next attempt.
 //!
 //! The resolver and the connector here wrap each failure of theirs in [`NotSent`]: a host that did
 //! not resolve, and a connection that was not made. Nothing of such a request went out, so an
@@ -114,29 +114,43 @@ struct Good {
     at: Instant,
 }
 
-/// Why a host's last lookup failed, kept to fail the requests that come before the next lookup
-/// is due (a ureq error is not `Clone`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a host's last lookup failed, kept to fail the host's requests the same way until the next
+/// lookup (a ureq error is not `Clone`): the same variant and text, a timeout's kind (a CONNECT
+/// proxy's host is looked up within the connect timeout), and an I/O error's kind with its OS error
+/// code, or with its message (`getaddrinfo`'s failures are `Uncategorized` with one).
+#[derive(Clone, Debug)]
 enum Failure {
-    TimedOut,
+    TimedOut(ureq::Timeout),
     NotFound,
-    Io(std::io::ErrorKind),
+    BadUri(String),
+    Os(i32),
+    Io(std::io::ErrorKind, String),
 }
 
 impl Failure {
-    fn of(e: &ureq::Error) -> Failure {
+    /// How `e` failed, unless the cache cannot make the same failure again (no failure of ureq's
+    /// own resolver), which is then not kept: the host's next request looks it up again.
+    fn of(e: &ureq::Error) -> Option<Failure> {
         match unwrapped(e) {
-            ureq::Error::Timeout(_) => Failure::TimedOut,
-            ureq::Error::Io(e) => Failure::Io(e.kind()),
-            _ => Failure::NotFound,
+            ureq::Error::Timeout(timeout) => Some(Failure::TimedOut(*timeout)),
+            ureq::Error::HostNotFound => Some(Failure::NotFound),
+            ureq::Error::BadUri(uri) => Some(Failure::BadUri(uri.clone())),
+            ureq::Error::Io(e) => Some(match e.raw_os_error() {
+                Some(code) => Failure::Os(code),
+                None => Failure::Io(e.kind(), e.to_string()),
+            }),
+            _ => None,
         }
     }
 
-    fn error(self) -> ureq::Error {
+    /// The failure again.
+    fn error(&self) -> ureq::Error {
         match self {
-            Failure::TimedOut => ureq::Error::Timeout(ureq::Timeout::Resolve),
+            Failure::TimedOut(timeout) => ureq::Error::Timeout(*timeout),
             Failure::NotFound => ureq::Error::HostNotFound,
-            Failure::Io(kind) => ureq::Error::Io(kind.into()),
+            Failure::BadUri(uri) => ureq::Error::BadUri(uri.clone()),
+            Failure::Os(code) => ureq::Error::Io(std::io::Error::from_raw_os_error(*code)),
+            Failure::Io(kind, text) => ureq::Error::Io(std::io::Error::new(*kind, text.clone())),
         }
     }
 }
@@ -148,7 +162,7 @@ struct Entry {
     good: Option<Good>,
     /// When the last lookup ended, successful or not.
     ended: Instant,
-    /// How the last lookup failed, when it did.
+    /// How the last lookup failed, when it did (and the cache keeps the failure, `Failure::of`).
     failed: Option<Failure>,
     /// When the next lookup is due.
     next: Instant,
@@ -168,50 +182,115 @@ impl Entry {
 
 /// What a request does about its host's addresses.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a plan lives from `plan` to its match in `resolve`, and boxing the addresses would \
+              allocate for every request the cache serves"
+)]
 enum Plan {
-    /// Uses them: they are fresh, they stand in for a failed lookup until the next is due, or
-    /// another request looks the host up.
+    /// Uses them: they are fresh, or they stand in for a failed lookup until the next is due, or
+    /// while another request looks the host up.
     Use(ResolvedSocketAddrs),
-    /// Fails as the last lookup did, which failed with no addresses to stand in, until the next
-    /// lookup is due.
+    /// Fails as the last lookup did, which left no addresses to stand in, until the next lookup is
+    /// due, or while another request looks the host up.
     Fail(Failure),
-    /// Looks the host up as lookup `id`, with the addresses that stand in if it fails.
-    LookUp(Option<Good>),
+    /// Looks the host up.
+    LookUp,
 }
 
 /// The plan of a request at `now`, given what the cache knows of its host, which the request
 /// marks as being looked up (as lookup `id`) when it is to look the host up.
 fn plan(entry: &mut Entry, now: Instant, id: u64) -> Plan {
-    let stand_in = entry.stand_in(now).cloned();
-    match (stand_in, entry.failed) {
-        (Some(good), _) if now < entry.next || entry.looking.is_some() => Plan::Use(good.addrs),
-        (None, Some(failure)) if now < entry.next => Plan::Fail(failure),
-        (stand_in, _) => {
+    let waits = now < entry.next || entry.looking.is_some();
+    match (entry.stand_in(now), &entry.failed) {
+        (Some(good), _) if waits => Plan::Use(good.addrs.clone()),
+        (None, Some(failure)) if waits => Plan::Fail(failure.clone()),
+        _ => {
             entry.looking = Some(id);
-            Plan::LookUp(stand_in)
+            Plan::LookUp
         }
     }
 }
 
-/// When the next lookup is due after one that failed at `now` with `good` standing in: after
-/// [`DNS_RETRY`], and no later than the stale limit of `good`.
-fn retry_at(good: &Good, now: Instant) -> Instant {
-    let retry = now.checked_add(DNS_RETRY).unwrap_or(now);
-    let stale = good.at.checked_add(DNS_STALE_LIMIT).unwrap_or(good.at);
-    retry.min(stale)
+/// What a request gets from its lookup ([`settle`]).
+#[derive(Debug)]
+enum Settled {
+    /// Addresses: its lookup's, or those of a lookup that succeeded while it ran.
+    Found(ResolvedSocketAddrs),
+    /// The host's last addresses, standing in for its lookup, which failed so.
+    Stale(Good, ureq::Error),
+    /// Its lookup's failure, with no addresses to stand in.
+    Failed(ureq::Error),
+}
+
+/// Settles in `entry` a request's lookup of the host, which started at `started` and ended at
+/// `ended` with `looked`, and says what the request gets. `entry` is what the cache knows of the
+/// host at `ended`: other requests' lookups may have settled since `started`, but none after
+/// `ended` (`resolve` reads it under the cache's lock).
+///
+/// A success is the host's newest addresses, due again after [`DNS_FRESH`]. A failure gives way
+/// to a success that ended since `started`: the request gets its addresses, and the entry stays as
+/// that success left it. Otherwise the failure is kept, and the addresses that stand in at `ended`
+/// serve the request, with the next lookup due after [`DNS_RETRY`], or at their stale limit if that
+/// comes first. With none, the request fails, and so do the host's requests until the next lookup,
+/// after [`DNS_RETRY`]. Either way, the next lookup is due after `ended`.
+fn settle(
+    entry: &mut Entry,
+    started: Instant,
+    ended: Instant,
+    looked: Result<ResolvedSocketAddrs, ureq::Error>,
+) -> Settled {
+    entry.ended = ended;
+    let e = match looked {
+        Ok(addrs) => {
+            entry.good = Some(Good {
+                addrs: addrs.clone(),
+                at: ended,
+            });
+            entry.failed = None;
+            entry.next = later(ended, DNS_FRESH);
+            return Settled::Found(addrs);
+        }
+        Err(e) => e,
+    };
+    if let Some(good) = entry.good.as_ref().filter(|good| good.at >= started) {
+        return Settled::Found(good.addrs.clone());
+    }
+    entry.failed = Failure::of(&e);
+    match entry.stand_in(ended).cloned() {
+        Some(good) => {
+            entry.next = retry_at(&good, ended);
+            Settled::Stale(good, e)
+        }
+        None => {
+            entry.next = later(ended, DNS_RETRY);
+            Settled::Failed(e)
+        }
+    }
+}
+
+/// `at` moved `by` into the future, or `at` if that cannot be told.
+fn later(at: Instant, by: Duration) -> Instant {
+    at.checked_add(by).unwrap_or(at)
+}
+
+/// When the next lookup is due after one that failed at `ended` with `good` standing in: after
+/// [`DNS_RETRY`], or when `good` passes the stale limit if that comes first, which is after
+/// `ended` since `good` stands in then.
+fn retry_at(good: &Good, ended: Instant) -> Instant {
+    later(ended, DNS_RETRY).min(later(good.at, DNS_STALE_LIMIT))
 }
 
 /// When the next lookup is due after a connection to the host's addresses failed at `now`: at
 /// once, but no sooner than [`DNS_RETRY`] after the last lookup ended, and no later than it was.
 fn due_at(entry: &Entry, now: Instant) -> Instant {
-    let floor = entry.ended.checked_add(DNS_RETRY).unwrap_or(entry.ended);
-    entry.next.min(now.max(floor))
+    entry.next.min(now.max(later(entry.ended, DNS_RETRY)))
 }
 
 /// The agents' resolver: ureq's own, behind a cache of each host's addresses ([`DNS_FRESH`]),
-/// whose last addresses also stand in for failed lookups ([`DNS_STALE_LIMIT`], [`DNS_RETRY`]), one
-/// lookup at a time per host while they do (see the module). A lookup that failed with none to
-/// stand in fails the host's requests until the next is due, after [`DNS_RETRY`]. An IP address
+/// whose last addresses also stand in for failed lookups ([`DNS_STALE_LIMIT`], [`DNS_RETRY`]), with
+/// one lookup at a time per host (see the module). A lookup that failed with none to stand in fails
+/// the host's requests the same way until the next one, after [`DNS_RETRY`], ends. An IP address
 /// needs no lookup and is never cached. Every failure it returns is [`NotSent`]. Clones share one
 /// cache.
 #[derive(Debug)]
@@ -324,67 +403,50 @@ impl<R: ureq::unversioned::resolver::Resolver> ureq::unversioned::resolver::Reso
         let Some(host) = host(uri) else {
             return self.0.inner.resolve(uri, config, timeout).map_err(not_sent);
         };
-        let now = Instant::now();
+        let started = Instant::now();
         let id = self.0.lookups.fetch_add(1, Ordering::Relaxed);
-        let stand_in = {
+        {
             let mut hosts = self.hosts();
             let entry = hosts.entry(host.clone()).or_insert(Entry {
                 good: None,
-                ended: now,
+                ended: started,
                 failed: None,
-                next: now,
+                next: started,
                 looking: None,
             });
-            match plan(entry, now, id) {
+            match plan(entry, started, id) {
                 Plan::Use(addrs) => return Ok(addrs),
                 Plan::Fail(failure) => return Err(not_sent(failure.error())),
-                Plan::LookUp(stand_in) => stand_in,
+                Plan::LookUp => {}
             }
-        };
+        }
         let _looking = Looking {
             resolver: self,
             host: &host,
             id,
         };
         let looked = self.0.inner.resolve(uri, config, timeout);
-        let ended = Instant::now();
         let mut hosts = self.hosts();
+        let ended = Instant::now();
         let Some(entry) = hosts.get_mut(&host) else {
             return looked.map_err(not_sent);
         };
-        entry.ended = ended;
-        match looked {
-            Ok(addrs) => {
-                entry.good = Some(Good {
-                    addrs: addrs.clone(),
-                    at: ended,
-                });
-                entry.failed = None;
-                entry.next = ended.checked_add(DNS_FRESH).unwrap_or(ended);
-                Ok(addrs)
+        let settled = settle(entry, started, ended, looked);
+        drop(hosts);
+        match settled {
+            Settled::Found(addrs) => Ok(addrs),
+            Settled::Stale(good, e) => {
+                log::emit(Level::Warn, "dns_stale", &[
+                    ("host", &host),
+                    (
+                        "age_ms",
+                        &ended.saturating_duration_since(good.at).as_millis(),
+                    ),
+                    ("reason", &e),
+                ]);
+                Ok(good.addrs)
             }
-            Err(e) => {
-                entry.failed = Some(Failure::of(&e));
-                match stand_in {
-                    Some(good) => {
-                        entry.next = retry_at(&good, ended);
-                        drop(hosts);
-                        log::emit(Level::Warn, "dns_stale", &[
-                            ("host", &host),
-                            (
-                                "age_ms",
-                                &ended.saturating_duration_since(good.at).as_millis(),
-                            ),
-                            ("reason", &e),
-                        ]);
-                        Ok(good.addrs)
-                    }
-                    None => {
-                        entry.next = ended.checked_add(DNS_RETRY).unwrap_or(ended);
-                        Err(not_sent(e))
-                    }
-                }
-            }
+            Settled::Failed(e) => Err(not_sent(e)),
         }
     }
 }
@@ -441,6 +503,7 @@ mod tests {
 
     use ureq::config::Config;
     use ureq::http::Uri;
+    use ureq::unversioned::resolver::DefaultResolver;
     use ureq::unversioned::resolver::ResolvedSocketAddrs;
     use ureq::unversioned::resolver::Resolver as _;
     use ureq::unversioned::transport::NextTimeout;
@@ -449,10 +512,14 @@ mod tests {
     use super::DNS_RETRY;
     use super::DNS_STALE_LIMIT;
     use super::Entry;
+    use super::Failure;
+    use super::Good;
     use super::Resolver;
+    use super::Settled;
     use super::is_not_sent;
     use super::not_sent;
     use super::sent_nothing;
+    use super::settle;
     use super::unwrapped;
 
     const URL: &str = "http://gw.test/b/s";
@@ -725,23 +792,197 @@ mod tests {
     }
 
     // A failed connection makes the host's lookup due, but no sooner than 5 s after the last
-    // lookup, and keeps its addresses to stand in for a lookup that fails.
+    // lookup ended (a lookup's end, not the first request's, starts those 5 s), and keeps its
+    // addresses to stand in for a lookup that fails.
     #[test]
     fn a_failed_connection_makes_the_lookup_due_after_the_retry_and_keeps_the_addresses() {
         let resolver = Resolver::new(Scripted::new(vec![
             Answer::Addr(addr(80)),
+            Answer::Addr(addr(81)),
             Answer::Fail(ureq::Error::Timeout(ureq::Timeout::Resolve)),
         ]));
         let uri: Uri = URL.parse().unwrap();
         assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        age(&resolver, DNS_FRESH);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
         resolver.due(&uri);
-        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
-        assert_eq!(lookups(&resolver), 1);
-        resolver.hosts().get_mut(HOST).unwrap().ended =
-            Instant::now().checked_sub(DNS_RETRY).unwrap();
-        resolver.due(&uri);
-        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
         assert_eq!(lookups(&resolver), 2);
+        resolver.backdate(DNS_RETRY);
+        resolver.due(&uri);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
+        assert_eq!(lookups(&resolver), 3);
+    }
+
+    // With no addresses to stand in, while one request looks the host up again after a failed
+    // lookup, the host's other requests fail as that lookup did, with no lookup of theirs.
+    #[test]
+    fn one_request_at_a_time_looks_up_a_host_with_no_addresses() {
+        let (lookup, started, end) = gated(addr(81));
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Fail(ureq::Error::HostNotFound),
+            lookup,
+            Answer::Addr(addr(99)),
+        ]));
+        let e = resolve(&resolver, URL).unwrap_err();
+        assert!(matches!(sent_nothing(e), (ureq::Error::HostNotFound, true)));
+        due_now(&resolver);
+        let looking = in_thread(&resolver);
+        started.recv_timeout(STARTS).unwrap();
+        let e = resolve(&resolver, URL).unwrap_err();
+        assert!(matches!(sent_nothing(e), (ureq::Error::HostNotFound, true)));
+        assert_eq!(lookups(&resolver), 2);
+        end.send(()).unwrap();
+        assert_eq!(looking.join().unwrap().unwrap(), addr(81));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
+        assert_eq!(lookups(&resolver), 2);
+    }
+
+    // A failure the cache repeats, until the next lookup, prints as the lookup's own did, and is
+    // the same error: an I/O error's message (getaddrinfo's failures are `Uncategorized` with one)
+    // or OS error code, and a timeout's kind (a CONNECT proxy's host is looked up within the
+    // connect timeout).
+    #[test]
+    fn a_kept_failure_prints_as_the_lookup_did() {
+        // No system uses this OS error code, so std takes its kind as `Uncategorized`.
+        let uncategorized = std::io::Error::from_raw_os_error(9999).kind();
+        let failures: [fn(std::io::ErrorKind) -> ureq::Error; 5] = [
+            |kind| {
+                ureq::Error::Io(std::io::Error::new(
+                    kind,
+                    "failed to lookup address information: Name or service not known",
+                ))
+            },
+            |_| ureq::Error::Io(std::io::Error::from_raw_os_error(libc::ECONNREFUSED)),
+            |_| ureq::Error::Timeout(ureq::Timeout::Connect),
+            |_| ureq::Error::HostNotFound,
+            |_| ureq::Error::BadUri("gw.test is missing scheme".to_string()),
+        ];
+        for failure in failures {
+            let resolver = Resolver::new(Scripted::new(vec![Answer::Fail(failure(uncategorized))]));
+            let (first, sent) = sent_nothing(resolve(&resolver, URL).unwrap_err());
+            assert!(sent);
+            let (kept, sent) = sent_nothing(resolve(&resolver, URL).unwrap_err());
+            assert!(sent);
+            assert_eq!(lookups(&resolver), 1);
+            assert_eq!(kept.to_string(), first.to_string());
+            assert_eq!(format!("{kept:?}"), format!("{first:?}"));
+        }
+    }
+
+    /// `t` moved `secs` seconds on.
+    fn at(t: Instant, secs: u64) -> Instant {
+        t.checked_add(Duration::from_secs(secs)).unwrap()
+    }
+
+    fn addrs(port: u16) -> ResolvedSocketAddrs {
+        let mut addrs = DefaultResolver::default().empty();
+        addrs.push(addr(port));
+        addrs
+    }
+
+    /// A host whose last lookup succeeded (port 80) and ended at `good`, due again at `next`.
+    fn looked_up(good: Instant, next: Instant) -> Entry {
+        Entry {
+            good: Some(Good {
+                addrs: addrs(80),
+                at: good,
+            }),
+            ended: good,
+            failed: None,
+            next,
+            looking: None,
+        }
+    }
+
+    // A lookup that succeeds settles as the host's newest addresses, due again 30 s after it ended,
+    // which is when the host's last lookup ended.
+    #[test]
+    fn a_lookup_that_succeeds_settles_as_the_newest_addresses() {
+        let t = Instant::now();
+        let mut entry = looked_up(t, at(t, 30));
+        entry.failed = Some(Failure::NotFound);
+        let settled = settle(&mut entry, at(t, 40), at(t, 41), Ok(addrs(81)));
+        assert!(matches!(settled, Settled::Found(found) if found[..] == [addr(81)]));
+        let good = entry.good.unwrap();
+        assert_eq!((&good.addrs[..], good.at), (&[addr(81)][..], at(t, 41)));
+        assert!(entry.failed.is_none());
+        assert_eq!((entry.ended, entry.next), (at(t, 41), at(t, 71)));
+    }
+
+    // A lookup that fails gives way to one that succeeded since it started: its request gets that
+    // lookup's addresses, and the host stays as that lookup left it, with no failure kept and the
+    // next lookup not brought forward.
+    #[test]
+    fn a_lookup_that_fails_gives_way_to_a_success_since_it_started() {
+        let t = Instant::now();
+        let mut entry = looked_up(at(t, 2), at(t, 32));
+        let settled = settle(
+            &mut entry,
+            t,
+            at(t, 5),
+            Err(ureq::Error::Timeout(ureq::Timeout::Resolve)),
+        );
+        assert!(matches!(settled, Settled::Found(found) if found[..] == [addr(80)]));
+        assert!(entry.failed.is_none());
+        assert_eq!((entry.ended, entry.next), (at(t, 5), at(t, 32)));
+    }
+
+    // A lookup that fails settles on the addresses that stand in when it ended: the next lookup is
+    // due 5 s after it ended, or at the stale limit if that comes first, and never before it
+    // ended. Addresses that pass the stale limit while the lookup runs stand in for nothing.
+    #[test]
+    fn a_lookup_that_fails_settles_on_what_stands_in_when_it_ended() {
+        let t = Instant::now();
+        let limit = DNS_STALE_LIMIT.as_secs();
+        let timeout = || Err(ureq::Error::Timeout(ureq::Timeout::Resolve));
+        let mut entry = looked_up(t, at(t, 30));
+        let settled = settle(&mut entry, at(t, 60), at(t, 61), timeout());
+        assert!(matches!(&settled, Settled::Stale(good, _) if good.at == t));
+        assert!(matches!(
+            entry.failed,
+            Some(Failure::TimedOut(ureq::Timeout::Resolve))
+        ));
+        assert_eq!((entry.ended, entry.next), (at(t, 61), at(t, 66)));
+        let mut entry = looked_up(t, at(t, 30));
+        let settled = settle(&mut entry, at(t, limit - 4), at(t, limit - 2), timeout());
+        assert!(matches!(settled, Settled::Stale(..)));
+        assert_eq!((entry.ended, entry.next), (at(t, limit - 2), at(t, limit)));
+        let mut entry = looked_up(t, at(t, 30));
+        let settled = settle(&mut entry, at(t, limit - 1), at(t, limit + 1), timeout());
+        assert!(matches!(settled, Settled::Failed(_)));
+        assert_eq!(
+            (entry.ended, entry.next),
+            (at(t, limit + 1), at(t, limit + 6))
+        );
+    }
+
+    // A lookup that fails with no addresses to stand in fails its request and keeps how it failed
+    // until the next lookup, 5 s after it ended. A failure the cache cannot make again is not kept.
+    #[test]
+    fn a_lookup_that_fails_with_no_addresses_keeps_its_failure_until_the_retry() {
+        let t = Instant::now();
+        let mut entry = looked_up(t, t);
+        entry.good = None;
+        let settled = settle(&mut entry, t, at(t, 5), Err(ureq::Error::HostNotFound));
+        assert!(matches!(
+            settled,
+            Settled::Failed(ureq::Error::HostNotFound)
+        ));
+        assert!(matches!(entry.failed, Some(Failure::NotFound)));
+        assert_eq!((entry.ended, entry.next), (at(t, 5), at(t, 10)));
+        let settled = settle(
+            &mut entry,
+            at(t, 10),
+            at(t, 11),
+            Err(ureq::Error::ConnectionFailed),
+        );
+        assert!(matches!(
+            settled,
+            Settled::Failed(ureq::Error::ConnectionFailed)
+        ));
+        assert!(entry.failed.is_none());
+        assert_eq!((entry.ended, entry.next), (at(t, 11), at(t, 16)));
     }
 
     // A failure is wrapped once, however many times it passes a marking resolver or connector (a

@@ -241,7 +241,7 @@ impl Default for RaftConfig {
             install_snapshot_timeout: HumanDuration::sec(120),
             append_transport_budget_bytes: 128 * 1024 * 1024,
             grpc_reconnect_after_failures: 8,
-            snapshot_build_max_concurrency: 4,
+            snapshot_build_max_concurrency: 2,
             snapshot_install_max_concurrency: 1,
             snapshot_logs_since_last: 5_000,
             snapshot_pressure_max_groups_per_tick: 16,

@@ -227,7 +227,7 @@ raft:
   # Snapshot builds a node runs at once. Each holds a copy of its group's state and its compressed
   # upload. The snapshot driver keeps one in flight while the node's Raft log is below its budget,
   # and past it more, up to this many before the hard limit of twice the budget.
-  snapshotBuildMaxConcurrency: 4
+  snapshotBuildMaxConcurrency: 2
   # Payload-bearing log entries retained per group after snapshot coverage.
   maxInSnapshotLogToKeep: 64
 

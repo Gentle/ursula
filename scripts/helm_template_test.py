@@ -604,7 +604,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
     def test_snapshot_build_concurrency_defaults_to_the_server_default(self) -> None:
         parsed = tomllib.loads(render_config("--set", "s3.bucket=bkt"))
 
-        self.assertEqual(parsed["raft"]["snapshot_build_max_concurrency"], 4)
+        self.assertEqual(parsed["raft"]["snapshot_build_max_concurrency"], 2)
 
     def test_snapshot_build_concurrency_below_one_is_refused(self) -> None:
         result = subprocess.run(

@@ -838,6 +838,15 @@ mod tests {
             body: String::new(),
         };
         assert!(FailureKind::may_be_size(&unanswered(), &large, 1000));
+        // So may a reset that macOS reports as `EINVAL` (`client::reset_on_macos`), on every
+        // system: like a broken pipe, it came on an open connection, which may have carried the
+        // body.
+        let einval = ureq::Error::Io(std::io::Error::from_raw_os_error(libc::EINVAL));
+        assert!(FailureKind::may_be_size(
+            &unknown(Attempt::Transport(Box::new(einval))),
+            &large,
+            1000
+        ));
         assert!(FailureKind::may_be_size(&status(503), &large, 1000));
         assert!(FailureKind::may_be_size(&timed_out, &large, 1000));
         assert!(

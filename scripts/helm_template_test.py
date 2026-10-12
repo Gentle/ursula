@@ -602,9 +602,11 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(parsed["raft"]["snapshot_build_max_concurrency"], 1)
 
     def test_snapshot_build_concurrency_defaults_to_the_server_default(self) -> None:
+        # Unset, the key is not rendered, so each server keeps its own
+        # default: a pod that still runs an older image too.
         parsed = tomllib.loads(render_config("--set", "s3.bucket=bkt"))
 
-        self.assertEqual(parsed["raft"]["snapshot_build_max_concurrency"], 2)
+        self.assertNotIn("snapshot_build_max_concurrency", parsed["raft"])
 
     def test_snapshot_build_concurrency_below_one_is_refused(self) -> None:
         result = subprocess.run(

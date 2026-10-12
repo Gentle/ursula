@@ -105,6 +105,22 @@ struct SnapshotBuildCoordinatorInner {
     log_pressure: Arc<AtomicBool>,
 }
 
+/// What became of a build permit handed to a group with its snapshot trigger
+/// ([`SnapshotBuildCoordinator::hand_off_and_trigger`]).
+#[derive(Debug)]
+pub enum Handoff<E> {
+    /// The group's build claimed the permit, so it runs.
+    Claimed,
+    /// The group's build did not claim the permit in time, and it went back
+    /// to the node's permits. OpenRaft drops a trigger while it counts a
+    /// build of the group as running, which it does until RaftCore handles
+    /// the build's end, after the build released its permit. A build that
+    /// waits behind its group's applies claims too late as well.
+    Unclaimed,
+    /// The trigger failed, and the permit went back to the node's permits.
+    TriggerFailed(E),
+}
+
 /// One snapshot build that holds a permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BuildInFlight {
@@ -263,10 +279,42 @@ impl SnapshotBuildCoordinator {
         }
     }
 
+    /// Hands `permit` to `raft_group_id`, runs `trigger` (the group's
+    /// snapshot trigger) and waits up to `wait` for the group's next build
+    /// to claim the permit. The permit goes back to the node's permits
+    /// unless the build claimed it.
+    ///
+    /// A triggered build otherwise only *tries* for a permit and is refused
+    /// while other groups hold every one, so a driver firing many groups at
+    /// once built about one per tick and the Raft log outgrew memory under
+    /// sustained writes (#519). A caller that needs the build to run takes a
+    /// permit first (waiting until fewer builds run than it allows, as
+    /// [`SnapshotBuildCoordinator::acquire_below`] does) and hands it over.
+    pub async fn hand_off_and_trigger<E>(
+        &self,
+        raft_group_id: u32,
+        permit: OwnedSemaphorePermit,
+        wait: Duration,
+        trigger: impl Future<Output = Result<(), E>>,
+    ) -> Handoff<E> {
+        self.hand_off(raft_group_id, permit);
+        if let Err(err) = trigger.await {
+            self.reclaim_handoff(raft_group_id);
+            return Handoff::TriggerFailed(err);
+        }
+        let _claimed_or_late =
+            crate::rt::time::timeout(wait, self.handoff_claimed(raft_group_id)).await;
+        if self.reclaim_handoff(raft_group_id) {
+            Handoff::Unclaimed
+        } else {
+            Handoff::Claimed
+        }
+    }
+
     /// Waits until the permit handed off to `raft_group_id` is no longer
     /// pending: the group claimed it, or it was taken back. A claim
     /// registers its build, which wakes the wait.
-    pub async fn handoff_claimed(&self, raft_group_id: u32) {
+    pub(crate) async fn handoff_claimed(&self, raft_group_id: u32) {
         // Subscribed before the check, so a claim right after it still
         // wakes the wait.
         let mut builds = self.inner.builds.subscribe();
@@ -277,26 +325,20 @@ impl SnapshotBuildCoordinator {
         }
     }
 
-    /// Reserves `permit` for the next snapshot build of `raft_group_id`.
-    ///
-    /// The snapshot driver acquires a permit (waiting until fewer builds run
-    /// than its log pressure calls for) and hands it to the group it
-    /// triggers. A triggered build otherwise only *tries* for a permit and is
-    /// refused while other groups hold every permit, so a driver firing many
-    /// groups at once built about one per tick and the Raft log outgrew
-    /// memory under sustained writes.
-    pub fn hand_off(&self, raft_group_id: u32, permit: OwnedSemaphorePermit) {
+    /// Reserves `permit` for the next snapshot build of `raft_group_id`
+    /// ([`SnapshotBuildCoordinator::hand_off_and_trigger`]).
+    pub(crate) fn hand_off(&self, raft_group_id: u32, permit: OwnedSemaphorePermit) {
         self.handoffs().insert(raft_group_id, permit);
     }
 
     /// Whether `raft_group_id`'s handed-off permit is still unclaimed.
-    pub fn handoff_pending(&self, raft_group_id: u32) -> bool {
+    pub(crate) fn handoff_pending(&self, raft_group_id: u32) -> bool {
         self.handoffs().contains_key(&raft_group_id)
     }
 
     /// Takes back an unclaimed handed-off permit (the trigger was dropped);
     /// returns whether there was one.
-    pub fn reclaim_handoff(&self, raft_group_id: u32) -> bool {
+    pub(crate) fn reclaim_handoff(&self, raft_group_id: u32) -> bool {
         self.handoffs().remove(&raft_group_id).is_some()
     }
 
@@ -2162,6 +2204,58 @@ mod tests {
         build.hand_off(group, build.acquire().await.expect("permit"));
         assert!(build.reclaim_handoff(group));
         assert_eq!(build.available_permits(), 1);
+    }
+
+    /// #519: a permit handed to a group with its trigger goes back to the
+    /// node's permits when the trigger fails or no build claims it in time,
+    /// and stays with the build that claims it until the build ends.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_handed_off_permit_comes_back_unless_a_build_claims_it() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        let never = Duration::from_secs(3_600);
+
+        let permit = build.acquire().await.expect("driver's build permit");
+        let failed = build
+            .hand_off_and_trigger(group, permit, never, async {
+                Err::<(), _>("the group stopped")
+            })
+            .await;
+        assert!(matches!(
+            failed,
+            Handoff::TriggerFailed("the group stopped")
+        ));
+        assert!(!build.handoff_pending(group));
+        assert_eq!(build.available_permits(), 2);
+
+        // No build claims it, as when OpenRaft dropped the trigger.
+        let permit = build.acquire().await.expect("driver's build permit");
+        let unclaimed = build
+            .hand_off_and_trigger(group, permit, Duration::from_millis(20), async {
+                Ok::<(), &str>(())
+            })
+            .await;
+        assert!(matches!(unclaimed, Handoff::Unclaimed));
+        assert!(!build.handoff_pending(group));
+        assert_eq!(build.available_permits(), 2);
+
+        // The trigger starts the group's build, which claims the permit.
+        let permit = build.acquire().await.expect("driver's build permit");
+        let mut builder = None;
+        let claimed = build
+            .hand_off_and_trigger(group, permit, never, async {
+                builder = state_machine.try_create_snapshot_builder(false).await;
+                Ok::<(), &str>(())
+            })
+            .await;
+        assert!(matches!(claimed, Handoff::Claimed));
+        assert!(builder.is_some());
+        assert_eq!(build.available_permits(), 1);
+        drop(builder);
+        assert_eq!(build.available_permits(), 2);
     }
 
     /// #519: a build counts in flight, with the log it will still free,

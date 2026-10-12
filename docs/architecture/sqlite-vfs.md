@@ -840,12 +840,17 @@ The crate refuses to build with `panic = "abort"`.
 - Behind a layer with a lower request limit, set `URSULA_VFS_MAX_FRAME_BYTES` at or below it (64
   KiB at least). A `413` marked `x-ursula-not-applied` and vouched for (§2) fails the commit alone
   as `too_large`. The gateway's per-bucket body limit reads the whole body before it answers, so
-  its 413 reaches the client. Its `--max-request-body-bytes` stops reading at the limit, answers a
-  vouched 413, and closes the connection with the rest of the body unread (#540). A commit a little
-  over the limit may still get the 413 and fail alone as `too_large`. One far over it usually meets
-  a failed write, an unknown outcome, and the commit poisons once the retry budget runs out. The
-  server's limit equals the default frame limit, which the setting cannot raise past, so no frame
-  the extension sends is over it. Any other `413` poisons at once.
+  its 413 reaches the client. So do the refusals the gateway decides from a write's head alone (a
+  refused token, an authorizer's denial, a bucket's rate limit): from 0.7.4 it reads the body
+  before it answers them, up to its `--max-request-body-bytes`, for 30 s at most, which outlasts a
+  commit's 10 s request timeout, and until no data arrived for 5 s (#540). Before, a commit larger
+  than one read of the gateway often met a reset instead, an unknown outcome. Its
+  `--max-request-body-bytes` still stops reading at the limit, answers a vouched 413, and closes
+  the connection with the rest of the body unread. A commit a little over the limit may still get
+  the 413 and fail alone as `too_large`. One far over it usually meets a failed write, an unknown
+  outcome, and the commit poisons once the retry budget runs out. The server's limit equals the
+  default frame limit, which the setting cannot raise past, so no frame the extension sends is over
+  it. Any other `413` poisons at once.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
   by the server at 1 GiB compressed (32 MiB inline or through the gateway). `snapshot_bytes` in
   `ursula_status` is the latest body's compressed size.
@@ -1056,6 +1061,12 @@ must say in its release notes to stop every owner of a stream before upgrading.
   succeeds, a fresh attach of the stream holds the accepted rows alone, and the owner's own files,
   attached again, pass `integrity_check` with the same rows. With `URSULA_VFS_MAX_FRAME_BYTES` set
   to 1 MiB, a 2 MiB transaction fails the same way.
+- A refusal a real `ursula gateway` decides from a write's head alone (`test/early-refusal.e2e.ts`,
+  through a gateway that checks tokens, #540). The owner's token file turns bad before a commit of
+  8 MiB of random bytes, more than the loopback holds while the gateway reads nothing. Every attempt
+  gets the gateway's 401, none a closed connection, the commit fails alone as `unauthorized` with
+  `InvalidCredential` as its reason, nothing is poisoned, the next commit succeeds with a good
+  token, and the stream holds the accepted commits alone.
 - Panics (`test/panics.e2e.ts`, each case in its own Node process with `URSULA_VFS_PANIC_IN`). Every
   SQL function and the extension's init fail with "panicked inside the extension", and the process
   goes on without a signal. A panic in `xWrite` fails the commit with `SQLITE_IOERR_WRITE` and

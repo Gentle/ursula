@@ -63,17 +63,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(log = %usage_path.display(), "gateway usage accounting enabled");
     }
 
-    let gateway = Arc::new(gateway);
-
-    // Keep Axum's State extractor in the binary so the library handler stays
-    // easy to call directly from tests.
-    let app = Router::new()
-        .fallback(any(
-            |State(gateway): State<Arc<Gateway>>, req: Request<Body>| async move {
-                gateway.handle(req).await
-            },
-        ))
-        .with_state(gateway);
+    let app = router(Arc::new(gateway));
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(
@@ -100,6 +90,19 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// The gateway's HTTP service: every request goes to [`Gateway::handle`].
+/// Axum's State extractor stays here, out of the library handler, so tests
+/// can call the handler directly.
+pub(crate) fn router(gateway: Arc<Gateway>) -> Router {
+    Router::new()
+        .fallback(any(
+            |State(gateway): State<Arc<Gateway>>, req: Request<Body>| async move {
+                gateway.handle(req).await
+            },
+        ))
+        .with_state(gateway)
 }
 
 /// Builds the opt-in access-control hooks from CLI arguments. All-absent means
@@ -176,7 +179,9 @@ pub struct GatewayArgs {
     #[arg(long, default_value = "5")]
     upstream_tcp_user_timeout: NonZeroU64,
 
-    /// Maximum request body bytes buffered for leader-redirect replay.
+    /// Maximum request body bytes buffered for leader-redirect replay. Also
+    /// the most the gateway reads of a body before it sends a refusal it
+    /// decided from the request's head alone.
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES)]
     max_request_body_bytes: usize,
 

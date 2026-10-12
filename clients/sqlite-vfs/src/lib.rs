@@ -128,7 +128,10 @@
 //! bound, and one that is not a number of bytes is ignored, both logged once as
 //! `setting_adjusted`). A larger transaction is refused as `too_large` without being sent. Test
 //! hook: `URSULA_VFS_SNAPSHOT_RETRY_MS` sets the wait after a first failed snapshot (100 ms, at
-//! least 1 ms).
+//! least 1 ms). `URSULA_VFS_READ_ORIGIN` sets where attach reads the snapshot and the history
+//! behind the tail (see `read_origin`): unset, the stream's `Stream-Read-Origin` hint; `off`, the
+//! stream's origin only; an `https://host[:port]` origin, that origin (any other value is taken as
+//! `off`, logged once as `setting_adjusted`).
 //!
 //! Module map:
 //!
@@ -147,6 +150,7 @@
 //! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
+//! - `read_origin`: attach's immutable reads at a read origin (a CDN), and their fallback.
 //! - `snapshotter`: the snapshot thread, snapshots and retention.
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
 //! - `status`: `ursula_status` and `ursula_stats`.
@@ -167,6 +171,7 @@ mod host;
 mod local;
 mod log;
 mod net;
+mod read_origin;
 pub mod snapshot;
 mod snapshotter;
 mod stats;

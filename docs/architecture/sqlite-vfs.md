@@ -287,6 +287,9 @@ leaving a stream whose rebuilt copies need a rollback journal to be written.
    attach round, as in step 6). From here on every request carries step 2's incarnation as the
    `Stream-Incarnation` precondition. If the stream's latest snapshot is ahead of the file (a fresh
    host, or a file left below the retention), installs it (§4.3). Then replays frames to the tail.
+   With a read origin (§7, read origin), the snapshot and the history up to the tail this `HEAD`
+   named come from it first, with the incarnation in the URL ([immutable reads](immutable-reads.md)
+   §4), and the rest from the stream's origin.
 5. Claims with the incarnation's `Producer-Id` (§2): appends a claim at (epoch = highest seen + 1,
    seq 0) and reads it back. A 2xx alone proves nothing, because two owners claiming the same epoch
    both get one, the second as a duplicate. So the claim counts only if the frame ending at the
@@ -791,6 +794,24 @@ The crate refuses to build with `panic = "abort"`.
 - A host's addresses are looked up through the system's resolver at most once every 30 s per
   process, so a stream whose endpoint moves is reached at its new addresses within 30 s, or 5 s
   after a connection to an old address failed (§6, DNS).
+- **Read origin.** Attach can read the snapshot and the history behind the tail from a read
+  origin, typically a CDN in front of the same server ([immutable reads](immutable-reads.md)).
+  `URSULA_VFS_READ_ORIGIN` chooses it. Unset, attach follows the stream's `Stream-Read-Origin`
+  hint (sent on `HEAD`) when the hint is an `https` origin within the stream URL's site, its
+  registrable domain from the public suffix list. `off` never uses a read origin. An
+  `https://host[:port]` origin with no path is used whatever the hint says. Any other value is
+  taken as `off`, logged once as `setting_adjusted`. Requests there carry the token. Only the
+  snapshot `GET` and the history reads up to the tail that attach's `HEAD` named go there, as
+  `GET {path}/snapshot/{offset}?incarnation={inc}` and
+  `GET {path}?offset={o}&aligned=true&incarnation={inc}` (no `consistency`). Attach takes an answer
+  only as a `200` of that incarnation, for a snapshot with the offset and digest `HEAD` named (then
+  checks its size and checksum as always), and never reads `Stream-Up-To-Date` from it. It stops
+  using the read origin at the tail, or after the first answer not marked `Stream-Immutable`. On
+  any other answer (a redirect, a `404`, a `412`, another incarnation, a body cut short) or a
+  transport error, it sends the request again to the stream's origin and reads the rest of the
+  attach there, logged once as `read_origin_fallback`. Only the stream origin's `412` means the
+  stream was recreated. Commits, claims, `consistency=leader` reads, `HEAD`, the snapshot thread
+  and retention always use the stream's origin.
 - **Connections.** Appends, reads and `HEAD`s keep a connection for 90 s after its last request
   (`URSULA_VFS_IDLE_MS`), so a writer that commits every 15 to 90 s does not open a new TCP and TLS
   connection per commit, which behind a reverse proxy or a CDN can cost about a second. Snapshot

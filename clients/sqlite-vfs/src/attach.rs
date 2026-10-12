@@ -47,6 +47,7 @@ use crate::local::stream_key;
 use crate::local::write_sidecar;
 use crate::log;
 use crate::log::Level;
+use crate::read_origin::ImmutableReads;
 use crate::snapshot;
 use crate::snapshotter::Snapper;
 use crate::snapshotter::snapshot_loop;
@@ -232,12 +233,15 @@ impl Applier {
 /// Reads and applies frames from `pos` (a frame boundary) until the tail (`until == None`) or
 /// until `pos` reaches `until`. Offsets are opaque, so `pos` only ever takes a read's
 /// `Stream-Next-Offset`, once no partial frame is buffered: a frame boundary at or before
-/// everything applied (replay from there is idempotent).
+/// everything applied (replay from there is idempotent). Reads go to the read origin while `reads`
+/// has one in use, up to `tail` (`HEAD`'s), and then to the stream's origin; a frame may span the
+/// two.
 fn catch_up(
     url: &str,
     incarnation: &str,
     pos: &mut String,
     until: Option<&str>,
+    (reads, tail): (&mut ImmutableReads, Option<&str>),
     applier: &mut Applier,
 ) -> Result<(), Error> {
     let (mut buf, mut at) = (Vec::new(), pos.clone());
@@ -245,7 +249,10 @@ fn catch_up(
         if buf.is_empty() && until.is_some_and(|u| pos.as_str() >= u) {
             break;
         }
-        let (bytes, next) = read_from(url, incarnation, &at)?;
+        let (bytes, next) = match reads.read(url, incarnation, &at, tail) {
+            Some(read) => read,
+            None => read_from(url, incarnation, &at)?,
+        };
         if bytes.is_empty() {
             if !buf.is_empty() || until.is_some() {
                 return Err(Error::StreamEnded {
@@ -288,13 +295,15 @@ fn catch_up(
 /// [`Error::Recreated`], and `attach_files_rebuilding` rebuilds against the new one; a newer owner's
 /// claim replayed after ours fails the attach). Returns the epoch claimed and the latest
 /// snapshot's offset (`START` for none). Read-only (`mode`), it stops at the tail without a claim
-/// and returns the highest epoch claimed up to it.
+/// and returns the highest epoch claimed up to it. The snapshot and the history up to `HEAD`'s tail
+/// come from the read origin while `reads` has one in use; nothing after the claim does.
 pub(crate) fn sync(
     url: &str,
     incarnation: &str,
     pos: &mut String,
     applier: &mut Applier,
     mode: Mode,
+    reads: &mut ImmutableReads,
 ) -> Result<(u64, String), Error> {
     let head = head(url, &|| false)?;
     if head.incarnation.as_deref() != Some(incarnation) {
@@ -303,23 +312,20 @@ pub(crate) fn sync(
     if let Some(s) = head.snapshot.as_deref()
         && pos.as_str() < s
     {
-        let Some(body) = get_snapshot(url, incarnation, s, &|| false)? else {
-            return Err(Error::Gone(Gone::SnapshotSuperseded {
-                offset: s.to_owned(),
-            }));
+        let digest = head.snapshot_digest.as_deref();
+        let (bytes, snap) = match reads.snapshot(url, incarnation, s, digest, installable) {
+            Some(found) => found,
+            None => {
+                let Some(body) = get_snapshot(url, incarnation, s, &|| false)? else {
+                    return Err(Error::Gone(Gone::SnapshotSuperseded {
+                        offset: s.to_owned(),
+                    }));
+                };
+                (body.len(), installable(s, &body)?)
+            }
         };
-        let snap = snapshot::decode(&body).map_err(|source| Error::Snapshot {
-            offset: s.to_owned(),
-            source,
-        })?;
-        if snap.offset != s {
-            return Err(Error::SnapshotOffset {
-                at: s.to_owned(),
-                reflects: snap.offset,
-            });
-        }
         applier.install(snap)?;
-        applier.installed_bytes = body.len();
+        applier.installed_bytes = bytes;
         s.clone_into(pos);
     } else if *pos != START && *pos < head.retained {
         return Err(Error::Gone(Gone::RetentionPassed {
@@ -328,7 +334,14 @@ pub(crate) fn sync(
         }));
     }
     // From the beginning (`START`), a stream trimmed with no snapshot visible answers 410: `Gone`.
-    catch_up(url, incarnation, pos, None, applier)?;
+    catch_up(
+        url,
+        incarnation,
+        pos,
+        None,
+        (reads, head.tail.as_deref()),
+        applier,
+    )?;
     let snapshot = head.snapshot.unwrap_or_else(|| START.into());
     if mode == Mode::ReadOnly {
         return Ok((applier.epoch, snapshot));
@@ -342,7 +355,15 @@ pub(crate) fn sync(
         applier.epoch.saturating_add(1),
         pos,
     )?;
-    catch_up(url, incarnation, pos, Some(claimed.as_str()), applier)?;
+    let stream_origin = &mut ImmutableReads::default();
+    catch_up(
+        url,
+        incarnation,
+        pos,
+        Some(claimed.as_str()),
+        (stream_origin, None),
+        applier,
+    )?;
     // The replay may run past our claim into a higher one: another owner claimed meanwhile
     // (normally after ours, as the server refuses a lower epoch from this producer; a stray claim
     // under a deleted incarnation's producer is not epoch-fenced and may precede it). Either way
@@ -354,6 +375,22 @@ pub(crate) fn sync(
         }));
     }
     Ok((epoch, snapshot))
+}
+
+/// The snapshot body fetched at offset `at`, decoded (size and checksum) and checked to reflect
+/// `at`.
+fn installable(at: &str, body: &[u8]) -> Result<snapshot::Snapshot, Error> {
+    let snap = snapshot::decode(body).map_err(|source| Error::Snapshot {
+        offset: at.to_owned(),
+        source,
+    })?;
+    if snap.offset != at {
+        return Err(Error::SnapshotOffset {
+            at: at.to_owned(),
+            reflects: snap.offset,
+        });
+    }
+    Ok(snap)
 }
 
 pub(crate) fn attach(path: &str, url: &str, mode: Mode) -> Result<String, Arc<Error>> {
@@ -514,6 +551,9 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     let incarnation = head.incarnation.ok_or_else(|| Error::NoIncarnation {
         url: url.to_owned(),
     })?;
+    // One read origin per attach: once out of use (at the tail, or after a fallback), the later
+    // rounds below read at the stream's origin too.
+    let mut reads = ImmutableReads::for_attach(url, head.read_origin.as_deref(), &incarnation);
     let (mut local, mut emptied) = (None, None);
     if let Some(s) = found {
         match s {
@@ -606,7 +646,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     // `Gone`: retention moved past the file (or the snapshot read was superseded) under a HEAD
     // that did not show it yet; the next round installs the newer snapshot.
     let (epoch, snapshot) = loop {
-        match sync(url, &incarnation, &mut pos, &mut applier, mode) {
+        match sync(url, &incarnation, &mut pos, &mut applier, mode, &mut reads) {
             Ok(r) => break r,
             Err(e) if e.is_gone() && tries < 10 => {
                 tries = tries.saturating_add(1);
@@ -708,4 +748,410 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         Mode::ReadOnly => None,
     };
     Ok((pos, db, snapshots))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::net::TcpListener;
+
+    use super::Applier;
+    use super::sync;
+    use crate::client::START;
+    use crate::client::mock::answer;
+    use crate::client::mock::answer_with_bytes;
+    use crate::client::mock::serve;
+    use crate::db::Mode;
+    use crate::error::Error;
+    use crate::frame;
+    use crate::frame::PAGE;
+    use crate::local::remove_if_exists;
+    use crate::read_origin::ImmutableReads;
+    use crate::read_origin::Origin;
+    use crate::snapshot;
+
+    const S: &str = "00000000000000000010";
+    const M: &str = "00000000000000000020";
+    const T: &str = "00000000000000000030";
+    const U: &str = "00000000000000000040";
+
+    /// A commit frame that sets page `pgno` to `fill`, the database `size` pages after it.
+    fn commit(size: u32, pgno: u32, fill: u8) -> Vec<u8> {
+        frame::encode_commit(size, &BTreeMap::from([(pgno, vec![fill; PAGE])]))
+            .unwrap()
+            .0
+    }
+
+    /// The stream: a snapshot at `S` (page 1), commits A (page 2) and B (page 3) up to `T`, the
+    /// tail `HEAD` names, and C (page 1 again) from `T` to `U`, appended after the `HEAD`.
+    struct Stream {
+        snapshot: Vec<u8>,
+        a: Vec<u8>,
+        b: Vec<u8>,
+        c: Vec<u8>,
+    }
+
+    impl Stream {
+        fn new() -> Stream {
+            Stream {
+                snapshot: snapshot::encode(S, 0, &[0x11; PAGE]).unwrap(),
+                a: commit(2, 2, 0x22),
+                b: commit(3, 3, 0x33),
+                c: commit(3, 1, 0x44),
+            }
+        }
+
+        /// The bytes from `S` to `M`, which ends inside B, and from `M` to `T`.
+        fn chunks(&self) -> (Vec<u8>, Vec<u8>) {
+            let half = self.b.len() / 2;
+            (
+                [&self.a[..], &self.b[..half]].concat(),
+                self.b[half..].to_vec(),
+            )
+        }
+
+        fn head(&self) -> Vec<u8> {
+            answer(&format!(
+                "200 OK\r\nstream-incarnation: i1\r\nstream-next-offset: {T}\r\n\
+                 stream-snapshot-offset: {S}\r\nstream-snapshot-digest: d1\r\n\
+                 stream-retained-offset: {S}"
+            ))
+            .into_bytes()
+        }
+
+        /// The snapshot as the read origin answers it (`marked`) or the stream's origin.
+        fn snapshot(&self, marked: bool) -> Vec<u8> {
+            let marker = if marked {
+                "\r\nstream-immutable: true"
+            } else {
+                ""
+            };
+            answer_with_bytes(
+                &format!(
+                    "200 OK\r\nstream-incarnation: i1\r\nstream-snapshot-offset: {S}\r\n\
+                     stream-snapshot-digest: d1\r\nstream-next-offset: {T}{marker}"
+                ),
+                &self.snapshot,
+            )
+        }
+
+        /// The stream origin's answers from `from` (`S`, `M` or `T`) to its end.
+        fn tail_from(&self, from: &str) -> Vec<Vec<u8>> {
+            let (first, second) = self.chunks();
+            let mut answers = Vec::new();
+            match from {
+                S => answers.push(read(&[first, second].concat(), T, "")),
+                M => answers.push(read(&second, T, "")),
+                _ => {}
+            }
+            answers.push(read(&self.c, U, ""));
+            answers
+                .push(answer(&format!("204 No Content\r\nstream-next-offset: {U}")).into_bytes());
+            answers
+        }
+    }
+
+    /// A 200 of incarnation `i1` with `bytes`, `next` and header lines `more`.
+    fn read(bytes: &[u8], next: &str, more: &str) -> Vec<u8> {
+        answer_with_bytes(
+            &format!("200 OK\r\nstream-incarnation: i1\r\nstream-next-offset: {next}{more}"),
+            bytes,
+        )
+    }
+
+    /// A read of the read origin, marked immutable.
+    fn chunk(bytes: &[u8], next: &str) -> Vec<u8> {
+        read(bytes, next, "\r\nstream-immutable: true")
+    }
+
+    /// The request lines of a stand-in's requests.
+    fn lines(requests: Vec<String>) -> Vec<String> {
+        requests
+            .iter()
+            .map(|r| r.split(" HTTP/").next().unwrap().to_owned())
+            .collect()
+    }
+
+    /// A path for a fresh db file `name`, with nothing left there by an earlier run.
+    fn scratch(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("ursula-read-origin-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name).to_str().unwrap().to_owned();
+        for leftover in ["", "-wal", "-shm", "-ursula"] {
+            remove_if_exists(&format!("{path}{leftover}")).unwrap();
+        }
+        path
+    }
+
+    /// The applier of an attach of a fresh file at `path`.
+    fn fresh(path: &str) -> Applier {
+        Applier {
+            path: path.to_owned(),
+            sidecar: format!("{path}-ursula"),
+            stamp: String::new(),
+            from: (START.into(), 0, 0),
+            installed: START.into(),
+            installed_bytes: 0,
+            log: 0,
+            written: 0,
+            file: None,
+            pages: BTreeMap::new(),
+            min_size: None,
+            size: None,
+            epoch: 0,
+        }
+    }
+
+    /// A read-only attach (`sync`) of a fresh file `name` from `stream`, with `reads` at the read
+    /// origin `read_origin` (`None`: a port nothing listens on). Checks that the file holds the
+    /// stream's state at `U`, and that the read origin is no longer in use. Returns the request
+    /// lines of the stream's origin and of the read origin.
+    fn attach(
+        name: &str,
+        read_origin: Option<Vec<Vec<u8>>>,
+        stream: Vec<Vec<u8>>,
+    ) -> (Vec<String>, Vec<String>) {
+        let (url, stream_server) = serve(stream);
+        let (origin, read_server) = match read_origin {
+            Some(answers) => {
+                let (read_url, server) = serve(answers);
+                (read_url.trim_end_matches("/b/s").to_owned(), Some(server))
+            }
+            None => {
+                let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+                let origin = format!("http://{}", closed.local_addr().unwrap());
+                drop(closed);
+                (origin, None)
+            }
+        };
+        let mut reads = ImmutableReads::at(&Origin::for_tests(&origin), &url);
+        let path = scratch(name);
+        let mut applier = fresh(&path);
+        let mut pos = START.to_owned();
+        let synced = sync(
+            &url,
+            "i1",
+            &mut pos,
+            &mut applier,
+            Mode::ReadOnly,
+            &mut reads,
+        );
+        assert!(
+            matches!(synced, Ok((0, ref snapshot)) if snapshot == S),
+            "{name}: {synced:?}"
+        );
+        assert_eq!((pos.as_str(), applier.installed.as_str()), (U, S), "{name}");
+        assert!(!reads.in_use(), "{name}");
+        drop(applier);
+        let image = fs::read(&path).unwrap();
+        let pages: Vec<u8> = image.chunks(PAGE).map(|page| page[0]).collect();
+        assert_eq!(pages, [0x44, 0x22, 0x33], "{name}");
+        let read_requests = read_server.map_or_else(Vec::new, |s| lines(s.join().unwrap()));
+        (lines(stream_server.join().unwrap()), read_requests)
+    }
+
+    fn snapshot_at_stream() -> String {
+        format!("GET /b/s/snapshot/{S}")
+    }
+
+    fn snapshot_at_read_origin() -> String {
+        format!("GET /b/s/snapshot/{S}?incarnation=i1")
+    }
+
+    fn leader(offset: &str) -> String {
+        format!("GET /b/s?offset={offset}&consistency=leader")
+    }
+
+    fn aligned(offset: &str) -> String {
+        format!("GET /b/s?offset={offset}&aligned=true&incarnation=i1")
+    }
+
+    // With a read origin, attach takes the snapshot and the history up to the tail `HEAD` named
+    // from it, in aligned reads that carry the incarnation in the URL and no `consistency`, and
+    // then reads on at the stream's origin, with `consistency=leader`, until it is up to date. A
+    // frame that spans two chunks is put back together.
+    #[test]
+    fn attach_reads_the_snapshot_and_history_at_the_read_origin() {
+        let s = Stream::new();
+        let (first, second) = s.chunks();
+        let mut stream = vec![s.head()];
+        stream.extend(s.tail_from(T));
+        let (stream, read_origin) = attach(
+            "read-origin",
+            Some(vec![s.snapshot(true), chunk(&first, M), chunk(&second, T)]),
+            stream,
+        );
+        assert_eq!(read_origin, [
+            snapshot_at_read_origin(),
+            aligned(S),
+            aligned(M)
+        ]);
+        assert_eq!(stream, ["HEAD /b/s".to_owned(), leader(T), leader(U)]);
+    }
+
+    // A frame that spans a chunk boundary applies once both chunks are in, whichever origin
+    // serves the second: here the first chunk ends inside B and the stream's origin serves the
+    // rest after the read origin falls back.
+    #[test]
+    fn a_frame_spanning_a_chunk_boundary_is_put_back_together() {
+        let s = Stream::new();
+        let (first, _) = s.chunks();
+        let mut stream = vec![s.head()];
+        stream.extend(s.tail_from(M));
+        let (stream, read_origin) = attach(
+            "spanning",
+            Some(vec![
+                s.snapshot(true),
+                chunk(&first, M),
+                answer("503 Service Unavailable").into_bytes(),
+            ]),
+            stream,
+        );
+        assert_eq!(read_origin, [
+            snapshot_at_read_origin(),
+            aligned(S),
+            aligned(M)
+        ]);
+        assert_eq!(stream, [
+            "HEAD /b/s".to_owned(),
+            leader(M),
+            leader(T),
+            leader(U)
+        ]);
+    }
+
+    // Any answer of the read origin but a checked 200, and a transport error, repeats the request
+    // at the stream's origin, which serves the rest of the attach. A wrong incarnation or a 412
+    // there is no recreate: only the stream's origin says that. An answer that is not marked
+    // immutable, or that says it is up to date (a cache may hold an old one), is taken, and the
+    // rest is read at the stream's origin.
+    #[test]
+    fn the_read_origin_falls_back_to_the_stream_origin() {
+        let s = Stream::new();
+        let (first, second) = s.chunks();
+        let other = |answer: Vec<u8>| {
+            String::from_utf8_lossy(&answer)
+                .replace("stream-incarnation: i1", "stream-incarnation: i2")
+        };
+        let with_stream = |from: &str, snapshot: bool| {
+            let mut stream = vec![s.head()];
+            if snapshot {
+                stream.push(s.snapshot(false));
+            }
+            stream.extend(s.tail_from(from));
+            stream
+        };
+        let head = "HEAD /b/s".to_owned();
+        // The snapshot of another incarnation.
+        let (stream, read_origin) = attach(
+            "wrong-incarnation",
+            Some(vec![other(s.snapshot(true)).into_bytes()]),
+            with_stream(S, true),
+        );
+        assert_eq!(read_origin, [snapshot_at_read_origin()]);
+        assert_eq!(stream, [
+            head.clone(),
+            snapshot_at_stream(),
+            leader(S),
+            leader(T),
+            leader(U)
+        ]);
+        // A snapshot whose digest is not HEAD's.
+        let stale = String::from_utf8_lossy(&s.snapshot(true))
+            .replace("digest: d1", "digest: d0")
+            .into_bytes();
+        let (stream, _) = attach("wrong-digest", Some(vec![stale]), with_stream(S, true));
+        assert_eq!(stream[1], snapshot_at_stream());
+        // A transport error.
+        let (stream, read_origin) = attach("transport", None, with_stream(S, true));
+        assert!(read_origin.is_empty());
+        assert_eq!(stream[1], snapshot_at_stream());
+        // A 404, and a 412, on the first chunk.
+        for status in ["404 Not Found", "412 Precondition Failed"] {
+            let (stream, read_origin) = attach(
+                status,
+                Some(vec![s.snapshot(true), answer(status).into_bytes()]),
+                with_stream(S, false),
+            );
+            assert_eq!(read_origin, [snapshot_at_read_origin(), aligned(S)]);
+            assert_eq!(stream, [head.clone(), leader(S), leader(T), leader(U)]);
+        }
+        // A chunk of another incarnation.
+        let (stream, _) = attach(
+            "wrong-incarnation-chunk",
+            Some(vec![s.snapshot(true), other(chunk(&first, M)).into_bytes()]),
+            with_stream(S, false),
+        );
+        assert_eq!(stream[1], leader(S));
+        // A body cut short: the connection closes before the length it announced.
+        let mut truncated = chunk(&second, T);
+        truncated.truncate(truncated.len() - 3);
+        let (stream, read_origin) = attach(
+            "truncated",
+            Some(vec![s.snapshot(true), chunk(&first, M), truncated]),
+            with_stream(M, false),
+        );
+        assert_eq!(read_origin, [
+            snapshot_at_read_origin(),
+            aligned(S),
+            aligned(M)
+        ]);
+        assert_eq!(stream[1], leader(M));
+        // An old answer that says it is up to date, unmarked: taken, and the rest read at the
+        // stream's origin rather than taken for the tail.
+        let (stream, read_origin) = attach(
+            "stale-up-to-date",
+            Some(vec![
+                s.snapshot(true),
+                read(&first, M, "\r\nstream-up-to-date: true"),
+            ]),
+            with_stream(M, false),
+        );
+        assert_eq!(read_origin, [snapshot_at_read_origin(), aligned(S)]);
+        assert_eq!(stream, [head.clone(), leader(M), leader(T), leader(U)]);
+        // An answer without the marker (a server that ignored `aligned` and `incarnation`).
+        let (stream, read_origin) = attach(
+            "unmarked",
+            Some(vec![s.snapshot(true), read(&first, M, "")]),
+            with_stream(M, false),
+        );
+        assert_eq!(read_origin, [snapshot_at_read_origin(), aligned(S)]);
+        assert_eq!(stream, [head, leader(M), leader(T), leader(U)]);
+    }
+
+    // A 412 at the stream's origin is a recreate, as without a read origin.
+    #[test]
+    fn only_the_stream_origin_says_recreated() {
+        let s = Stream::new();
+        let (url, server) = serve(vec![
+            s.head(),
+            s.snapshot(false),
+            answer("412 Precondition Failed").into_bytes(),
+        ]);
+        let (read_url, read_server) = serve(vec![answer("412 Precondition Failed")]);
+        let origin = Origin::for_tests(read_url.trim_end_matches("/b/s"));
+        let mut reads = ImmutableReads::at(&origin, &url);
+        let path = scratch("recreated");
+        let mut applier = fresh(&path);
+        let mut pos = START.to_owned();
+        let e = sync(
+            &url,
+            "i1",
+            &mut pos,
+            &mut applier,
+            Mode::ReadOnly,
+            &mut reads,
+        )
+        .unwrap_err();
+        assert!(matches!(e, Error::Recreated { .. }), "{e}");
+        assert_eq!(lines(read_server.join().unwrap()), [
+            snapshot_at_read_origin()
+        ]);
+        assert_eq!(lines(server.join().unwrap()), [
+            "HEAD /b/s".to_owned(),
+            snapshot_at_stream(),
+            leader(S)
+        ]);
+    }
 }

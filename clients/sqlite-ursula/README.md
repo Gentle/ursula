@@ -51,6 +51,10 @@ Read [SQLite on Ursula](https://ursula.tonbo.io/docs/examples/sqlite-vfs) before
 
 `https://` stream URLs trust the certificate authorities bundled with the extension, or only those in the PEM bundle `URSULA_VFS_CA_FILE` names. Behind `ursula gateway` with access control, set the bearer token with `setToken(token)` (refresh it before it expires), or name a file that holds it in `URSULA_VFS_TOKEN_FILE` (read again whenever it changes). See [TLS and credentials](https://ursula.tonbo.io/docs/examples/sqlite-vfs#tls-and-credentials).
 
+## Read origin
+
+An attach on a fresh host downloads the latest snapshot and the history after it. A deployment can serve those through a CDN: the server names a read origin in the `Stream-Read-Origin` header on `HEAD`, and the extension follows it when it is an `https` origin on the same site as the stream URL. Set `URSULA_VFS_READ_ORIGIN=off` to read only from the stream URL, or `URSULA_VFS_READ_ORIGIN=https://reads.example.com` to use that origin whatever the server says. Commits, claims and reads at the tail always go to the stream URL. Any answer the read origin gets wrong makes the attach read the rest from the stream URL.
+
 ## Platforms
 
 The extension is prebuilt for:

@@ -18,6 +18,8 @@ zstd = { version = "0.13", default-features = false }
 crc32c = "0.6"
 libc = "0.2"
 thiserror = "1"
+# The registrable domain of a read origin hint (`read_origin`): the public suffix list, no dependencies.
+psl = "2"
 
 [lints]
 workspace = true

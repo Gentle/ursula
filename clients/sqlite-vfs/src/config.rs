@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::log;
 use crate::log::Level;
+use crate::read_origin::Origin;
 
 pub(crate) fn abort_after_ack() -> Option<u64> {
     static V: OnceLock<Option<u64>> = OnceLock::new();
@@ -130,6 +131,50 @@ fn frame_limit_from(value: &str) -> Setting<usize> {
     }
 }
 
+/// Where attach sends its immutable reads (`read_origin`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadOriginSetting {
+    /// Unset: the stream's `Stream-Read-Origin` hint, when it passes the guards.
+    Hint,
+    /// `off`: the stream's own origin only.
+    Off,
+    /// An `https://host[:port]` origin, whatever the hint says.
+    Configured(Origin),
+}
+
+/// `URSULA_VFS_READ_ORIGIN` (see [`ReadOriginSetting`]). Any other value, a path after the origin
+/// or `http://` included, turns reads at a read origin off, logged once (`setting_adjusted`).
+pub(crate) fn read_origin() -> &'static ReadOriginSetting {
+    static V: OnceLock<ReadOriginSetting> = OnceLock::new();
+    V.get_or_init(|| {
+        let Some(value) = non_empty("URSULA_VFS_READ_ORIGIN") else {
+            return ReadOriginSetting::Hint;
+        };
+        match read_origin_from(&value) {
+            Setting::Taken(setting) => setting,
+            Setting::Adjusted(setting) => {
+                log::emit(Level::Warn, "setting_adjusted", &[
+                    ("setting", &"URSULA_VFS_READ_ORIGIN"),
+                    ("value", &value),
+                    ("used", &"off"),
+                ]);
+                setting
+            }
+        }
+    })
+}
+
+/// The read origin `URSULA_VFS_READ_ORIGIN=value` sets (see [`read_origin`]).
+fn read_origin_from(value: &str) -> Setting<ReadOriginSetting> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") {
+        return Setting::Taken(ReadOriginSetting::Off);
+    }
+    Origin::parse(value).map_or(Setting::Adjusted(ReadOriginSetting::Off), |origin| {
+        Setting::Taken(ReadOriginSetting::Configured(origin))
+    })
+}
+
 /// Test hook `URSULA_VFS_SNAPSHOT_RETRY_MS`: the wait after a first failed snapshot attempt (100 ms
 /// by default, at least 1 ms), which doubles with each further failure
 /// (`snapshotter::SnapshotFailing`). Tests set it high to see the next attempt held back.
@@ -204,8 +249,11 @@ fn non_empty(name: &str) -> Option<String> {
 mod tests {
     use super::DEFAULT_MAX_FRAME_BYTES;
     use super::MIN_FRAME_BYTES;
+    use super::ReadOriginSetting;
     use super::Setting;
     use super::frame_limit_from;
+    use super::read_origin_from;
+    use crate::read_origin::Origin;
 
     // The frame limit is a number of bytes from 64 KiB to 32 MiB, both included: below, an owner's
     // claim could be refused, and above, a frame the server cannot take would be sent. A value
@@ -226,5 +274,37 @@ mod tests {
         assert_eq!(frame_limit_from("0"), Setting::Adjusted(65_536));
         assert_eq!(frame_limit_from("16MiB"), Setting::Adjusted(33_554_432));
         assert_eq!(frame_limit_from(""), Setting::Adjusted(33_554_432));
+    }
+
+    // `off` turns the read origin off, an https origin replaces the hint, and anything else (a
+    // path, `http://`, a bare host) turns it off too, adjusted.
+    #[test]
+    fn the_read_origin_is_off_or_an_https_origin() {
+        assert_eq!(
+            read_origin_from("off"),
+            Setting::Taken(ReadOriginSetting::Off)
+        );
+        assert_eq!(
+            read_origin_from(" OFF "),
+            Setting::Taken(ReadOriginSetting::Off)
+        );
+        assert_eq!(
+            read_origin_from("https://reads.example.com:8443"),
+            Setting::Taken(ReadOriginSetting::Configured(
+                Origin::parse("https://reads.example.com:8443").unwrap()
+            ))
+        );
+        for bad in [
+            "https://reads.example.com/b",
+            "http://reads.example.com",
+            "reads.example.com",
+            "on",
+        ] {
+            assert_eq!(
+                read_origin_from(bad),
+                Setting::Adjusted(ReadOriginSetting::Off),
+                "{bad}"
+            );
+        }
     }
 }

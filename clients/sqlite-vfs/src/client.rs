@@ -29,6 +29,7 @@ use crate::error::WriteRefusal;
 use crate::log;
 use crate::log::Level;
 use crate::net;
+use crate::read_origin::Fallback;
 
 /// `Producer-Id` prefix; the stream incarnation follows (`producer_id`).
 const PRODUCER: &str = "sqlite-ursula-vfs";
@@ -1055,6 +1056,12 @@ pub(crate) struct Head {
     /// for equality only. `None` when absent (or unusable in a sidecar or `Producer-Id`): attach
     /// refuses.
     pub(crate) incarnation: Option<String>,
+    /// `Stream-Next-Offset`: the tail, where attach's reads at a read origin end.
+    pub(crate) tail: Option<String>,
+    /// `Stream-Snapshot-Digest` of `snapshot`: a snapshot from a read origin must carry it.
+    pub(crate) snapshot_digest: Option<String>,
+    /// `Stream-Read-Origin`, as sent: a hint `read_origin` checks before following it.
+    pub(crate) read_origin: Option<String>,
 }
 
 /// `stopped` ends the retries early (`send_retrying` lists the answers it retries).
@@ -1083,7 +1090,108 @@ pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error>
             .map(str::trim)
             .filter(|v| !v.is_empty() && !v.contains(char::is_whitespace))
             .map(str::to_owned),
+        tail: header_offset(&r, "stream-next-offset"),
+        snapshot_digest: header_text(&r, "stream-snapshot-digest"),
+        read_origin: header_text(&r, "stream-read-origin"),
     })
+}
+
+/// Header `name`, trimmed, when it is text and not empty.
+fn header_text<B>(r: &ureq::http::Response<B>, name: &str) -> Option<String> {
+    let value = r.headers().get(name)?.to_str().ok()?.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// A history read the read origin answered, and that passed `read_immutable`'s checks.
+pub(crate) struct ImmutableRead {
+    pub(crate) bytes: Vec<u8>,
+    /// `Stream-Next-Offset`, past the read's offset.
+    pub(crate) next: String,
+    /// Marked `Stream-Immutable: true`.
+    pub(crate) immutable: bool,
+}
+
+/// Whether the read origin's answer `r` is a 200 of stream incarnation `incarnation` (extensions
+/// §4.4, client rules). Anything else, a redirect or a 412 included, is no answer of that
+/// incarnation: the stream's own origin is asked instead, and only its 412 means a recreate.
+fn of_incarnation<B>(r: &ureq::http::Response<B>, incarnation: &str) -> Result<(), Fallback> {
+    let status = r.status().as_u16();
+    if status != 200 {
+        return Err(Fallback::Status { status });
+    }
+    let found = header_text(r, "stream-incarnation");
+    if found.as_deref() != Some(incarnation) {
+        return Err(Fallback::Incarnation { found });
+    }
+    Ok(())
+}
+
+/// One aligned read from `offset` of stream incarnation `incarnation` at `at`, its URL at a read
+/// origin (`read_origin`): the incarnation in the URL, which keys a cache, rather than in a header,
+/// and no `consistency`. One attempt: a failed one is sent again to the stream's origin. Accepted
+/// only as a 200 of the incarnation with bytes and a `Stream-Next-Offset` past `offset`. Its
+/// `Stream-Up-To-Date` is not read: a cached answer may be older than the stream.
+pub(crate) fn read_immutable(
+    at: &str,
+    incarnation: &str,
+    offset: &str,
+) -> Result<ImmutableRead, Fallback> {
+    let request = format!("{at}?offset={offset}&aligned=true&incarnation={incarnation}");
+    let mut r = prepared(agent().get(request.as_str()), Resend::default())
+        .call()
+        .map_err(|e| Fallback::Transport(Box::new(e)))?;
+    of_incarnation(&r, incarnation)?;
+    let next = header_offset(&r, "stream-next-offset").ok_or(Fallback::NoNextOffset)?;
+    let immutable = header_text(&r, "stream-immutable").as_deref() == Some("true");
+    let bytes = r
+        .body_mut()
+        .with_config()
+        .limit(1 << 30)
+        .read_to_vec()
+        .map_err(|e| Fallback::Body(Box::new(e)))?;
+    if bytes.is_empty() || next.as_str() <= offset {
+        return Err(Fallback::NotAdvanced {
+            at: offset.to_owned(),
+            len: bytes.len(),
+            next,
+        });
+    }
+    Ok(ImmutableRead {
+        bytes,
+        next,
+        immutable,
+    })
+}
+
+/// The snapshot at `offset` of stream incarnation `incarnation` at `at`, its URL at a read origin
+/// (`read_origin`), in one attempt. Accepted only as a 200 of the incarnation whose
+/// `Stream-Snapshot-Offset` is `offset` and whose `Stream-Snapshot-Digest` is `digest`, `HEAD`'s.
+pub(crate) fn get_snapshot_immutable(
+    at: &str,
+    incarnation: &str,
+    offset: &str,
+    digest: &str,
+) -> Result<Vec<u8>, Fallback> {
+    let request = format!("{at}/snapshot/{offset}?incarnation={incarnation}");
+    let mut r = prepared(bulk_agent().get(request.as_str()), Resend::default())
+        .call()
+        .map_err(|e| Fallback::Transport(Box::new(e)))?;
+    of_incarnation(&r, incarnation)?;
+    let (found_offset, found_digest) = (
+        header_offset(&r, "stream-snapshot-offset"),
+        header_text(&r, "stream-snapshot-digest"),
+    );
+    if found_offset.as_deref() != Some(offset) || found_digest.as_deref() != Some(digest) {
+        return Err(Fallback::SnapshotMismatch {
+            offset: found_offset,
+            digest: found_digest,
+        });
+    }
+    r.body_mut()
+        .with_config()
+        .limit(2 << 30)
+        .read_to_vec()
+        .map_err(|e| Fallback::Body(Box::new(e)))
 }
 
 /// The snapshot at `offset`; `None` when it does not exist (superseded, or not yet visible here).
@@ -1278,7 +1386,9 @@ pub(crate) mod mock {
     /// can drop the answer before the client reads it. A connection it waits for over a minute
     /// fails it, so a client that sends fewer requests than answers fails the test's `join`
     /// instead of hanging it.
-    pub(crate) fn serve(answers: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    pub(crate) fn serve<A: AsRef<[u8]> + Send + 'static>(
+        answers: Vec<A>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/b/s", listener.local_addr().unwrap());
@@ -1298,7 +1408,7 @@ pub(crate) mod mock {
                     let len =
                         request_header(&head, "content-length").map_or(0, |n| n.parse().unwrap());
                     conn.read_exact(&mut vec![0u8; len]).unwrap();
-                    conn.write_all(answer.as_bytes()).unwrap();
+                    conn.write_all(answer.as_ref()).unwrap();
                     head
                 })
                 .collect()
@@ -1336,6 +1446,17 @@ pub(crate) mod mock {
             "HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    /// An answer with a binary body: `head` is the status and the headers.
+    pub(crate) fn answer_with_bytes(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut answer = format!(
+            "HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(body);
+        answer
     }
 
     /// A gateway's vouch for the marker, as a header line of an answer: alone, it proves nothing.

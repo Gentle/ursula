@@ -839,6 +839,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
+        // Readiness reads the group's Raft metrics, which OpenRaft updates
+        // just after the state machine answered the create (#503).
+        state
+            .raft_registry()
+            .and_then(|registry| registry.get(super::RaftGroupId(0)))
+            .expect("the create started group 0")
+            .wait(Some(std::time::Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    metrics.last_applied.is_some()
+                        && metrics.last_applied.as_ref().map(|log_id| log_id.index)
+                            >= metrics.local_committed.as_ref().map(|log_id| log_id.index)
+                },
+                "the group's metrics show the create applied",
+            )
+            .await
+            .expect("the create applies");
         assert_eq!(ready(client).await, StatusCode::OK);
         assert_eq!(
             super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await,

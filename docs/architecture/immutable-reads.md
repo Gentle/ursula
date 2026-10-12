@@ -1,6 +1,6 @@
 # Immutable reads through a shared cache
 
-Status: design, not implemented. The protocol is
+The protocol is
 [extensions §4](../web/src/content/docs/pages/specs/extensions.mdx#4-immutable-reads).
 
 ## 1. Why

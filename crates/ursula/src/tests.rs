@@ -10,6 +10,9 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::Request;
+use axum::http::header::CACHE_CONTROL;
+use axum::http::header::ETAG;
+use axum::http::header::IF_NONE_MATCH;
 use openraft::RaftNetworkV2;
 use openraft::error::ReplicationClosed;
 use openraft::network::RPCOption;
@@ -10192,6 +10195,366 @@ async fn a_capped_json_offset_read_may_end_mid_message() {
         assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
         assert_eq!(&body_bytes(response).await[..], &expected.as_bytes()[CAP..]);
     }
+}
+
+/// Creates an octet stream holding `body` and returns its incarnation.
+async fn create_immutable_read_stream(app: &Router, uri: &str, body: Body) -> String {
+    let response = http_put(
+        app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    header_str(&response, HEADER_STREAM_INCARNATION).to_owned()
+}
+
+fn is_immutable(response: &Response) -> bool {
+    response
+        .headers()
+        .get(HEADER_STREAM_IMMUTABLE)
+        .is_some_and(|value| value == "true")
+}
+
+/// Extensions §4.3: a catch-up read that carried `incarnation` is marked
+/// `Stream-Immutable` when it ends below the tail or at the tail of a closed
+/// stream, never at an open tail, on a 304, or without the parameter (the
+/// `Stream-Incarnation` header alone does not mark it).
+#[tokio::test]
+async fn immutable_marker_follows_the_tail_and_closure() {
+    let app = test_router();
+    let uri = "/benchcmp/immutable-marker";
+    let incarnation = create_immutable_read_stream(&app, uri, Body::from("abcdef")).await;
+    let chunk = format!("{uri}?offset=-1&max_bytes=2&incarnation={incarnation}");
+
+    let response = http_get(&app, &chunk).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert!(is_immutable(&response));
+    assert_eq!(header_str(&response, CACHE_CONTROL), "no-store");
+    let etag = header_str(&response, ETAG).to_owned();
+
+    let response = send(
+        &app,
+        "GET",
+        &chunk,
+        &[(IF_NONE_MATCH.as_str(), etag.as_str())],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(!is_immutable(&response));
+
+    let response = http_get(&app, &format!("{uri}?offset=-1&incarnation={incarnation}")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert!(!is_immutable(&response));
+
+    let response = http_get(&app, &format!("{uri}?offset=-1&max_bytes=2")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!is_immutable(&response));
+    let response = send(
+        &app,
+        "GET",
+        &format!("{uri}?offset=-1&max_bytes=2"),
+        &[(HEADER_STREAM_INCARNATION, incarnation.as_str())],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!is_immutable(&response));
+
+    let response = http_post(&app, uri, &[(HEADER_STREAM_CLOSED, "true")], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    for query in ["offset=-1", &format!("offset={tail}")] {
+        let response = http_get(&app, &format!("{uri}?{query}&incarnation={incarnation}")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        assert_eq!(header_str(&response, HEADER_STREAM_CLOSED), "true");
+        assert!(is_immutable(&response), "{query}");
+    }
+    let response = http_get(&app, &format!("{uri}?offset=-1")).await;
+    assert!(!is_immutable(&response));
+}
+
+/// Extensions §4.3: a snapshot read that carried `incarnation` is always
+/// marked, whether or not the snapshot is at the tail; one without it, or one
+/// refused with 412, is not.
+#[tokio::test]
+async fn immutable_marker_on_snapshot_reads() {
+    let app = test_router();
+    let uri = "/benchcmp/immutable-snapshot";
+    let incarnation = create_immutable_read_stream(&app, uri, Body::from("abc")).await;
+    let snapshot = format!("{uri}/snapshot/00000000000000000003");
+    let response = http_put(
+        &app,
+        &snapshot,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from("state"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = http_get(&app, &format!("{snapshot}?incarnation={incarnation}")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert!(is_immutable(&response));
+    assert_eq!(&body_bytes(response).await[..], b"state");
+
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from("de"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_get(&app, &format!("{snapshot}?incarnation={incarnation}")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert!(is_immutable(&response));
+
+    let response = http_get(&app, &snapshot).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!is_immutable(&response));
+
+    let stale = incarnation.parse::<u64>().expect("incarnation") + 1;
+    let response = http_get(&app, &format!("{snapshot}?incarnation={stale}")).await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_INCARNATION),
+        incarnation
+    );
+    assert!(!is_immutable(&response));
+}
+
+#[test]
+fn aligned_read_len_reaches_the_next_chunk_boundary() {
+    const CHUNK: u64 = READ_ALIGNED_CHUNK_BYTES;
+    assert_eq!(aligned_read_len(0), 4 * 1024 * 1024);
+    assert_eq!(aligned_read_len(1), 4 * 1024 * 1024 - 1);
+    assert_eq!(aligned_read_len(CHUNK - 1), 1);
+    assert_eq!(aligned_read_len(CHUNK), 4 * 1024 * 1024);
+    assert_eq!(aligned_read_len(3 * CHUNK + 5), 4 * 1024 * 1024 - 5);
+    // The last byte of the offset space is the last byte of a chunk.
+    assert_eq!(aligned_read_len(u64::MAX), 1);
+}
+
+/// Extensions §4.2: an aligned read from inside a chunk ends at the next
+/// 4 MiB boundary, one from a boundary returns a full chunk, and one whose
+/// chunk holds the tail ends at the tail. Every response below the tail is
+/// marked immutable.
+#[tokio::test]
+async fn aligned_reads_end_at_the_chunk_grid() {
+    const CHUNK: usize = 4 * 1024 * 1024;
+    let app = test_router();
+    let uri = "/benchcmp/aligned-grid";
+    let tail = CHUNK + CHUNK / 4;
+    let payload: Vec<u8> = (0..tail).map(|i| (i % 251) as u8).collect();
+    let incarnation = create_immutable_read_stream(&app, uri, Body::from(payload.clone())).await;
+
+    for (start, next, up_to_date) in [
+        (1_000, CHUNK, false),
+        (0, CHUNK, false),
+        (CHUNK - 1, CHUNK, false),
+        (CHUNK, tail, true),
+        (CHUNK + 7, tail, true),
+    ] {
+        let response = http_get(
+            &app,
+            &format!("{uri}?offset={start:020}&aligned=true&incarnation={incarnation}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "start={start}");
+        assert_eq!(
+            header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+            format!("{next:020}"),
+            "start={start}"
+        );
+        assert_eq!(
+            response.headers().contains_key(HEADER_STREAM_UP_TO_DATE),
+            up_to_date,
+            "start={start}"
+        );
+        assert_eq!(is_immutable(&response), !up_to_date, "start={start}");
+        assert_eq!(&body_bytes(response).await[..], &payload[start..next]);
+    }
+}
+
+/// Extensions §4.1 and §4.2: the parameter and combination errors answer
+/// 400 before any lookup.
+#[tokio::test]
+async fn immutable_read_parameters_reject_malformed_and_conflicting_use() {
+    let app = test_router();
+    let uri = "/benchcmp/immutable-400";
+    let incarnation = create_immutable_read_stream(&app, uri, Body::from("abc")).await;
+    let other = incarnation.parse::<u64>().expect("incarnation") + 1;
+    let snapshot = format!("{uri}/snapshot/00000000000000000003");
+    let response = http_put(
+        &app,
+        &snapshot,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from("state"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let mut queries = vec![
+        format!("offset=-1&incarnation={incarnation}&incarnation={incarnation}"),
+        format!("offset=-1&incarnation={incarnation}&live=long-poll"),
+        format!("offset=-1&incarnation={incarnation}&live=sse"),
+        format!("offset=now&incarnation={incarnation}"),
+        "offset=-1&aligned=false".to_owned(),
+        "offset=-1&aligned=1".to_owned(),
+        "offset=-1&aligned=".to_owned(),
+        "offset=-1&aligned=true&aligned=true".to_owned(),
+        "offset=-1&aligned=true&max_bytes=2".to_owned(),
+        "offset=-1&aligned=true&live=long-poll".to_owned(),
+        "offset=-1&aligned=true&live=sse".to_owned(),
+    ];
+    for malformed in ["", "x", "01", "-1", "+1", "%201", "1%20"] {
+        queries.push(format!("offset=-1&incarnation={malformed}"));
+    }
+    for query in &queries {
+        let response = http_get(&app, &format!("{uri}?{query}")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+    let disagreeing = [(HEADER_STREAM_INCARNATION, incarnation.as_str())];
+    for target in [
+        format!("{uri}?offset=-1&incarnation={other}"),
+        format!("{snapshot}?incarnation={other}"),
+    ] {
+        let response = send(&app, "GET", &target, &disagreeing, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{target}");
+    }
+    for query in [
+        "incarnation=x".to_owned(),
+        format!("incarnation={incarnation}&incarnation={incarnation}"),
+    ] {
+        let response = http_get(&app, &format!("{snapshot}?{query}")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+    // The header and the parameter may both be sent when they agree.
+    let response = send(
+        &app,
+        "GET",
+        &format!("{uri}?offset=-1&max_bytes=1&incarnation={incarnation}"),
+        &disagreeing,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(is_immutable(&response));
+}
+
+/// Extensions §4.1: the parameter is the `Stream-Incarnation` precondition,
+/// so a URL that names another incarnation answers 412 with the current one,
+/// after a recreate too, while 404 and 416 still come first.
+#[tokio::test]
+async fn incarnation_parameter_is_the_read_precondition() {
+    let app = test_router();
+    let uri = "/benchcmp/immutable-412";
+    let old = create_immutable_read_stream(&app, uri, Body::from("abc")).await;
+    let stale = old.parse::<u64>().expect("incarnation") + 1;
+
+    let response = http_get(&app, &format!("{uri}?offset=-1&incarnation={stale}")).await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(header_str(&response, HEADER_STREAM_INCARNATION), old);
+    assert!(!is_immutable(&response));
+    let both = [(HEADER_STREAM_INCARNATION, stale.to_string())];
+    let response = send(
+        &app,
+        "GET",
+        &format!("{uri}?offset=-1&incarnation={stale}"),
+        &[(both[0].0, both[0].1.as_str())],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    let response = http_get(
+        &app,
+        &format!("{uri}?offset=00000000000000000099&incarnation={stale}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+    let old_url = format!("{uri}?offset=-1&max_bytes=1&incarnation={old}");
+    let response = http_get(&app, &old_url).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = http_delete(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_get(&app, &old_url).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let current = create_immutable_read_stream(&app, uri, Body::from("abc")).await;
+    assert_ne!(current, old);
+    let response = http_get(&app, &old_url).await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(header_str(&response, HEADER_STREAM_INCARNATION), current);
+}
+
+/// Extensions §4.3: closing the stream changes nothing below the tail, so a
+/// chunk's `ETag` is the same before and after the close, and the tail's
+/// `ETag` changes.
+#[tokio::test]
+async fn non_tail_etag_is_stable_across_close() {
+    let app = test_router();
+    let uri = "/benchcmp/immutable-etag";
+    let incarnation = create_immutable_read_stream(&app, uri, Body::from("abcdef")).await;
+    let chunk = format!("{uri}?offset=-1&max_bytes=2&incarnation={incarnation}");
+    let at_tail = format!("{uri}?offset=00000000000000000004&incarnation={incarnation}");
+    let response = http_get(&app, &chunk).await;
+    let chunk_etag = header_str(&response, ETAG).to_owned();
+    let response = http_get(&app, &at_tail).await;
+    let tail_etag = header_str(&response, ETAG).to_owned();
+
+    let response = http_post(&app, uri, &[(HEADER_STREAM_CLOSED, "true")], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = http_get(&app, &chunk).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, ETAG), chunk_etag);
+    assert!(is_immutable(&response));
+    let response = send(
+        &app,
+        "GET",
+        &chunk,
+        &[(IF_NONE_MATCH.as_str(), chunk_etag.as_str())],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    let response = http_get(&app, &at_tail).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_CLOSED), "true");
+    assert_ne!(header_str(&response, ETAG), tail_etag);
+}
+
+/// Extensions §4.2: an aligned read of a JSON stream follows the same grid
+/// and marker rules; below the grid size it reads to the tail.
+#[tokio::test]
+async fn aligned_json_read_is_marked_once_closed() {
+    let app = test_router();
+    let uri = "/benchcmp/immutable-json";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"a":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let incarnation = header_str(&response, HEADER_STREAM_INCARNATION).to_owned();
+    let url = format!("{uri}?offset=-1&aligned=true&incarnation={incarnation}");
+    let response = http_get(&app, &url).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert!(!is_immutable(&response));
+    let response = http_post(&app, uri, &[(HEADER_STREAM_CLOSED, "true")], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_get(&app, &url).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(is_immutable(&response));
+    assert_eq!(&body_bytes(response).await[..], b"{\"a\":1}\n");
 }
 
 /// F11: catch-up and long-poll offset reads of a JSON stream that is closed

@@ -179,6 +179,7 @@ const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
+const HEADER_STREAM_IMMUTABLE: &str = "stream-immutable";
 const HEADER_STREAM_INCARNATION: &str = "stream-incarnation";
 const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
 const HEADER_STREAM_DATA_CONTENT_TYPE: &str = "stream-data-content-type";
@@ -213,6 +214,14 @@ const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// inside a message of any content type, and the client continues from
 /// `Stream-Next-Offset`.
 const READ_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// The chunk grid of `aligned=true` reads (immutable reads, extensions §4.2):
+/// an aligned read ends at the next multiple of this in the stream's offset
+/// space, so readers that start anywhere converge on the same URLs. Changing
+/// it never produces a wrong response, only cache misses.
+const READ_ALIGNED_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+// A chunk must fit one response, so an aligned read below the tail always
+// ends at a boundary.
+const _: () = assert!(READ_ALIGNED_CHUNK_BYTES <= READ_MAX_RESPONSE_BYTES as u64);
 const DEFAULT_LONG_POLL_TIMEOUT_MS: u64 = 1_000;
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
 
@@ -3015,11 +3024,20 @@ pub(crate) async fn read_stream_by_id(
     if let Err(response) = removed_surface::reject_removed_read_parameters(&query) {
         return *response;
     }
-    let if_incarnation = match incarnation_precondition(&headers) {
+    let url_incarnation = match incarnation_parameter(&query) {
+        Ok(url_incarnation) => url_incarnation,
+        Err(response) => return *response,
+    };
+    let if_incarnation = match read_incarnation_precondition(&headers, url_incarnation) {
         Ok(if_incarnation) => if_incarnation,
         Err(response) => return *response,
     };
     let live_mode = query.get("live").map(String::as_str);
+    let aligned = match query.get("aligned").map(String::as_str) {
+        None => false,
+        Some("true") => true,
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid aligned").into_response(),
+    };
     let leader_only = match query.get("consistency").map(String::as_str) {
         None | Some("local") => false,
         Some("leader") => true,
@@ -3033,6 +3051,22 @@ pub(crate) async fn read_stream_by_id(
             .into_response();
     }
     let offset_is_now = query.get("offset").is_some_and(|offset| offset == "now");
+    // The response of a live read or `offset=now` is never immutable, so
+    // its URL must not name an incarnation a cache would key it under.
+    if url_incarnation.is_some() && (live_mode.is_some() || offset_is_now) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the incarnation parameter is available only for catch-up reads from an offset",
+        )
+            .into_response();
+    }
+    if aligned && (live_mode.is_some() || query.contains_key("max_bytes")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "aligned reads take neither live nor max_bytes",
+        )
+            .into_response();
+    }
     if live_mode.is_some() && !query.contains_key("offset") {
         return (
             StatusCode::BAD_REQUEST,
@@ -3082,10 +3116,14 @@ pub(crate) async fn read_stream_by_id(
     // F11: every read is capped at READ_MAX_RESPONSE_BYTES; a capped read may
     // end inside a message. `max_bytes` keeps the base protocol's lenient
     // parsing.
-    let max_len = query
-        .get("max_bytes")
-        .map_or(usize::MAX, |raw| raw.parse::<usize>().unwrap_or(usize::MAX))
-        .min(READ_MAX_RESPONSE_BYTES);
+    let max_len = if aligned {
+        aligned_read_len(offset)
+    } else {
+        query
+            .get("max_bytes")
+            .map_or(usize::MAX, |raw| raw.parse::<usize>().unwrap_or(usize::MAX))
+    }
+    .min(READ_MAX_RESPONSE_BYTES);
 
     match (live_mode, live_owner) {
         (Some("sse"), Some(owner)) => {
@@ -3136,7 +3174,7 @@ pub(crate) async fn read_stream_by_id(
             if offset_is_now {
                 offset_now_response(response)
             } else {
-                read_response(response, &headers, None)
+                read_response(response, &headers, None, url_incarnation.is_some())
             }
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
@@ -3385,13 +3423,19 @@ pub(crate) async fn read_snapshot(
     OriginalUri(uri): OriginalUri,
     Path(path): Path<SnapshotPath>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
     let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
         Err(response) => return *response,
     };
-    let if_incarnation = match incarnation_precondition(&headers) {
+    let url_incarnation =
+        match parse_query(raw_query.as_deref()).and_then(|query| incarnation_parameter(&query)) {
+            Ok(url_incarnation) => url_incarnation,
+            Err(response) => return *response,
+        };
+    let if_incarnation = match read_incarnation_precondition(&headers, url_incarnation) {
         Ok(if_incarnation) => if_incarnation,
         Err(response) => return *response,
     };
@@ -3410,7 +3454,7 @@ pub(crate) async fn read_snapshot(
                 return refused;
             }
             let object = response.object.take();
-            let mut rendered = snapshot_response(response);
+            let mut rendered = snapshot_response(response, url_incarnation.is_some());
             if let Some(object) = object {
                 let len = object.payload_len;
                 match cold_snapshot::cold_snapshot_body(&state, object).await {
@@ -3593,6 +3637,7 @@ pub(crate) async fn long_poll_stream(
                     response,
                     &headers,
                     Some(query.get("cursor").map(String::as_str).unwrap_or("")),
+                    false,
                 )
             }
         }
@@ -3811,14 +3856,36 @@ pub(crate) fn parse_query(raw: Option<&str>) -> Result<HashMap<String, String>, 
         return Ok(query);
     };
     for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
-        if key == "offset" && query.contains_key("offset") {
+        if SINGLE_VALUED_QUERY_PARAMETERS.contains(&key.as_ref())
+            && query.contains_key(key.as_ref())
+        {
             return Err(Box::new(
-                (StatusCode::BAD_REQUEST, "multiple offset parameters").into_response(),
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("multiple {key} parameters"),
+                )
+                    .into_response(),
             ));
         }
         query.insert(key.into_owned(), value.into_owned());
     }
     Ok(query)
+}
+
+/// Query parameters that answer 400 when repeated rather than keeping the
+/// last value: `offset` would make the start ambiguous, and `incarnation`
+/// and `aligned` are part of an immutable read's URL (extensions §4.1, §4.2).
+const SINGLE_VALUED_QUERY_PARAMETERS: [&str; 3] = ["offset", "incarnation", "aligned"];
+
+/// The length of an `aligned=true` read from `offset`: up to the next
+/// multiple of [`READ_ALIGNED_CHUNK_BYTES`]. The read plan then ends it at
+/// the tail when the tail comes first.
+fn aligned_read_len(offset: u64) -> usize {
+    let into_chunk = offset.checked_rem(READ_ALIGNED_CHUNK_BYTES).unwrap_or(0);
+    let len = READ_ALIGNED_CHUNK_BYTES.saturating_sub(into_chunk);
+    // `len` is at most the chunk, which the const assertion keeps within
+    // the response cap.
+    usize::try_from(len).unwrap_or(READ_MAX_RESPONSE_BYTES)
 }
 
 pub(crate) fn request_content_type(headers: &HeaderMap) -> String {
@@ -3899,12 +3966,54 @@ pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64
     if values.next().is_some() {
         return Err(malformed());
     }
-    let Some(value) = value.to_str().ok().map(str::trim) else {
-        return Err(malformed());
+    value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .and_then(parse_incarnation_token)
+        .map(Some)
+        .ok_or_else(malformed)
+}
+
+/// An incarnation token as the server issues it: one canonical decimal
+/// integer.
+fn parse_incarnation_token(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|incarnation| incarnation.to_string() == value)
+}
+
+/// The `incarnation` query parameter of a catch-up or snapshot read
+/// (extensions §4.1): the `Stream-Incarnation` precondition carried in the
+/// URL, so that it is part of a cache key. Malformed answers 400; a repeated
+/// parameter already answered 400 in [`parse_query`].
+fn incarnation_parameter(query: &HashMap<String, String>) -> Result<Option<u64>, BoxResponse> {
+    let Some(value) = query.get("incarnation") else {
+        return Ok(None);
     };
-    match value.parse::<u64>() {
-        Ok(incarnation) if incarnation.to_string() == value => Ok(Some(incarnation)),
-        _ => Err(malformed()),
+    parse_incarnation_token(value).map(Some).ok_or_else(|| {
+        Box::new((StatusCode::BAD_REQUEST, "malformed incarnation parameter").into_response())
+    })
+}
+
+/// A read's incarnation precondition from the `Stream-Incarnation` header and
+/// the `incarnation` parameter. Either alone is the precondition; both must
+/// name the same incarnation, or the request answers 400. The result feeds
+/// the one `if_incarnation` path, so 404, 410 and 416 still come before 412.
+fn read_incarnation_precondition(
+    headers: &HeaderMap,
+    url_incarnation: Option<u64>,
+) -> Result<Option<u64>, BoxResponse> {
+    match (incarnation_precondition(headers)?, url_incarnation) {
+        (Some(header), Some(url)) if header != url => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "the incarnation parameter and Stream-Incarnation disagree",
+            )
+                .into_response(),
+        )),
+        (header, url) => Ok(header.or(url)),
     }
 }
 

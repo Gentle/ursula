@@ -334,7 +334,7 @@ GET {stream_url}/snapshot/{snapshot_offset}?incarnation={token}
 
 `incarnation={token}` on a catch-up read or a snapshot read is the `Stream-Incarnation` request precondition (Section 2.4) carried in the URL, with the same evaluation and the same `412 Precondition Failed` on a mismatch. A request header is not part of a cache key, so a cache would otherwise store a response of one incarnation and serve it to a reader of another.
 
-- A request that carries both the parameter and the `Stream-Incarnation` header with different values MUST be rejected with `400 Bad Request`, as MUST a malformed value or a parameter given more than once.
+- A request that carries both the parameter and the `Stream-Incarnation` header with different values MUST be rejected with `400 Bad Request`, as MUST a parameter given more than once or a malformed value: one that is not, exactly, a token the server could have issued. Surrounding whitespace makes a value malformed.
 - Live reads (`live=long-poll`, `live=sse`) and `offset=now` MUST reject the parameter with `400 Bad Request`. Their responses are never immutable.
 
 ### 4.2. Aligned Reads
@@ -347,7 +347,7 @@ The server partitions each stream's offsets into chunks. An aligned read returns
 
 - The partition MUST NOT change during an incarnation, and SHOULD NOT change across server versions. A changed partition never produces a wrong response, only cache misses.
 - A chunk MUST NOT be larger than the server's response cap (Section 9.3), so an aligned read that is not at the tail always ends at a chunk boundary.
-- `aligned=true` combined with `max_bytes` or with `live` MUST be rejected with `400 Bad Request`, as MUST any other value of `aligned`.
+- `aligned=true` combined with `max_bytes` or with `live` MUST be rejected with `400 Bad Request`, as MUST any other value of `aligned` or the parameter given more than once.
 - On a JSON stream an aligned read MAY end inside a message, as any capped read may (Section 9.4).
 
 Ursula's chunk boundaries are the multiples of 4 MiB (4,194,304) in its offset space.
@@ -360,11 +360,14 @@ A server marks a `200 OK` response with:
 Stream-Immutable: true
 ```
 
-when every later request for the same URL that succeeds receives the same body and the same `Content-Type`, `ETag`, `Stream-Next-Offset`, `Stream-Incarnation`, `Stream-Closed`, `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest`. The server MUST send it only when:
+when every later request for the same URL that succeeds receives the same body and the same `Content-Type`, `ETag`, `Stream-Next-Offset`, `Stream-Incarnation`, `Stream-Closed`, `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest`. `Stream-Up-To-Date` on a snapshot read is not part of this guarantee: it describes the stream when the response was made (Section 4.4, client rules).
 
-- the request carried `incarnation` (Section 4.1), and
-- it is a catch-up read whose response does not carry `Stream-Up-To-Date: true`, or one that carries `Stream-Closed: true`, or
+The server MUST send it only when the request carried `incarnation` (Section 4.1) and either:
+
+- it is a catch-up read whose response does not carry `Stream-Up-To-Date: true`, or carries `Stream-Closed: true`, or
 - it is a snapshot read (Section 2.5). Publishing different content at an offset is refused (Section 2.2).
+
+Closing a stream MUST NOT change the `ETag` of a response that ends below the tail, since closure is visible only at the tail.
 
 The server SHOULD send it whenever these hold.
 

@@ -40,6 +40,7 @@ use crate::HEADER_PRODUCER_SEQ;
 use crate::HEADER_STREAM_CLOSED;
 use crate::HEADER_STREAM_CURSOR;
 use crate::HEADER_STREAM_EXPIRES_AT;
+use crate::HEADER_STREAM_IMMUTABLE;
 use crate::HEADER_STREAM_INCARNATION;
 use crate::HEADER_STREAM_NEXT_OFFSET;
 use crate::HEADER_STREAM_SNAPSHOT_DIGEST;
@@ -483,14 +484,21 @@ pub(crate) fn read_etag(response: &ReadStreamResponse) -> String {
     response.content_type.hash(&mut hasher);
     response.payload.hash(&mut hasher);
     response.up_to_date.hash(&mut hasher);
-    response.closed.hash(&mut hasher);
+    // Closure is visible only at the tail, so a chunk below it keeps its
+    // `ETag` when the stream is closed later (extensions §4.3).
+    (response.closed && response.up_to_date).hash(&mut hasher);
     format!("\"{:016x}\"", hasher.finish())
 }
 
+/// A read's `200` (or `304`) response. `incarnation_in_url` is whether a
+/// catch-up read carried the `incarnation` parameter; such a response is
+/// marked `Stream-Immutable` when it can no longer change: it ends below the
+/// tail, or at the tail of a closed stream (extensions §4.3).
 pub(crate) fn read_response(
     response: ReadStreamResponse,
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
+    incarnation_in_url: bool,
 ) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -520,10 +528,19 @@ pub(crate) fn read_response(
             response_cursor(response.next_offset, request_cursor),
         );
     }
+    if incarnation_in_url && (!response.up_to_date || closed_at_tail) {
+        insert_static(&mut headers, HEADER_STREAM_IMMUTABLE, "true");
+    }
     (StatusCode::OK, headers, response.payload).into_response()
 }
 
-pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
+/// A snapshot read's `200`. A published offset never changes content, so a
+/// read that carried the `incarnation` parameter is always marked
+/// `Stream-Immutable` (extensions §4.3).
+pub(crate) fn snapshot_response(
+    response: ReadSnapshotResponse,
+    incarnation_in_url: bool,
+) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, &response.content_type);
@@ -533,6 +550,9 @@ pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
     insert_incarnation(&mut headers, response.incarnation);
     if response.up_to_date {
         insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+    }
+    if incarnation_in_url {
+        insert_static(&mut headers, HEADER_STREAM_IMMUTABLE, "true");
     }
     (StatusCode::OK, headers, response.payload).into_response()
 }

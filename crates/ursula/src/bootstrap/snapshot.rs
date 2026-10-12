@@ -47,7 +47,8 @@ const MAX_HOLD_PASSES: u32 = 32;
 enum Trigger {
     /// The group claimed the handed-off permit, so its build runs.
     Started,
-    /// The group is gone, or the trigger failed.
+    /// The group is gone, the trigger failed, or a permit handed to the
+    /// group earlier is still pending (an operator's snapshot of it starts).
     NotStarted,
     /// The group did not claim the handed-off permit in time: OpenRaft
     /// dropped the trigger, or the build waits behind the group's applies.
@@ -124,6 +125,7 @@ async fn trigger_snapshot_build(
             tracing::error!("snapshot driver trigger group {raft_group_id} error: {err}");
             Trigger::NotStarted
         }
+        Handoff::Busy => Trigger::NotStarted,
     }
 }
 
@@ -131,10 +133,10 @@ async fn trigger_snapshot_build(
 /// trigger of theirs went unclaimed.
 ///
 /// OpenRaft drops a trigger while it counts a build of the group as running,
-/// which it does until RaftCore handles the build's end, after the build
-/// released its permit. A pass planned in between can draw such a trigger,
-/// and each holds the pass up for [`SNAPSHOT_HANDOFF_WAIT`] with its build
-/// slot idle. So a group whose trigger went unclaimed is left out of the next
+/// which it does until RaftCore handles the build's end, and that can come
+/// after the build released its permit. A pass planned in between can draw
+/// such a trigger, and each holds the pass up for [`SNAPSHOT_HANDOFF_WAIT`]
+/// with its build slot idle. So a group whose trigger went unclaimed is left out of the next
 /// [`FIRST_HOLD_PASSES`] passes, and of twice as many after each such trigger
 /// in a row, up to [`MAX_HOLD_PASSES`], so that a group whose triggers keep
 /// going unclaimed does not head every pass. A claimed trigger clears it.
@@ -202,18 +204,21 @@ fn should_drive_snapshots(store_trouble: bool, log_pressure: bool) -> bool {
 
 /// The pause before the snapshot driver's next pass. While the node's log is
 /// over its pressure watermark, the next pass comes after
-/// [`SNAPSHOT_PRESSURE_RETICK`] when this one started a build or builds are in
-/// flight, so neither a pass's group count nor a group that still builds holds
-/// the node to one pass per interval. So does a pass that ended because the
-/// log climbed to a higher pressure than it was planned for.
+/// [`SNAPSHOT_PRESSURE_RETICK`] when this one started a build, builds are in
+/// flight or groups are held ([`HeldGroups`]), so neither a pass's group
+/// count, a group that still builds nor a held group, whose hold counts
+/// passes, holds the node to one pass per interval. So does a pass that
+/// ended because the log climbed to a higher pressure than it was planned
+/// for.
 fn next_pause(
     interval: Duration,
     pressure: LogPressure,
     triggered: u64,
     in_flight: usize,
+    held: usize,
     outgrown: bool,
 ) -> Duration {
-    if outgrown || (pressure.is_pressure() && (triggered > 0 || in_flight > 0)) {
+    if outgrown || (pressure.is_pressure() && (triggered > 0 || in_flight > 0 || held > 0)) {
         interval.min(SNAPSHOT_PRESSURE_RETICK)
     } else {
         interval
@@ -395,9 +400,10 @@ pub fn spawn_snapshot_driver(
             // still counts as in flight, and one whose build ended before it
             // shows, in the metrics read next, the log after the build freed
             // it, never the log before. OpenRaft keeps counting a build until
-            // RaftCore handles its end, after the build released its permit,
-            // so a trigger in that window still goes unclaimed: its group
-            // then sits out the next passes (`HeldGroups`).
+            // RaftCore handles its end, which can come after the build
+            // released its permit, so a trigger in between still goes
+            // unclaimed: its group then sits out the next passes
+            // (`HeldGroups`).
             let building = coordinator.builds_in_flight();
             let held = held_groups.pass();
             let snaps = registry.metrics_snapshot();
@@ -469,10 +475,18 @@ pub fn spawn_snapshot_driver(
                         }
                     }
                 }
-                pause = next_pause(interval, plan.pressure, triggered, building.len(), outgrown);
-                // Counts and logs the passes that planned a build: one that
-                // found nothing to start while builds run only waits for them.
-                if plan.pressure.is_pressure() && (planned > 0 || outgrown) {
+                pause = next_pause(
+                    interval,
+                    plan.pressure,
+                    triggered,
+                    building.len(),
+                    held.len(),
+                    outgrown,
+                );
+                // Counts and logs the passes that planned a build or held
+                // groups out: one that found nothing to start while builds
+                // run only waits for them.
+                if plan.pressure.is_pressure() && (planned > 0 || outgrown || !held.is_empty()) {
                     let elapsed = started_at.elapsed();
                     runtime.metrics().record_raft_snapshot_pressure(
                         triggered,
@@ -526,34 +540,40 @@ mod tests {
     use super::should_drive_snapshots;
 
     /// #519: under pressure the driver plans again soon while its passes
-    /// start builds or builds run, so a group whose build is in flight, and
-    /// skipped for it, is triggered again soon after the build ends.
+    /// start builds, builds run or groups are held, so a group whose build
+    /// is in flight, and skipped for it, is triggered again soon after the
+    /// build ends, and a held group's hold, which counts passes, ends soon.
     #[test]
     fn a_pressure_pass_plans_again_soon_while_builds_start_or_run() {
         let interval = Duration::from_secs(5);
         let escalated = LogPressure::Escalated { builds: 2 };
         assert_eq!(
-            next_pause(interval, LogPressure::Calm, 3, 2, false),
+            next_pause(interval, LogPressure::Calm, 3, 2, 1, false),
             interval
         );
         assert_eq!(
-            next_pause(interval, LogPressure::Watermark, 1, 0, false),
+            next_pause(interval, LogPressure::Watermark, 1, 0, 0, false),
             SNAPSHOT_PRESSURE_RETICK
         );
         assert_eq!(
-            next_pause(interval, escalated, 0, 1, false),
+            next_pause(interval, escalated, 0, 1, 0, false),
             SNAPSHOT_PRESSURE_RETICK
         );
         // Nothing started and nothing runs: the log is at its target.
-        assert_eq!(next_pause(interval, escalated, 0, 0, false), interval);
+        assert_eq!(next_pause(interval, escalated, 0, 0, 0, false), interval);
+        // A held group's hold counts passes, so they come soon under pressure.
+        assert_eq!(
+            next_pause(interval, escalated, 0, 0, 1, false),
+            SNAPSHOT_PRESSURE_RETICK
+        );
         // A pass the log outgrew goes again soon.
         assert_eq!(
-            next_pause(interval, LogPressure::Calm, 0, 0, true),
+            next_pause(interval, LogPressure::Calm, 0, 0, 0, true),
             SNAPSHOT_PRESSURE_RETICK
         );
         // A shorter interval stays.
         let short = Duration::from_millis(100);
-        assert_eq!(next_pause(short, escalated, 1, 0, false), short);
+        assert_eq!(next_pause(short, escalated, 1, 0, 0, false), short);
     }
 
     /// A group whose trigger went unclaimed sits out the next two passes,

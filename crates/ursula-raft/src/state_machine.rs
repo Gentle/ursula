@@ -91,9 +91,12 @@ struct SnapshotBuildCoordinatorInner {
     /// Per-group log gauges (F12e), shared node-wide like the permit, so
     /// the snapshot driver reads what every group's state machine counts.
     log_gauges: Arc<Mutex<BTreeMap<u32, Arc<GroupLogGauge>>>>,
-    /// Build permits the snapshot driver took for a group it is about to
-    /// trigger; that group's next build uses it instead of competing for one.
-    handoffs: Mutex<BTreeMap<u32, OwnedSemaphorePermit>>,
+    /// Build permits handed to a group about to be triggered, one per group
+    /// at a time; that group's next build uses it instead of competing for
+    /// one.
+    handoffs: Mutex<BTreeMap<u32, HandedOff>>,
+    /// Numbers the hand-offs in `handoffs`.
+    next_handoff: AtomicU64,
     /// The builds that hold a permit, by build number. The snapshot driver
     /// reads them to skip groups that already build and to wait for a free
     /// slot (#519).
@@ -114,11 +117,48 @@ pub enum Handoff<E> {
     /// The group's build did not claim the permit in time, and it went back
     /// to the node's permits. OpenRaft drops a trigger while it counts a
     /// build of the group as running, which it does until RaftCore handles
-    /// the build's end, after the build released its permit. A build that
-    /// waits behind its group's applies claims too late as well.
+    /// the build's end, and that can come after the build released its
+    /// permit. A build that waits behind its group's applies claims too
+    /// late as well.
     Unclaimed,
     /// The trigger failed, and the permit went back to the node's permits.
     TriggerFailed(E),
+    /// A permit handed to the group earlier is still pending, so this one
+    /// went back to the node's permits and nothing was triggered: the
+    /// group's next build claims the earlier one.
+    Busy,
+}
+
+/// A build permit handed to a group, with its hand-off's number.
+#[derive(Debug)]
+struct HandedOff {
+    token: u64,
+    permit: OwnedSemaphorePermit,
+}
+
+/// A hand-off its caller still waits on. Dropped before a build claimed the
+/// permit, it takes the permit back, so a caller that stops waiting (its
+/// future dropped, or its trigger panicking) never leaves the permit parked
+/// under the group.
+struct PendingHandoff<'a> {
+    coordinator: &'a SnapshotBuildCoordinator,
+    raft_group_id: u32,
+    token: u64,
+}
+
+impl PendingHandoff<'_> {
+    /// Takes the permit back unless a build claimed it; returns whether it
+    /// did.
+    fn reclaim(&self) -> bool {
+        self.coordinator
+            .reclaim_handoff(self.raft_group_id, self.token)
+    }
+}
+
+impl Drop for PendingHandoff<'_> {
+    fn drop(&mut self) {
+        self.reclaim();
+    }
 }
 
 /// One snapshot build that holds a permit.
@@ -179,6 +219,7 @@ impl SnapshotBuildCoordinator {
                 max_concurrency,
                 log_gauges,
                 handoffs: Mutex::default(),
+                next_handoff: AtomicU64::new(0),
                 builds: watch::Sender::new(BTreeMap::new()),
                 next_build: AtomicU64::new(0),
                 log_pressure,
@@ -282,7 +323,9 @@ impl SnapshotBuildCoordinator {
     /// Hands `permit` to `raft_group_id`, runs `trigger` (the group's
     /// snapshot trigger) and waits up to `wait` for the group's next build
     /// to claim the permit. The permit goes back to the node's permits
-    /// unless the build claimed it.
+    /// unless the build claimed it, also when the caller stops waiting or
+    /// the trigger panics. While a permit handed to the group earlier is
+    /// pending, this one goes back at once ([`Handoff::Busy`]).
     ///
     /// A triggered build otherwise only *tries* for a permit and is refused
     /// while other groups hold every one, so a driver firing many groups at
@@ -297,28 +340,35 @@ impl SnapshotBuildCoordinator {
         wait: Duration,
         trigger: impl Future<Output = Result<(), E>>,
     ) -> Handoff<E> {
-        self.hand_off(raft_group_id, permit);
+        let Ok(token) = self.hand_off(raft_group_id, permit) else {
+            return Handoff::Busy;
+        };
+        let pending = PendingHandoff {
+            coordinator: self,
+            raft_group_id,
+            token,
+        };
         if let Err(err) = trigger.await {
-            self.reclaim_handoff(raft_group_id);
+            pending.reclaim();
             return Handoff::TriggerFailed(err);
         }
         let _claimed_or_late =
-            crate::rt::time::timeout(wait, self.handoff_claimed(raft_group_id)).await;
-        if self.reclaim_handoff(raft_group_id) {
+            crate::rt::time::timeout(wait, self.handoff_claimed(raft_group_id, token)).await;
+        if pending.reclaim() {
             Handoff::Unclaimed
         } else {
             Handoff::Claimed
         }
     }
 
-    /// Waits until the permit handed off to `raft_group_id` is no longer
-    /// pending: the group claimed it, or it was taken back. A claim
-    /// registers its build, which wakes the wait.
-    pub(crate) async fn handoff_claimed(&self, raft_group_id: u32) {
+    /// Waits until hand-off `token` to `raft_group_id` is no longer
+    /// pending: a build claimed it, or it was taken back. A claim registers
+    /// its build, which wakes the wait.
+    pub(crate) async fn handoff_claimed(&self, raft_group_id: u32, token: u64) {
         // Subscribed before the check, so a claim right after it still
         // wakes the wait.
         let mut builds = self.inner.builds.subscribe();
-        while self.handoff_pending(raft_group_id) {
+        while self.handoff_pending(raft_group_id, token) {
             if builds.changed().await.is_err() {
                 return;
             }
@@ -326,20 +376,45 @@ impl SnapshotBuildCoordinator {
     }
 
     /// Reserves `permit` for the next snapshot build of `raft_group_id`
-    /// ([`SnapshotBuildCoordinator::hand_off_and_trigger`]).
-    pub(crate) fn hand_off(&self, raft_group_id: u32, permit: OwnedSemaphorePermit) {
-        self.handoffs().insert(raft_group_id, permit);
+    /// ([`SnapshotBuildCoordinator::hand_off_and_trigger`]) and returns the
+    /// hand-off's number, unless a permit handed to the group is still
+    /// pending: `permit` then comes back.
+    pub(crate) fn hand_off(
+        &self,
+        raft_group_id: u32,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<u64, OwnedSemaphorePermit> {
+        let mut handoffs = self.handoffs();
+        if handoffs.contains_key(&raft_group_id) {
+            return Err(permit);
+        }
+        let token = self.inner.next_handoff.fetch_add(1, Ordering::Relaxed);
+        handoffs.insert(raft_group_id, HandedOff { token, permit });
+        Ok(token)
     }
 
-    /// Whether `raft_group_id`'s handed-off permit is still unclaimed.
-    pub(crate) fn handoff_pending(&self, raft_group_id: u32) -> bool {
-        self.handoffs().contains_key(&raft_group_id)
+    /// Whether hand-off `token` to `raft_group_id` is still unclaimed.
+    pub(crate) fn handoff_pending(&self, raft_group_id: u32, token: u64) -> bool {
+        self.handoffs()
+            .get(&raft_group_id)
+            .is_some_and(|handed| handed.token == token)
     }
 
-    /// Takes back an unclaimed handed-off permit (the trigger was dropped);
-    /// returns whether there was one.
-    pub(crate) fn reclaim_handoff(&self, raft_group_id: u32) -> bool {
-        self.handoffs().remove(&raft_group_id).is_some()
+    /// Takes back hand-off `token` to `raft_group_id` unless a build claimed
+    /// it; returns whether it did. Another hand-off to the group stays.
+    pub(crate) fn reclaim_handoff(&self, raft_group_id: u32, token: u64) -> bool {
+        let mut handoffs = self.handoffs();
+        let ours = handoffs
+            .get(&raft_group_id)
+            .is_some_and(|handed| handed.token == token);
+        let taken = if ours {
+            handoffs.remove(&raft_group_id)
+        } else {
+            None
+        };
+        // The permit goes back to the node's permits outside the lock.
+        drop(handoffs);
+        taken.is_some()
     }
 
     /// Claims the permit handed off to `raft_group_id` for a build covering
@@ -347,8 +422,8 @@ impl SnapshotBuildCoordinator {
     /// so the driver never sees neither.
     fn claim_handoff(&self, raft_group_id: u32, log_mark: u64) -> Option<SnapshotBuildLease> {
         let mut handoffs = self.handoffs();
-        let permit = handoffs.remove(&raft_group_id)?;
-        let lease = self.lease(permit, raft_group_id, log_mark);
+        let handed = handoffs.remove(&raft_group_id)?;
+        let lease = self.lease(handed.permit, raft_group_id, log_mark);
         drop(handoffs);
         Some(lease)
     }
@@ -391,7 +466,7 @@ impl SnapshotBuildCoordinator {
         }
     }
 
-    fn handoffs(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, OwnedSemaphorePermit>> {
+    fn handoffs(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, HandedOff>> {
         self.inner
             .handoffs
             .lock()
@@ -2180,15 +2255,15 @@ mod tests {
             test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
         let group = state_machine.placement.raft_group_id.0;
         let permit = build.acquire().await.expect("driver's build permit");
-        build.hand_off(group, permit);
-        assert!(build.handoff_pending(group));
+        let token = build.hand_off(group, permit).expect("no hand-off pending");
+        assert!(build.handoff_pending(group, token));
 
         let builder = state_machine
             .try_create_snapshot_builder(false)
             .await
             .expect("a handed-off permit builds");
-        assert!(!build.handoff_pending(group));
-        assert!(!build.reclaim_handoff(group));
+        assert!(!build.handoff_pending(group, token));
+        assert!(!build.reclaim_handoff(group, token));
         assert_eq!(build.available_permits(), 0);
         // The next trigger without a handoff defers while this build runs.
         assert!(
@@ -2201,8 +2276,10 @@ mod tests {
         assert_eq!(build.available_permits(), 1);
 
         // An unclaimed handoff is taken back.
-        build.hand_off(group, build.acquire().await.expect("permit"));
-        assert!(build.reclaim_handoff(group));
+        let token = build
+            .hand_off(group, build.acquire().await.expect("permit"))
+            .expect("no hand-off pending");
+        assert!(build.reclaim_handoff(group, token));
         assert_eq!(build.available_permits(), 1);
     }
 
@@ -2228,7 +2305,6 @@ mod tests {
             failed,
             Handoff::TriggerFailed("the group stopped")
         ));
-        assert!(!build.handoff_pending(group));
         assert_eq!(build.available_permits(), 2);
 
         // No build claims it, as when OpenRaft dropped the trigger.
@@ -2239,7 +2315,6 @@ mod tests {
             })
             .await;
         assert!(matches!(unclaimed, Handoff::Unclaimed));
-        assert!(!build.handoff_pending(group));
         assert_eq!(build.available_permits(), 2);
 
         // The trigger starts the group's build, which claims the permit.
@@ -2258,6 +2333,104 @@ mod tests {
         assert_eq!(build.available_permits(), 2);
     }
 
+    fn panicking_trigger() -> Result<(), &'static str> {
+        panic!("the trigger panicked")
+    }
+
+    /// A hand-off whose caller stops waiting, during its trigger or its wait
+    /// for the claim, or whose trigger panics, still gives its permit back:
+    /// an operator's request that times out or whose client went away must
+    /// not park a permit (#558).
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_dropped_or_panicking_handoff_gives_its_permit_back() {
+        use futures_util::FutureExt as _;
+
+        let build = SnapshotBuildCoordinator::new(2);
+        let group = 7;
+        let never = Duration::from_secs(3_600);
+        let soon = Duration::from_millis(20);
+
+        let permit = build.acquire().await.expect("a permit");
+        let triggering = build.hand_off_and_trigger(
+            group,
+            permit,
+            never,
+            std::future::pending::<Result<(), &str>>(),
+        );
+        assert!(tokio::time::timeout(soon, triggering).await.is_err());
+        assert_eq!(build.available_permits(), 2);
+
+        let permit = build.acquire().await.expect("a permit");
+        let waiting =
+            build.hand_off_and_trigger(group, permit, never, async { Ok::<(), &str>(()) });
+        assert!(tokio::time::timeout(soon, waiting).await.is_err());
+        assert_eq!(build.available_permits(), 2);
+
+        let permit = build.acquire().await.expect("a permit");
+        let panicked =
+            std::panic::AssertUnwindSafe(
+                build.hand_off_and_trigger(group, permit, never, async { panicking_trigger() }),
+            )
+            .catch_unwind()
+            .await;
+        assert!(panicked.is_err());
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// One hand-off per group at a time: a second one while the first is
+    /// pending gives its permit back at once, and each caller takes back
+    /// only its own permit.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_group_takes_one_handoff_at_a_time() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        let never = Duration::from_secs(3_600);
+
+        let first = build.hand_off_and_trigger(
+            group,
+            build.acquire().await.expect("a permit"),
+            never,
+            async { Ok::<(), &str>(()) },
+        );
+        tokio::pin!(first);
+        assert!(futures_util::poll!(&mut first).is_pending());
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            build.hand_off_and_trigger(
+                group,
+                build.acquire().await.expect("a permit"),
+                never,
+                async { Ok::<(), &str>(()) },
+            ),
+        )
+        .await
+        .expect("a second hand-off returns at once");
+        assert!(matches!(second, Handoff::Busy));
+        assert_eq!(build.available_permits(), 1);
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("the first hand-off's permit builds");
+        assert!(matches!(first.await, Handoff::Claimed));
+        assert_eq!(build.available_permits(), 1);
+        drop(builder);
+
+        // A caller takes back only its own hand-off, never one made to the
+        // group since its own was claimed.
+        let token = build
+            .hand_off(group, build.acquire().await.expect("a permit"))
+            .expect("no hand-off pending");
+        let claimed_earlier = token.wrapping_sub(1);
+        assert!(!build.reclaim_handoff(group, claimed_earlier));
+        assert!(build.handoff_pending(group, token));
+        assert!(build.reclaim_handoff(group, token));
+        assert_eq!(build.available_permits(), 2);
+    }
+
     /// #519: a build counts in flight, with the log it will still free,
     /// from the moment it claims its permit until its builder is dropped,
     /// and the log it covers stops counting once it recorded its snapshot.
@@ -2273,12 +2446,14 @@ mod tests {
         assert!(build.builds_in_flight().is_empty());
         assert_eq!(build.node_log_bytes(), 300);
 
-        build.hand_off(group, build.acquire().await.expect("driver's build permit"));
+        let token = build
+            .hand_off(group, build.acquire().await.expect("driver's build permit"))
+            .expect("no hand-off pending");
         let builder = state_machine
             .try_create_snapshot_builder(false)
             .await
             .expect("a handed-off permit builds");
-        assert!(!build.handoff_pending(group));
+        assert!(!build.handoff_pending(group, token));
         assert_eq!(build.builds_in_flight(), BTreeMap::from([(group, 300)]));
         // Log applied after the capture is not this build's to free.
         gauge.record_applied(50);
@@ -2304,8 +2479,10 @@ mod tests {
             test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
         let group = state_machine.placement.raft_group_id.0;
         build.log_gauge(group).record_applied(300);
-        build.hand_off(group, build.acquire().await.expect("driver's build permit"));
-        let claimed = build.handoff_claimed(group);
+        let token = build
+            .hand_off(group, build.acquire().await.expect("driver's build permit"))
+            .expect("no hand-off pending");
+        let claimed = build.handoff_claimed(group, token);
         tokio::pin!(claimed);
         assert!(futures_util::poll!(&mut claimed).is_pending());
         let builder = state_machine
@@ -2314,10 +2491,10 @@ mod tests {
             .expect("a handed-off permit builds");
         // No timer wakes the wait: the claim does, so the next poll ends it.
         assert!(futures_util::poll!(&mut claimed).is_ready());
-        assert!(!build.handoff_pending(group));
+        assert!(!build.handoff_pending(group, token));
         drop(builder);
         // Nothing pending: the wait returns at once.
-        tokio::time::timeout(Duration::from_secs(5), build.handoff_claimed(group))
+        tokio::time::timeout(Duration::from_secs(5), build.handoff_claimed(group, token))
             .await
             .expect("no handoff to wait for");
     }

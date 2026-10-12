@@ -138,7 +138,9 @@ pub struct GroupDriveState {
     /// Whether the Raft WAL reports the group keeping old journal segments.
     pub lagging: bool,
     /// Log bytes the group's build in flight will still free, `None` while
-    /// no build runs.
+    /// no build runs. The snapshot driver also sets `Some(0)` for a group it
+    /// holds out of its passes after a trigger of it went unclaimed: never
+    /// planned, and none of its log counted as freed.
     pub building: Option<u64>,
 }
 

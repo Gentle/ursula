@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { generateKeyPairSync, type KeyObject, randomUUID, sign } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, request, type Server } from "node:http";
@@ -246,6 +246,21 @@ export class StallProxy {
 		this.server.closeAllConnections();
 		await new Promise<void>((r) => this.server.close(() => r()));
 	}
+}
+
+/**
+ * A throwaway CA in `dir` and a server certificate for 127.0.0.1 it signed: the key and certificate
+ * for an HTTPS server, and the path of the CA's PEM for `URSULA_VFS_CA_FILE`.
+ */
+export function loopbackCertificate(dir: string): { key: Buffer; cert: Buffer; ca: string } {
+	const openssl = (...args: string[]): void => {
+		execFileSync("openssl", args, { cwd: dir, stdio: "pipe" });
+	};
+	openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "1", "-subj", "/CN=sqlite-ursula e2e CA");
+	openssl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "leaf.key", "-out", "leaf.csr", "-subj", "/CN=127.0.0.1");
+	writeFileSync(join(dir, "leaf.ext"), "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n");
+	openssl("x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-set_serial", "1", "-days", "1", "-extfile", "leaf.ext", "-out", "leaf.pem");
+	return { key: readFileSync(join(dir, "leaf.key")), cert: readFileSync(join(dir, "leaf.pem")), ca: join(dir, "ca.pem") };
 }
 
 /** How the gate answers the writes it refuses: `402` without extra headers unless set. */

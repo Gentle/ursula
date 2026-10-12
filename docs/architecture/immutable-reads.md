@@ -142,3 +142,7 @@ Every part is optional on both sides, and the client checks every response:
   incarnation, digest mismatch, 404, 412, truncated body, stale `Stream-Up-To-Date`, missing marker,
   transport error) ending in a correct attach that is not taken for a recreate, and the hint
   guards.
+- `clients/sqlite-ursula/test/read-origin.e2e.ts`: fresh hosts attach a real server through a
+  caching HTTPS proxy configured as their read origin. Only the snapshot and the aligned history
+  reach the proxy, the second host gets them from its cache, and a chunk answered with another
+  incarnation or a 503 is read at the stream's origin without a rebuild.

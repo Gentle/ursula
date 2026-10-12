@@ -3683,6 +3683,7 @@ mod refused_bodies {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use axum::body::Body;
@@ -3696,6 +3697,7 @@ mod refused_bodies {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpSocket;
+    use tokio::net::TcpStream;
     use tokio::time::Instant;
     use tokio_stream::wrappers::ReceiverStream;
     use ursula_observability::serve::serve_until_shutdown;
@@ -3714,6 +3716,7 @@ mod refused_bodies {
     use crate::REFUSED_BODY_STALL_TIMEOUT;
     use crate::admission::StaticQuotaProvider;
     use crate::auth::AccessControl;
+    use crate::auth::AuthenticationError;
     use crate::auth::AuthorizationDecision;
     use crate::auth::AuthorizationError;
     use crate::service::router;
@@ -3844,6 +3847,49 @@ mod refused_bodies {
         }
     }
 
+    /// A gateway with access control and `config` whose token issuer is
+    /// unavailable, so that `valid-token` gets the issuer's `503`.
+    fn issuer_down(config: GatewayConfig) -> Gateway {
+        Gateway::with_access_control(
+            config,
+            AccessControl::new(
+                Arc::new(FixedPrincipalResolver {
+                    calls: AtomicUsize::new(0),
+                    result: Err(AuthenticationError::Unavailable),
+                }),
+                Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow)),
+            ),
+        )
+    }
+
+    /// Reads one answer from `connection`, its body included, by its
+    /// `content-length`, and returns its status and headers.
+    async fn read_answer(connection: &mut TcpStream) -> (StatusCode, HeaderMap) {
+        let mut answer = Vec::new();
+        let end = loop {
+            if let Some(end) = answer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end;
+            }
+            let mut read = [0_u8; 1024];
+            let got = connection.read(&mut read).await.expect("read the answer");
+            assert_ne!(got, 0, "the connection closed before the answer");
+            answer.extend_from_slice(&read[..got]);
+        };
+        let (status, headers) = parse_head(&answer[..end]);
+        let length: usize = value(&headers, "content-length")
+            .expect("a content-length")
+            .parse()
+            .expect("a length");
+        let mut read_of_body = answer.len().saturating_sub(end.saturating_add(4));
+        while read_of_body < length {
+            let mut read = [0_u8; 1024];
+            let got = connection.read(&mut read).await.expect("read the body");
+            assert_ne!(got, 0, "the connection closed in the answer's body");
+            read_of_body = read_of_body.saturating_add(got);
+        }
+        (status, headers)
+    }
+
     /// The status and headers of an answer's head, without its blank line.
     fn parse_head(head: &[u8]) -> (StatusCode, HeaderMap) {
         let head = std::str::from_utf8(head).expect("an ASCII head");
@@ -3941,6 +3987,13 @@ mod refused_bodies {
                 "NotFound",
             ),
             (
+                "token issuer down",
+                issuer_down(config()),
+                "valid-token",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AuthenticationUnavailable",
+            ),
+            (
                 "authorizer down",
                 guarded(config(), Err(AuthorizationError::Unavailable)),
                 "valid-token",
@@ -3976,6 +4029,11 @@ mod refused_bodies {
                 value(&headers, NOT_APPLIED_CHECKED_HEADER),
                 Some("1"),
                 "{case}"
+            );
+            assert_eq!(
+                headers.get_all(NOT_APPLIED_CHECKED_HEADER).iter().count(),
+                1,
+                "{case}: one vouch on the wire"
             );
             let unread = gateway.handle(request(bearer, Body::empty())).await;
             assert_eq!(answered, unread.status(), "{case}");
@@ -4081,6 +4139,34 @@ mod refused_bodies {
         assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 1));
     }
 
+    /// A reading whose request is dropped before the body ended, as when the
+    /// connection goes away, counts as cut.
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_dropped_before_the_body_ended_counts_as_cut() {
+        // Never reached: the gateway refuses the token.
+        let gateway = guarded(
+            test_config(vec!["http://127.0.0.1:9".to_owned()]),
+            Ok(AuthorizationDecision::Allow),
+        );
+        let (chunks, body) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(1);
+        chunks
+            .send(Ok(Bytes::from_static(&[0; 1024])))
+            .await
+            .expect("the first chunk");
+        let body = Body::from_stream(ReceiverStream::new(body));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            gateway.handle(request("not-a-token", body)),
+        )
+        .await
+        .expect_err("the reading waits for the rest of the body");
+        drop(chunks);
+
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 1));
+    }
+
     /// A body that goes past `max_request_body_bytes` is read up to the limit
     /// and no further, whether the gateway would forward the request (its
     /// `413`, as before) or refused it from its head (with a chunked body,
@@ -4131,6 +4217,11 @@ mod refused_bodies {
                 Some("1"),
                 "{case}"
             );
+            assert_eq!(
+                headers.get_all(NOT_APPLIED_CHECKED_HEADER).iter().count(),
+                1,
+                "{case}: one vouch on the wire"
+            );
             let metrics = gateway.metrics_snapshot();
             assert_eq!(
                 (metrics.refusal_drains, metrics.refusal_drains_cut),
@@ -4170,5 +4261,51 @@ mod refused_bodies {
         assert_eq!(value(&headers, NOT_APPLIED_CHECKED_HEADER), Some("1"));
         let metrics = gateway.metrics_snapshot();
         assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 1));
+    }
+
+    /// After a refused body was read to its end, the connection carries the
+    /// client's next request.
+    #[tokio::test(start_paused = true)]
+    async fn the_connection_carries_the_next_request_after_a_whole_reading() {
+        let _frozen = FrozenClock::hold();
+        let upstream = answering_upstream().await;
+        let gateway = Arc::new(guarded(
+            test_config(vec![upstream.url.clone()]),
+            Ok(AuthorizationDecision::Allow),
+        ));
+        let (addr, _server) = serve(Arc::clone(&gateway)).await;
+        let mut connection = TcpStream::connect(addr).await.expect("connect");
+
+        let head = format!(
+            "POST /owner-a/events HTTP/1.1\r\nhost: gateway.test\r\nauthorization: Bearer \
+             not-a-token\r\ncontent-length: {LARGE_BODY}\r\n\r\n"
+        );
+        connection
+            .write_all(head.as_bytes())
+            .await
+            .expect("send the head");
+        connection
+            .write_all(&vec![0_u8; LARGE_BODY])
+            .await
+            .expect("send the whole body before reading");
+        let (refused, headers) = read_answer(&mut connection).await;
+        assert_eq!(refused, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            headers.get_all(NOT_APPLIED_CHECKED_HEADER).iter().count(),
+            1,
+            "one vouch on the wire"
+        );
+
+        connection
+            .write_all(
+                b"POST /owner-a/events HTTP/1.1\r\nhost: gateway.test\r\nauthorization: Bearer \
+                  valid-token\r\ncontent-length: 0\r\n\r\n",
+            )
+            .await
+            .expect("send the next request on the same connection");
+        let (next, _) = read_answer(&mut connection).await;
+        assert_eq!(next, StatusCode::OK);
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 0));
     }
 }

@@ -159,11 +159,13 @@ impl Authorizer for AllowAllAuthorizer {
 ///
 /// The standalone gateway does not install this value and keeps its original
 /// pass-through behavior. Deployments that do install it authenticate any
-/// presented bearer credential, then authorize both anonymous and authenticated
-/// requests against the explicit bucket/stream resource. Such a gateway
-/// answers `404` to paths it does not recognize, every `/__ursula/*` path
-/// included. That covers its own metrics path unless
-/// [`AccessControl::with_public_metrics`] makes the metrics public.
+/// bearer credential presented on a bucket or stream request, then authorize
+/// both anonymous and authenticated requests against the explicit
+/// bucket/stream resource. Such a gateway answers `404` to requests it does
+/// not recognize, every `/__ursula/*` path included, without checking a
+/// credential. Its own metrics path is one of them unless
+/// [`AccessControl::with_public_metrics`] makes the metrics public, which
+/// serves them without checking a credential either.
 #[derive(Clone)]
 pub struct AccessControl {
     principal_resolver: Arc<dyn PrincipalResolver>,
@@ -194,12 +196,14 @@ impl AccessControl {
 
     /// Sets whether the gateway answers `GET /__ursula/gateway/metrics` with
     /// its own counters for every caller, with or without a token and without
-    /// asking the authorizer, as a gateway without access control does. Off
-    /// by default: the path then answers `404` like every other `/__ursula/*`
-    /// path (#548). The counters hold no tenant data, but they show traffic
-    /// volume, so make them public only where untrusted clients cannot reach
-    /// the gateway's listener, or where a proxy in front of it denies
-    /// `/__ursula/*`.
+    /// asking the authorizer, as a gateway without access control does. The
+    /// gateway does not check a presented token there, so an invalid or
+    /// expired one gets the counters too, though it gets `401` on a bucket or
+    /// stream request. Off by default: the path then answers `404` like every
+    /// other `/__ursula/*` path (#548). The counters hold no tenant data, but
+    /// they show traffic volume, so make them public only where untrusted
+    /// clients cannot reach the gateway's listener, or where a proxy in front
+    /// of it denies `/__ursula/*`.
     pub fn with_public_metrics(mut self, public: bool) -> Self {
         self.public_metrics = public;
         self

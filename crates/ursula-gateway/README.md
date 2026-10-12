@@ -106,10 +106,12 @@ The gateway's own metrics path, `/__ursula/gateway/metrics`, is one of those
 internal paths. `--auth-public-metrics` on `ursula gateway`, or
 `AccessControl::with_public_metrics(true)` in a hosted binary, serves the
 counters there to every caller, with or without a token, as a gateway without
-access control does. The counters hold no tenant data, but they show traffic
-volume. Set it only where untrusted clients cannot reach the gateway, or where
-a proxy in front of it denies `/__ursula/*`. Gateways before 0.7.4 served the
-path to every caller, with or without access control.
+access control does. The gateway then does not check a presented token on that
+path, so an invalid or expired one gets the counters too. The counters hold no
+tenant data, but they show traffic volume. Make them public only where
+untrusted clients cannot reach the gateway, or where a proxy in front of it
+denies `/__ursula/*`. Gateways before 0.7.4 served the path to every caller,
+with or without access control.
 
 ## Redirects
 

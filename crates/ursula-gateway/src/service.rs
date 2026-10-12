@@ -210,12 +210,13 @@ pub struct GatewayArgs {
 
     /// Answer `GET /__ursula/gateway/metrics` with the gateway's own counters
     /// for every caller, with or without a token, as a gateway without access
-    /// control does. Requires access control (`--auth-issuer`). Without this
-    /// flag an access-controlled gateway answers that path 404, like every
-    /// other `/__ursula/*` path. The counters hold no tenant data, but they
-    /// show traffic volume: set it only where untrusted clients cannot reach
-    /// the listener, or where a proxy in front of the gateway denies
-    /// `/__ursula/*`.
+    /// control does. The gateway does not check a presented token there, so
+    /// an invalid or expired one gets the counters too. Requires access
+    /// control (`--auth-issuer`). Without this flag an access-controlled
+    /// gateway answers that path 404, like every other `/__ursula/*` path.
+    /// The counters hold no tenant data, but they show traffic volume: set
+    /// the flag only where untrusted clients cannot reach the listener, or
+    /// where a proxy in front of the gateway denies `/__ursula/*`.
     #[arg(long, requires = "auth_issuer")]
     auth_public_metrics: bool,
 

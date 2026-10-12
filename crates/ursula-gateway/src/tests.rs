@@ -1083,7 +1083,7 @@ async fn access_control_fails_closed_for_unclassified_routes() {
 
 /// An upstream that answers every request `200` with an empty body, and
 /// counts the requests.
-async fn counting_upstream() -> (TestUpstream, Arc<AtomicUsize>) {
+async fn counting_fallback_upstream() -> (TestUpstream, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let upstream_hits = Arc::clone(&hits);
     let upstream = spawn_upstream(Router::new().fallback(any(move || {
@@ -1126,7 +1126,7 @@ async fn served_metrics(response: AxumResponse) -> serde_json::Value {
 /// any caller (#548).
 #[tokio::test]
 async fn gateway_without_access_control_serves_its_metrics() {
-    let (upstream, hits) = counting_upstream().await;
+    let (upstream, hits) = counting_fallback_upstream().await;
     let gateway = Gateway::new(test_config(vec![upstream.url.clone()]));
 
     let metrics = served_metrics(gateway.handle(metrics_request(Method::GET, None)).await).await;
@@ -1142,7 +1142,7 @@ async fn gateway_without_access_control_serves_its_metrics() {
 /// missing one (#548).
 #[tokio::test]
 async fn access_control_conceals_the_gateway_metrics() {
-    let (upstream, hits) = counting_upstream().await;
+    let (upstream, hits) = counting_fallback_upstream().await;
     let resolver = Arc::new(FixedPrincipalResolver::valid());
     let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
     let gateway = gateway_with_access_control(
@@ -1174,7 +1174,7 @@ async fn access_control_conceals_the_gateway_metrics() {
 /// paths, still answer `404` (#548).
 #[tokio::test]
 async fn access_control_with_public_metrics_serves_them_to_any_caller() {
-    let (upstream, hits) = counting_upstream().await;
+    let (upstream, hits) = counting_fallback_upstream().await;
     let resolver = Arc::new(FixedPrincipalResolver::valid());
     // Conceals every resource, so a metrics request that reached it would
     // answer `404`.
@@ -1183,6 +1183,8 @@ async fn access_control_with_public_metrics_serves_them_to_any_caller() {
     ));
     let gateway = Gateway::with_access_control(
         test_config(vec![upstream.url.clone()]),
+        // `.clone()`: `Arc::clone(&resolver)` would take the trait object type
+        // that `AccessControl::new` expects and refuse the concrete `Arc`.
         AccessControl::new(resolver.clone(), authorizer.clone()).with_public_metrics(true),
     );
 

@@ -317,6 +317,13 @@ impl Gateway {
     /// each one carries the gateway's vouch, [`NOT_APPLIED_CHECKED_HEADER`],
     /// added after the redirect rule decided whether a node's
     /// [`NOT_APPLIED_HEADER`] stays.
+    ///
+    /// A refusal decided from the request's head alone (access control,
+    /// tenant admission) is returned once the request's body has been read
+    /// and dropped: within `max_request_body_bytes`, 5 s without data and
+    /// 30 s in all, so that a client that sends its whole body first gets the
+    /// refusal (#540). The future can take that long, and the caller pays the
+    /// body's ingress.
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
         let mut response = self.handle_with_cors(req).await;
         response
@@ -535,7 +542,9 @@ impl Gateway {
     /// [`REFUSED_BODY_DRAIN_TIMEOUT`] in all. At any bound the refusal goes
     /// out at once and the connection closes, as after the `413` for a body
     /// over the limit. A body whose declared length is over the limit is not
-    /// read at all, since its connection closes either way. A reading keeps no
+    /// read at all, since the reading would stop at the limit before the
+    /// body's end. Over HTTP/2 the body is read the same way, and a reading
+    /// cut short resets only the request's stream. A reading keeps no
     /// byte of the body and adds no task: it runs in the request's own
     /// handler. So the requests under way bound the readings under way, as
     /// they bound the bodies the gateway buffers whole for the requests it
@@ -553,12 +562,14 @@ impl Gateway {
     async fn refuse_unread(&self, refusal: Refusal, body: Body) -> AxumResponse {
         if !body.is_end_stream() {
             self.metrics.refusal_drains.fetch_add(1, Ordering::Relaxed);
+            // Counted as cut unless the body was read to its end, also when
+            // the request is dropped while its body is read.
+            let mut cut = CutUnlessWhole {
+                cut: &self.metrics.refusal_drains_cut,
+                whole: false,
+            };
             let drained = drain(body, self.config.max_request_body_bytes).await;
-            if drained != Drained::Whole {
-                self.metrics
-                    .refusal_drains_cut
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            cut.whole = drained == Drained::Whole;
             debug!(?drained, "read the body of a refused request");
         }
         refusal.into_response()
@@ -1375,6 +1386,21 @@ enum Drained {
     /// The body failed, as when the client goes away in the middle of it.
     /// [`drain`] logs the body's error.
     Failed,
+}
+
+/// Counts a refused request's reading in `cut` when it drops, unless the
+/// reading read the body to its end.
+struct CutUnlessWhole<'a> {
+    cut: &'a AtomicU64,
+    whole: bool,
+}
+
+impl Drop for CutUnlessWhole<'_> {
+    fn drop(&mut self) {
+        if !self.whole {
+            self.cut.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Reads `body` to its end and drops each chunk as it arrives: `limit` bytes

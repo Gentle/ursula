@@ -7,7 +7,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use axum::serve::Listener;
-use axum::serve::ListenerExt;
 use openraft::RaftMetrics;
 use openraft::rt::Instant as _;
 use openraft::rt::WatchReceiver;
@@ -224,21 +223,14 @@ async fn new_recovery_engine(
 }
 
 /// Binds a fixture node's gRPC listener on loopback and returns its
-/// endpoint. Every socket it accepts sets `TCP_NODELAY`, as production's
-/// listeners do (`ursula_observability::serve::serve_until_shutdown`).
-/// Without it, Nagle's algorithm holds a follower's reply while an earlier
-/// reply is unacknowledged, and the leader delays that acknowledgement (at
-/// least 40 ms on Linux) until its next request. With the fixtures' 10 ms
-/// ReadIndex rounds, each reply can then arrive one round late, round after
-/// round, so that no round reaches a quorum (#521, #547).
+/// endpoint. Like production's listeners, it sets `TCP_NODELAY` on every
+/// socket it accepts ([`ursula_observability::serve::nodelay_listener`]):
+/// with the fixtures' 10 ms ReadIndex rounds, a delayed reply can otherwise
+/// keep every round short of a quorum (#521, #547).
 async fn bind_fixture_listener() -> (String, impl Listener<Io = TcpStream, Addr = SocketAddr>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let listener = listener.tap_io(|stream| {
-        if let Err(err) = stream.set_nodelay(true) {
-            tracing::warn!("set TCP_NODELAY on an accepted fixture socket: {err}");
-        }
-    });
+    let listener = ursula_observability::serve::nodelay_listener(listener);
     (endpoint, listener)
 }
 
@@ -487,17 +479,6 @@ fn read_attempt_error(error: GroupEngineError) -> AttemptError {
         } => AttemptError::Transient(text),
         _ => AttemptError::Fatal(text),
     }
-}
-
-/// A fixture node's listener accepts connections with `TCP_NODELAY` set, as
-/// production's listeners do.
-#[tokio::test]
-async fn fixture_listener_sets_nodelay_on_accepted_connections() {
-    let (_endpoint, mut listener) = bind_fixture_listener().await;
-    let address = listener.local_addr().unwrap();
-    let ((accepted, _peer), client) = tokio::join!(listener.accept(), TcpStream::connect(address));
-    client.unwrap();
-    assert!(accepted.nodelay().unwrap());
 }
 
 #[tokio::test]

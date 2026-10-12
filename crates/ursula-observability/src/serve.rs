@@ -10,9 +10,13 @@
 use std::future::Future;
 use std::future::IntoFuture;
 use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 
+use axum::serve::Listener;
 use axum::serve::ListenerExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 /// Wait for a termination signal: SIGTERM or Ctrl-C (Ctrl-C only on
 /// non-unix). If the SIGTERM handler cannot be installed, falls back to
@@ -55,6 +59,21 @@ pub async fn shutdown_signal() {
     }
 }
 
+/// Wrap `listener` so that every socket it accepts sets `TCP_NODELAY`.
+///
+/// Without it, Nagle's algorithm holds a reply while an earlier reply on the
+/// same connection is unacknowledged, and the peer delays that
+/// acknowledgement (at least 40 ms on Linux) until its next request. A Raft
+/// follower that writes two replies in a row then answers each ReadIndex
+/// round one round late (#521, #547).
+pub fn nodelay_listener(listener: TcpListener) -> impl Listener<Io = TcpStream, Addr = SocketAddr> {
+    listener.tap_io(|stream| {
+        if let Err(err) = stream.set_nodelay(true) {
+            tracing::warn!("set TCP_NODELAY on accepted socket: {err}");
+        }
+    })
+}
+
 /// Serve `listener` with `app` until `shutdown` completes, then stop accepting
 /// new connections and drain in-flight requests before returning.
 ///
@@ -63,18 +82,13 @@ pub async fn shutdown_signal() {
 /// unbounded (callers enforce their own deadline, e.g. via a forced-exit
 /// watchdog).
 pub async fn serve_until_shutdown(
-    listener: tokio::net::TcpListener,
+    listener: TcpListener,
     app: axum::Router,
     shutdown: impl Future<Output = ()> + Send + 'static,
     drain_timeout: Option<Duration>,
 ) -> io::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let listener = listener.tap_io(|stream| {
-        if let Err(err) = stream.set_nodelay(true) {
-            tracing::warn!("set TCP_NODELAY on accepted socket: {err}");
-        }
-    });
-    let server = axum::serve(listener, app)
+    let server = axum::serve(nodelay_listener(listener), app)
         .with_graceful_shutdown(async move {
             drop(shutdown_rx.await);
         })
@@ -107,5 +121,27 @@ pub async fn serve_until_shutdown(
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::serve::Listener;
+    use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+
+    use super::nodelay_listener;
+
+    /// A connection accepted through [`nodelay_listener`] has `TCP_NODELAY`
+    /// set, so `serve_until_shutdown` serves every connection with it.
+    #[tokio::test]
+    async fn nodelay_listener_sets_nodelay_on_accepted_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut listener = nodelay_listener(listener);
+        let ((accepted, _peer), client) =
+            tokio::join!(listener.accept(), TcpStream::connect(address));
+        client.unwrap();
+        assert!(accepted.nodelay().unwrap());
     }
 }

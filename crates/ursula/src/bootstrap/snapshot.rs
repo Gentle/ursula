@@ -28,7 +28,7 @@ use crate::bootstrap::store_health::spawn_store_health_gate;
 /// before it ends the tick.
 const SNAPSHOT_PERMIT_WAIT: Duration = Duration::from_secs(60);
 /// Longest a handed-off permit waits for the triggered group to claim it.
-const SNAPSHOT_HANDOFF_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const SNAPSHOT_HANDOFF_WAIT: Duration = Duration::from_secs(5);
 /// Pause between ticks while the node is over its log watermark, so a
 /// pressure pass is not capped at its group count per interval.
 const SNAPSHOT_PRESSURE_RETICK: Duration = Duration::from_millis(250);

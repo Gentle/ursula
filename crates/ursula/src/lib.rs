@@ -88,6 +88,7 @@ use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
+use ursula_raft::Handoff;
 use ursula_raft::IncomingTransferError;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::OwnerRaftHandle;
@@ -2125,6 +2126,9 @@ fn cold_reference_error_response(err: &ursula_runtime::ColdReferenceError) -> Re
     (status, message).into_response()
 }
 
+/// How long an operator's snapshot request waits for its build to start.
+const ADMIN_SNAPSHOT_START_WAIT: Duration = Duration::from_secs(10);
+
 pub(crate) async fn trigger_raft_snapshot(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
@@ -2133,13 +2137,72 @@ pub(crate) async fn trigger_raft_snapshot(
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
-    let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
-    if let Err(err) = raft.trigger().snapshot().await {
+    let Some(coordinator) = state
+        .raft_registry()
+        .map(RaftGroupHandleRegistry::snapshot_build_coordinator)
+    else {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("trigger raft snapshot: {err}"),
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
         )
             .into_response();
+    };
+    let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
+    // The wait drops the hand-off when it runs out, which gives its permit
+    // back.
+    let started = tokio::time::timeout(ADMIN_SNAPSHOT_START_WAIT, async {
+        loop {
+            // A triggered build that finds every permit taken is refused, so
+            // the request takes one first, in line with the snapshot driver
+            // (#529).
+            let permit = match coordinator.acquire().await {
+                Ok(permit) => permit,
+                Err(err) => return Err(format!("take a snapshot build permit: {err}")),
+            };
+            match coordinator
+                .hand_off_and_trigger(
+                    raft_group_id.0,
+                    permit,
+                    bootstrap::SNAPSHOT_HANDOFF_WAIT,
+                    raft.trigger().snapshot(),
+                )
+                .await
+            {
+                Handoff::Claimed => return Ok(()),
+                // OpenRaft dropped the trigger, for example because a build
+                // of the group was already running, which may cover less than
+                // the request asks for. Trigger again once that build ended.
+                Handoff::Unclaimed => coordinator.build_ended(raft_group_id.0).await,
+                // The snapshot driver handed the group a permit first.
+                // Trigger again once that hand-off settled and the build it
+                // started, if any, ended.
+                Handoff::Busy => {
+                    coordinator.handoff_settled(raft_group_id.0).await;
+                    coordinator.build_ended(raft_group_id.0).await;
+                }
+                Handoff::TriggerFailed(err) => {
+                    return Err(format!("trigger raft snapshot: {err}"));
+                }
+            }
+        }
+    })
+    .await;
+    match started {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+        Err(_elapsed) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                format!(
+                    "no snapshot build of group {} started within \
+                     {ADMIN_SNAPSHOT_START_WAIT:?}, usually because other builds held every \
+                     permit; retry",
+                    raft_group_id.0
+                ),
+            )
+                .into_response();
+        }
     }
     if let Some(snapshot_log_id) = snapshot_log_id
         && let Err(err) = raft

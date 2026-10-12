@@ -725,12 +725,14 @@ What attach does in each case:
   lookup, up to the resolve timeout of 5 s, even when a pooled connection is ready, while the
   host's other requests go on with its last addresses. While lookups fail, the client keeps using
   the host's last addresses for up to 10 minutes after the last successful lookup
-  (`net::DNS_STALE_LIMIT`), with one lookup every 5 s meanwhile (`net::DNS_RETRY`, logged as
-  `dns_stale`), and a failed connection makes the next attempt look the host up again. So a DNS
-  outage shorter than 10 minutes delays one request per host by up to 5 s every 5 s, and fails
-  nothing. Past it, attempts fail before they go out, and commits fail alone as `unreachable`
-  (above). Before 0.7.4 every request looked its host up, a pooled connection's included, and an
-  outage of 30 s or more poisoned the databases of every owner whose commits met it.
+  (`net::DNS_STALE_LIMIT`), and looks the host up again 5 s after each failed lookup ends
+  (`net::DNS_RETRY`, logged as `dns_stale`). A failed connection makes the host's next lookup due,
+  no sooner than 5 s after its last lookup ended. So a DNS outage shorter than 10 minutes delays
+  one request per host by up to 5 s, at most once every 5 s, and fails nothing. Past it, and for a
+  host never looked up, a failed lookup fails the host's requests before they go out, without
+  another lookup for 5 s, and commits fail alone as `unreachable` (above). Before 0.7.4 every
+  request looked its host up, a pooled connection's included, and an outage of 30 s or more
+  poisoned the databases of every owner whose commits met it.
 - A server that refuses writes for a while (its Raft log over its hard limit under sustained
   write load, its WAL disk full) marks its refusals `x-ursula-not-applied`. So does a gateway that
   refuses a request before it forwards it, such as one whose token issuer is down for a few
@@ -893,9 +895,10 @@ The crate refuses to build with `panic = "abort"`.
   of an untrusted database cannot call them.
 - A host's addresses are looked up through the system's resolver at most once every 30 s per
   process (§6), so a stream whose endpoint moves to new addresses is reached there within 30 s, or
-  at the attempt after a connection to an old address failed, and a pooled connection keeps the old
-  address until it closes. While lookups fail, the last addresses serve for up to 10 minutes after
-  the last successful lookup.
+  at the attempt after a connection to an old address failed (5 s after the last lookup at the
+  soonest), and a pooled connection keeps the old address until it closes. While lookups fail, the
+  last addresses serve for up to 10 minutes after the last successful lookup, and a host with none
+  fails its requests for 5 s after each failed lookup.
 - Appends, reads and `HEAD`s keep a connection for 90 s after its last request
   (`URSULA_VFS_IDLE_MS`, ureq's default is 15 s), so a writer that commits every 15 to 90 s reuses
   its connection instead of opening a new TCP and TLS connection per commit, which behind a reverse
@@ -1026,6 +1029,21 @@ must say in its release notes to stop every owner of a stream before upgrading.
   ten tries) and never on Linux. A `HEAD` and a read reset this way three times are sent again and
   succeed on the fourth connection. A reset while a 16 MiB snapshot body goes out is no answer,
   whatever error reports it. CI runs them on macOS too.
+- Units also cover the transport (`net`). Requests to a host within 30 s of its lookup make no
+  other, and one request at a time looks a host up while the others use its last addresses: a
+  second request while the lookup is held open, and one due after another lookup that started with
+  no addresses ended while this one runs. A failed lookup serves the last addresses until the
+  retry, 5 s later and no later than the stale limit, and then the host is looked up again. Past
+  the limit a failed lookup fails as never sent, and one with no addresses fails the host's
+  requests the same way until the retry, with no lookup of theirs. A failed connection makes the
+  lookup due, 5 s after the last one at the soonest, and keeps the addresses. An IP address is
+  never cached, each port of a host is its own entry, and a failure is marked once. Through an
+  agent, requests to a host share one lookup, and a failed connection looks the host up again and
+  reaches its new address. A CONNECT proxy whose host does not resolve and a failed TLS handshake
+  fail as never sent, the stand-in endpoint receiving no byte of the request. An append whose every
+  attempt fails before sending (connections refused, or lookups that time out) fails alone as
+  `unreachable` with its sequence free, a later proven refusal still fails it alone, and an
+  attempt that got no answer on a connection keeps it unknown.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -1088,6 +1106,11 @@ must say in its release notes to stop every owner of a stream before upgrading.
   succeeds, a fresh attach of the stream holds the accepted rows alone, and the owner's own files,
   attached again, pass `integrity_check` with the same rows. With `URSULA_VFS_MAX_FRAME_BYTES` set
   to 1 MiB, a 2 MiB transaction fails the same way.
+- An endpoint that refuses connections (`test/unreachable.e2e.ts`, through a TCP forwarder the
+  test turns off and on again on the same port). A commit while it is off fails alone with
+  `SQLITE_IOERR_AUTH`, `ursula_status` reports `unreachable` with the connection's failure as the
+  reason, the owner keeps its epoch and offset, and nothing is poisoned. Once it is back the next
+  commit succeeds without an attach, and the stream holds the accepted commits alone.
 - Panics (`test/panics.e2e.ts`, each case in its own Node process with `URSULA_VFS_PANIC_IN`). Every
   SQL function and the extension's init fail with "panicked inside the extension", and the process
   goes on without a signal. A panic in `xWrite` fails the commit with `SQLITE_IOERR_WRITE` and

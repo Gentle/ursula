@@ -9,8 +9,10 @@
 //! the cache, a host is looked up at most once every [`DNS_FRESH`] (every [`DNS_RETRY`] while
 //! lookups fail), by one request at a time: while it waits for the lookup, up to the resolve
 //! timeout (5 s), the host's other requests go on with its last addresses, and only requests that
-//! find none (the first ones to a host) look it up each. A connection that fails makes its host's
-//! lookup due, so an endpoint that moved is looked up again at the next attempt.
+//! find none (the first ones to a host) look it up each, until one of their lookups fails, which
+//! fails the host's requests for [`DNS_RETRY`]. A connection that fails makes its host's lookup
+//! due, no sooner than [`DNS_RETRY`] after the last one ended, so an endpoint that moved is looked
+//! up again at the next attempt.
 //!
 //! The resolver and the connector here wrap each failure of theirs in [`NotSent`]: a host that did
 //! not resolve, and a connection that was not made. Nothing of such a request went out, so an
@@ -22,11 +24,12 @@
 //!
 //! That proof relies on how ureq 3.4.2 sends a request as these agents use it (no redirects
 //! followed, no middleware): it resolves the host and makes the connection (the TCP connect, a
-//! CONNECT proxy's tunnel, and the TLS handshake, which ureq's rustls connector completes) before it
-//! writes any byte of the request, it sends a request once and never again on another connection,
-//! and it sends no TLS early data. `client::tests::a_failed_tls_handshake_sends_nothing` pins the
-//! handshake. These use ureq's `unversioned` resolver and transport types, which its semver promises
-//! do not cover: an update of ureq that changes them fails the build here.
+//! CONNECT proxy's tunnel, and the TLS handshake, which ureq's rustls connector completes) before
+//! it writes any byte of the request, it sends a request once and never again on another
+//! connection, and it sends no TLS early data.
+//! `client::tests::a_failed_tls_handshake_sends_nothing` pins the handshake. These use ureq's
+//! `unversioned` resolver and transport types, which its semver promises do not cover: an update
+//! of ureq that changes them fails the build here.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -34,6 +37,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -102,66 +107,123 @@ pub(crate) fn is_not_sent(e: &ureq::Error) -> bool {
     matches!(e, ureq::Error::Other(other) if other.is::<NotSent>())
 }
 
-/// A host's addresses from its last successful lookup, when that was, when the next lookup is
-/// due, and whether a request looks it up now.
+/// A host's last successful lookup: its addresses, and when the lookup ended.
 #[derive(Clone, Debug)]
-struct Looked {
+struct Good {
     addrs: ResolvedSocketAddrs,
     at: Instant,
+}
+
+/// Why a host's last lookup failed, kept to fail the requests that come before the next lookup
+/// is due (a ureq error is not `Clone`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Failure {
+    TimedOut,
+    NotFound,
+    Io(std::io::ErrorKind),
+}
+
+impl Failure {
+    fn of(e: &ureq::Error) -> Failure {
+        match unwrapped(e) {
+            ureq::Error::Timeout(_) => Failure::TimedOut,
+            ureq::Error::Io(e) => Failure::Io(e.kind()),
+            _ => Failure::NotFound,
+        }
+    }
+
+    fn error(self) -> ureq::Error {
+        match self {
+            Failure::TimedOut => ureq::Error::Timeout(ureq::Timeout::Resolve),
+            Failure::NotFound => ureq::Error::HostNotFound,
+            Failure::Io(kind) => ureq::Error::Io(kind.into()),
+        }
+    }
+}
+
+/// What the cache knows of a host.
+#[derive(Clone, Debug)]
+struct Entry {
+    /// The last successful lookup.
+    good: Option<Good>,
+    /// When the last lookup ended, successful or not.
+    ended: Instant,
+    /// How the last lookup failed, when it did.
+    failed: Option<Failure>,
+    /// When the next lookup is due.
     next: Instant,
-    looking: bool,
+    /// The lookup a request runs now, by its number.
+    looking: Option<u64>,
+}
+
+impl Entry {
+    /// The last successful lookup's addresses, while they stand in for a lookup at `now`: within
+    /// [`DNS_STALE_LIMIT`] of it.
+    fn stand_in(&self, now: Instant) -> Option<&Good> {
+        self.good
+            .as_ref()
+            .filter(|good| now.saturating_duration_since(good.at) < DNS_STALE_LIMIT)
+    }
 }
 
 /// What a request does about its host's addresses.
 #[derive(Debug)]
 enum Plan {
-    /// Uses them: they are fresh, or another request looks the host up and they still stand in.
+    /// Uses them: they are fresh, they stand in for a failed lookup until the next is due, or
+    /// another request looks the host up.
     Use(ResolvedSocketAddrs),
-    /// Looks the host up, with the last addresses to stand in if the lookup fails.
-    LookUp(Option<Looked>),
+    /// Fails as the last lookup did, which failed with no addresses to stand in, until the next
+    /// lookup is due.
+    Fail(Failure),
+    /// Looks the host up as lookup `id`, with the addresses that stand in if it fails.
+    LookUp(Option<Good>),
 }
 
-/// The plan of a request at `now`, given its host's last lookup, which it marks as being looked
-/// up when the request is to look it up.
-fn plan(last: Option<&mut Looked>, now: Instant) -> Plan {
-    match last {
-        Some(last) if now < last.next || (last.looking && stands_in(last, now)) => {
-            Plan::Use(last.addrs.clone())
+/// The plan of a request at `now`, given what the cache knows of its host, which the request
+/// marks as being looked up (as lookup `id`) when it is to look the host up.
+fn plan(entry: &mut Entry, now: Instant, id: u64) -> Plan {
+    let stand_in = entry.stand_in(now).cloned();
+    match (stand_in, entry.failed) {
+        (Some(good), _) if now < entry.next || entry.looking.is_some() => Plan::Use(good.addrs),
+        (None, Some(failure)) if now < entry.next => Plan::Fail(failure),
+        (stand_in, _) => {
+            entry.looking = Some(id);
+            Plan::LookUp(stand_in)
         }
-        Some(last) => {
-            last.looking = true;
-            Plan::LookUp(Some(last.clone()))
-        }
-        None => Plan::LookUp(None),
     }
 }
 
-/// Whether the host's last addresses stand in for a lookup at `now`: within [`DNS_STALE_LIMIT`]
-/// of the last successful lookup.
-fn stands_in(last: &Looked, now: Instant) -> bool {
-    now.saturating_duration_since(last.at) < DNS_STALE_LIMIT
+/// When the next lookup is due after one that failed at `now` with `good` standing in: after
+/// [`DNS_RETRY`], and no later than the stale limit of `good`.
+fn retry_at(good: &Good, now: Instant) -> Instant {
+    let retry = now.checked_add(DNS_RETRY).unwrap_or(now);
+    let stale = good.at.checked_add(DNS_STALE_LIMIT).unwrap_or(good.at);
+    retry.min(stale)
 }
 
-/// When the next lookup is due after one failed at `now` and `last` stood in: after
-/// [`DNS_RETRY`], and no later than its stale limit.
-fn retry_at(last: &Looked, now: Instant) -> Instant {
-    let retry = now.checked_add(DNS_RETRY).unwrap_or(now);
-    let stale = last.at.checked_add(DNS_STALE_LIMIT).unwrap_or(last.at);
-    retry.min(stale)
+/// When the next lookup is due after a connection to the host's addresses failed at `now`: at
+/// once, but no sooner than [`DNS_RETRY`] after the last lookup ended, and no later than it was.
+fn due_at(entry: &Entry, now: Instant) -> Instant {
+    let floor = entry.ended.checked_add(DNS_RETRY).unwrap_or(entry.ended);
+    entry.next.min(now.max(floor))
 }
 
 /// The agents' resolver: ureq's own, behind a cache of each host's addresses ([`DNS_FRESH`]),
 /// whose last addresses also stand in for failed lookups ([`DNS_STALE_LIMIT`], [`DNS_RETRY`]), one
-/// lookup at a time per host (see the module). An IP address needs no lookup and is never cached.
-/// Every failure it returns is [`NotSent`]. Clones share one cache.
+/// lookup at a time per host while they do (see the module). A lookup that failed with none to
+/// stand in fails the host's requests until the next is due, after [`DNS_RETRY`]. An IP address
+/// needs no lookup and is never cached. Every failure it returns is [`NotSent`]. Clones share one
+/// cache.
 #[derive(Debug)]
 pub(crate) struct Resolver<R = DefaultResolver>(Arc<Cache<R>>);
 
 #[derive(Debug)]
 struct Cache<R> {
     inner: R,
-    /// Each host's last successful lookup, by host and port.
-    hosts: Mutex<HashMap<String, Looked>>,
+    /// What the cache knows of each host, by host and port.
+    hosts: Mutex<HashMap<String, Entry>>,
+    /// Numbers the lookups.
+    lookups: AtomicU64,
 }
 
 impl<R> Clone for Resolver<R> {
@@ -184,36 +246,53 @@ impl<R> Resolver<R> {
         Resolver(Arc::new(Cache {
             inner,
             hosts: Mutex::new(HashMap::new()),
+            lookups: AtomicU64::new(0),
         }))
     }
 
-    fn hosts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Looked>> {
+    fn hosts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
         self.0.hosts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Makes the lookup of `uri`'s host due and keeps its addresses: a connection to them failed,
-    /// so the endpoint may have moved.
+    /// Moves every host's lookups `by` into the past, for tests of what follows a lookup's retry.
+    #[cfg(test)]
+    pub(crate) fn backdate(&self, by: Duration) {
+        let back = |at: Instant| at.checked_sub(by).unwrap_or(at);
+        for entry in self.hosts().values_mut() {
+            entry.ended = back(entry.ended);
+            entry.next = back(entry.next);
+            if let Some(good) = entry.good.as_mut() {
+                good.at = back(good.at);
+            }
+        }
+    }
+
+    /// Makes the lookup of `uri`'s host due (`due_at`) and keeps its addresses: a connection to
+    /// them failed, so the endpoint may have moved.
     fn due(&self, uri: &Uri) {
         let Some(host) = host(uri) else {
             return;
         };
-        if let Some(last) = self.hosts().get_mut(&host) {
-            last.next = Instant::now();
+        if let Some(entry) = self.hosts().get_mut(&host) {
+            entry.next = due_at(entry, Instant::now());
         }
     }
 }
 
-/// A request's lookup of `host`: ends it in the cache, however the lookup ends, so that another
-/// request may look the host up.
+/// A request's lookup of `host`, as lookup `id`: ends the mark in the cache however the lookup
+/// ends, unless another request looks the host up since.
 struct Looking<'a, R> {
     resolver: &'a Resolver<R>,
     host: &'a str,
+    id: u64,
 }
 
 impl<R> Drop for Looking<'_, R> {
     fn drop(&mut self) {
-        if let Some(last) = self.resolver.hosts().get_mut(self.host) {
-            last.looking = false;
+        if let Some(entry) = self.resolver.hosts().get_mut(self.host)
+            && entry.looking == Some(self.id)
+        {
+            entry.looking = None;
         }
     }
 }
@@ -246,42 +325,66 @@ impl<R: ureq::unversioned::resolver::Resolver> ureq::unversioned::resolver::Reso
             return self.0.inner.resolve(uri, config, timeout).map_err(not_sent);
         };
         let now = Instant::now();
-        let last = match plan(self.hosts().get_mut(&host), now) {
-            Plan::Use(addrs) => return Ok(addrs),
-            Plan::LookUp(last) => last,
+        let id = self.0.lookups.fetch_add(1, Ordering::Relaxed);
+        let stand_in = {
+            let mut hosts = self.hosts();
+            let entry = hosts.entry(host.clone()).or_insert(Entry {
+                good: None,
+                ended: now,
+                failed: None,
+                next: now,
+                looking: None,
+            });
+            match plan(entry, now, id) {
+                Plan::Use(addrs) => return Ok(addrs),
+                Plan::Fail(failure) => return Err(not_sent(failure.error())),
+                Plan::LookUp(stand_in) => stand_in,
+            }
         };
         let _looking = Looking {
             resolver: self,
             host: &host,
+            id,
         };
-        match self.0.inner.resolve(uri, config, timeout) {
+        let looked = self.0.inner.resolve(uri, config, timeout);
+        let ended = Instant::now();
+        let mut hosts = self.hosts();
+        let Some(entry) = hosts.get_mut(&host) else {
+            return looked.map_err(not_sent);
+        };
+        entry.ended = ended;
+        match looked {
             Ok(addrs) => {
-                let at = Instant::now();
-                self.hosts().insert(host.clone(), Looked {
+                entry.good = Some(Good {
                     addrs: addrs.clone(),
-                    at,
-                    next: at.checked_add(DNS_FRESH).unwrap_or(at),
-                    looking: false,
+                    at: ended,
                 });
+                entry.failed = None;
+                entry.next = ended.checked_add(DNS_FRESH).unwrap_or(ended);
                 Ok(addrs)
             }
-            Err(e) => match last.filter(|last| stands_in(last, now)) {
-                Some(last) => {
-                    log::emit(Level::Warn, "dns_stale", &[
-                        ("host", &host),
-                        (
-                            "age_ms",
-                            &now.saturating_duration_since(last.at).as_millis(),
-                        ),
-                        ("reason", &e),
-                    ]);
-                    if let Some(entry) = self.hosts().get_mut(&host) {
-                        entry.next = retry_at(&last, Instant::now());
+            Err(e) => {
+                entry.failed = Some(Failure::of(&e));
+                match stand_in {
+                    Some(good) => {
+                        entry.next = retry_at(&good, ended);
+                        drop(hosts);
+                        log::emit(Level::Warn, "dns_stale", &[
+                            ("host", &host),
+                            (
+                                "age_ms",
+                                &ended.saturating_duration_since(good.at).as_millis(),
+                            ),
+                            ("reason", &e),
+                        ]);
+                        Ok(good.addrs)
                     }
-                    Ok(last.addrs)
+                    None => {
+                        entry.next = ended.checked_add(DNS_RETRY).unwrap_or(ended);
+                        Err(not_sent(e))
+                    }
                 }
-                None => Err(not_sent(e)),
-            },
+            }
         }
     }
 }
@@ -332,6 +435,7 @@ mod tests {
     use std::sync::PoisonError;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -344,26 +448,50 @@ mod tests {
     use super::DNS_FRESH;
     use super::DNS_RETRY;
     use super::DNS_STALE_LIMIT;
-    use super::Looked;
-    use super::Plan;
+    use super::Entry;
     use super::Resolver;
     use super::is_not_sent;
     use super::not_sent;
-    use super::plan;
-    use super::retry_at;
     use super::sent_nothing;
-    use super::stands_in;
     use super::unwrapped;
 
-    /// A resolver whose lookups answer from `answers`, one per lookup, and which counts them.
+    const URL: &str = "http://gw.test/b/s";
+    const HOST: &str = "gw.test:80";
+
+    /// How long a test waits for a lookup it expects to start: it fails, rather than hangs, when
+    /// the lookup does not.
+    const STARTS: Duration = Duration::from_secs(10);
+
+    /// One lookup's answer: addresses, a failure, or addresses once the test lets the lookup end
+    /// (`gated`).
+    #[derive(Debug)]
+    enum Answer {
+        Addr(SocketAddr),
+        Fail(ureq::Error),
+        Gated {
+            addr: SocketAddr,
+            started: mpsc::Sender<()>,
+            end: mpsc::Receiver<()>,
+        },
+    }
+
+    /// An answer of `addr` whose lookup says on the first receiver that it started, and ends when
+    /// the sender sends.
+    fn gated(addr: SocketAddr) -> (Answer, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (started, starts) = mpsc::channel();
+        let (ends, end) = mpsc::channel();
+        (Answer::Gated { addr, started, end }, starts, ends)
+    }
+
+    /// A resolver whose lookups answer from its answers in order, and which counts them.
     #[derive(Debug)]
     struct Scripted {
         lookups: AtomicUsize,
-        answers: Mutex<Vec<Result<SocketAddr, ureq::Error>>>,
+        answers: Mutex<Vec<Answer>>,
     }
 
     impl Scripted {
-        fn new(answers: Vec<Result<SocketAddr, ureq::Error>>) -> Self {
+        fn new(answers: Vec<Answer>) -> Self {
             Scripted {
                 lookups: AtomicUsize::new(0),
                 answers: Mutex::new(answers),
@@ -383,9 +511,21 @@ mod tests {
                 .answers
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .remove(0)?;
+                .remove(0);
+            let addr = match answer {
+                Answer::Addr(addr) => addr,
+                Answer::Fail(e) => return Err(e),
+                Answer::Gated { addr, started, end } => {
+                    started
+                        .send(())
+                        .map_err(|_closed| ureq::Error::ConnectionFailed)?;
+                    end.recv()
+                        .map_err(|_closed| ureq::Error::ConnectionFailed)?;
+                    addr
+                }
+            };
             let mut addrs = self.empty();
-            addrs.push(answer);
+            addrs.push(addr);
             Ok(addrs)
         }
     }
@@ -407,77 +547,201 @@ mod tests {
             .map(|addrs| addrs[0])
     }
 
-    /// Moves `host`'s last lookup `ago` into the past, and its next one due now.
-    fn age(resolver: &Resolver<Scripted>, host: &str, ago: Duration) {
+    /// A request resolving [`URL`] in a thread of its own.
+    fn in_thread(
+        resolver: &Resolver<Scripted>,
+    ) -> std::thread::JoinHandle<Result<SocketAddr, ureq::Error>> {
+        let resolver = resolver.clone();
+        std::thread::spawn(move || resolve(&resolver, URL))
+    }
+
+    fn entry(resolver: &Resolver<Scripted>) -> Entry {
+        resolver.hosts()[HOST].clone()
+    }
+
+    /// Moves the host's last lookup `ago` into the past, and its next one due now.
+    fn age(resolver: &Resolver<Scripted>, ago: Duration) {
         let mut hosts = resolver.hosts();
-        let last = hosts.get_mut(host).unwrap();
-        last.at = Instant::now().checked_sub(ago).unwrap();
-        last.next = Instant::now();
+        let entry = hosts.get_mut(HOST).unwrap();
+        let at = Instant::now().checked_sub(ago).unwrap();
+        entry.good.as_mut().unwrap().at = at;
+        entry.ended = at;
+        entry.next = Instant::now();
+    }
+
+    /// Makes the host's next lookup due now, and nothing else.
+    fn due_now(resolver: &Resolver<Scripted>) {
+        resolver.hosts().get_mut(HOST).unwrap().next = Instant::now();
     }
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, 1], port))
     }
 
+    // Requests to a host within 30 s of its lookup make no other.
     #[test]
-    fn a_lookup_serves_until_due_and_stands_in_for_failed_ones_for_10_min() {
-        let now = Instant::now();
-        let looked = |ago: Duration, next_in: Duration| Looked {
-            addrs: ResolvedSocketAddrs::from_fn(|_| addr(0)),
-            at: now.checked_sub(ago).unwrap(),
-            next: now.checked_add(next_in).unwrap(),
-            looking: false,
-        };
-        assert!(matches!(plan(None, now), Plan::LookUp(None)));
-        assert!(matches!(
-            plan(Some(&mut looked(Duration::ZERO, DNS_FRESH)), now),
-            Plan::Use(_)
-        ));
-        let mut due = looked(DNS_FRESH, Duration::ZERO);
-        assert!(matches!(plan(Some(&mut due), now), Plan::LookUp(Some(_))));
-        assert!(due.looking);
-        let almost = DNS_STALE_LIMIT.saturating_sub(Duration::from_millis(1));
-        assert!(stands_in(&looked(almost, Duration::ZERO), now));
-        assert!(!stands_in(&looked(DNS_STALE_LIMIT, Duration::ZERO), now));
+    fn requests_within_30_s_of_a_lookup_make_none() {
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Addr(addr(80)),
+            Answer::Addr(addr(81)),
+        ]));
+        for _ in 0..3 {
+            assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        }
+        assert_eq!(lookups(&resolver), 1);
+        age(&resolver, DNS_FRESH);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
+        assert_eq!(lookups(&resolver), 2);
     }
 
-    // While one request looks a host up, the others use its last addresses, which still stand in,
-    // instead of waiting for lookups of their own. Past the stale limit, they look it up too.
+    // While one request looks a host up, the host's other requests use its last addresses instead
+    // of looking it up too.
     #[test]
     fn one_request_at_a_time_looks_a_host_up() {
-        let now = Instant::now();
-        let mut looking = Looked {
-            addrs: ResolvedSocketAddrs::from_fn(|_| addr(0)),
-            at: now.checked_sub(DNS_FRESH).unwrap(),
-            next: now,
-            looking: true,
-        };
-        assert!(matches!(plan(Some(&mut looking), now), Plan::Use(_)));
-        looking.at = now.checked_sub(DNS_STALE_LIMIT).unwrap();
-        assert!(matches!(
-            plan(Some(&mut looking), now),
-            Plan::LookUp(Some(_))
-        ));
+        let (lookup, started, end) = gated(addr(81));
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Addr(addr(80)),
+            lookup,
+            Answer::Addr(addr(99)),
+        ]));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        age(&resolver, DNS_FRESH);
+        let looking = in_thread(&resolver);
+        started.recv_timeout(STARTS).unwrap();
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        assert_eq!(lookups(&resolver), 2);
+        end.send(()).unwrap();
+        assert_eq!(looking.join().unwrap().unwrap(), addr(81));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
+        assert_eq!(lookups(&resolver), 2);
     }
 
-    // A failed lookup holds the next one off for 5 s, but not past the last addresses' stale
-    // limit.
+    // Requests that find no addresses look the host up each. When one of their lookups ends while
+    // another runs, the host stays marked as looked up by the other, so a request when the next
+    // lookup is due uses the addresses found instead of looking it up a third time.
     #[test]
-    fn a_failed_lookup_holds_the_next_off_until_the_stale_limit_at_most() {
-        let now = Instant::now();
-        let looked = |ago: Duration| Looked {
-            addrs: ResolvedSocketAddrs::from_fn(|_| addr(0)),
-            at: now.checked_sub(ago).unwrap(),
-            next: now,
-            looking: true,
-        };
-        let early = looked(DNS_FRESH);
-        assert_eq!(retry_at(&early, now), now.checked_add(DNS_RETRY).unwrap());
-        let late = looked(DNS_STALE_LIMIT.saturating_sub(Duration::from_secs(1)));
-        assert_eq!(
-            retry_at(&late, now),
-            late.at.checked_add(DNS_STALE_LIMIT).unwrap()
+    fn a_lookup_that_ends_leaves_the_host_marked_while_another_runs() {
+        let (first, first_started, first_end) = gated(addr(81));
+        let (second, second_started, second_end) = gated(addr(82));
+        let resolver = Resolver::new(Scripted::new(vec![first, second, Answer::Addr(addr(99))]));
+        let first_request = in_thread(&resolver);
+        first_started.recv_timeout(STARTS).unwrap();
+        let second_request = in_thread(&resolver);
+        second_started.recv_timeout(STARTS).unwrap();
+        first_end.send(()).unwrap();
+        assert_eq!(first_request.join().unwrap().unwrap(), addr(81));
+        due_now(&resolver);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
+        assert_eq!(lookups(&resolver), 2);
+        second_end.send(()).unwrap();
+        assert_eq!(second_request.join().unwrap().unwrap(), addr(82));
+        due_now(&resolver);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(99));
+        assert_eq!(lookups(&resolver), 3);
+    }
+
+    // A lookup that fails while the host's last addresses stand in serves them, with no other
+    // lookup until the retry is due, and then the host is looked up again.
+    #[test]
+    fn a_failed_lookup_uses_the_last_addresses_until_the_retry() {
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Addr(addr(80)),
+            Answer::Fail(ureq::Error::Timeout(ureq::Timeout::Resolve)),
+            Answer::Addr(addr(81)),
+        ]));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        age(&resolver, DNS_FRESH);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        assert_eq!(lookups(&resolver), 2);
+        let next = entry(&resolver).next;
+        assert!(next > Instant::now() && next <= Instant::now().checked_add(DNS_RETRY).unwrap());
+        due_now(&resolver);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
+        assert_eq!(lookups(&resolver), 3);
+    }
+
+    // Near the stale limit, a failed lookup holds the next one off no longer than the limit.
+    #[test]
+    fn a_failed_lookup_near_the_stale_limit_holds_the_next_off_no_longer() {
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Addr(addr(80)),
+            Answer::Fail(ureq::Error::Timeout(ureq::Timeout::Resolve)),
+        ]));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        age(
+            &resolver,
+            DNS_STALE_LIMIT.saturating_sub(Duration::from_secs(1)),
         );
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        let entry = entry(&resolver);
+        let limit = entry
+            .good
+            .as_ref()
+            .unwrap()
+            .at
+            .checked_add(DNS_STALE_LIMIT)
+            .unwrap();
+        assert!(entry.next <= limit, "{:?} past {:?}", entry.next, limit);
+    }
+
+    // Past the stale limit, a failed lookup fails as never sent.
+    #[test]
+    fn a_failed_lookup_past_the_stale_limit_fails_as_never_sent() {
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Addr(addr(80)),
+            Answer::Fail(ureq::Error::HostNotFound),
+        ]));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        age(&resolver, DNS_STALE_LIMIT);
+        let e = resolve(&resolver, URL).unwrap_err();
+        assert!(matches!(sent_nothing(e), (ureq::Error::HostNotFound, true)));
+    }
+
+    // A lookup that fails with no addresses to stand in fails the host's requests as it did until
+    // the next lookup is due, with no lookup of theirs.
+    #[test]
+    fn a_failed_lookup_with_no_addresses_fails_the_host_until_the_retry() {
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Fail(ureq::Error::Timeout(ureq::Timeout::Resolve)),
+            Answer::Fail(ureq::Error::HostNotFound),
+            Answer::Addr(addr(80)),
+        ]));
+        for _ in 0..2 {
+            let e = resolve(&resolver, URL).unwrap_err();
+            assert!(is_not_sent(&e), "{e}");
+            assert!(matches!(
+                sent_nothing(e),
+                (ureq::Error::Timeout(ureq::Timeout::Resolve), true)
+            ));
+        }
+        assert_eq!(lookups(&resolver), 1);
+        due_now(&resolver);
+        let e = resolve(&resolver, URL).unwrap_err();
+        assert!(matches!(sent_nothing(e), (ureq::Error::HostNotFound, true)));
+        due_now(&resolver);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        assert_eq!(lookups(&resolver), 3);
+    }
+
+    // A failed connection makes the host's lookup due, but no sooner than 5 s after the last
+    // lookup, and keeps its addresses to stand in for a lookup that fails.
+    #[test]
+    fn a_failed_connection_makes_the_lookup_due_after_the_retry_and_keeps_the_addresses() {
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Addr(addr(80)),
+            Answer::Fail(ureq::Error::Timeout(ureq::Timeout::Resolve)),
+        ]));
+        let uri: Uri = URL.parse().unwrap();
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        resolver.due(&uri);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        assert_eq!(lookups(&resolver), 1);
+        resolver.hosts().get_mut(HOST).unwrap().ended =
+            Instant::now().checked_sub(DNS_RETRY).unwrap();
+        resolver.due(&uri);
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        assert_eq!(lookups(&resolver), 2);
     }
 
     // A failure is wrapped once, however many times it passes a marking resolver or connector (a
@@ -495,85 +759,29 @@ mod tests {
         ));
     }
 
-    // A failed connection makes its host's lookup due, so a moved endpoint is looked up again at
-    // the next attempt.
-    #[test]
-    fn a_failed_connection_makes_the_lookup_due() {
-        let resolver = Resolver::new(Scripted::new(vec![Ok(addr(80)), Ok(addr(81))]));
-        assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(80));
-        resolver.due(&"http://gw.test/b/s".parse::<Uri>().unwrap());
-        assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(81));
-        assert_eq!(lookups(&resolver), 2);
-    }
-
-    // Requests to a host within 30 s of its lookup make no other.
-    #[test]
-    fn requests_within_30_s_of_a_lookup_make_none() {
-        let resolver = Resolver::new(Scripted::new(vec![Ok(addr(80)), Ok(addr(81))]));
-        for _ in 0..3 {
-            assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(80));
-        }
-        assert_eq!(lookups(&resolver), 1);
-        age(&resolver, "gw.test:80", DNS_FRESH);
-        assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(81));
-        assert_eq!(lookups(&resolver), 2);
-    }
-
-    // A lookup that times out (`Timeout::Resolve`) or finds no host fails as never sent while the
-    // host has no addresses, and later serves its last addresses within 10 min of their lookup,
-    // without another lookup for 5 s.
-    #[test]
-    fn a_failed_lookup_uses_the_last_addresses_for_10_min_then_fails_as_never_sent() {
-        let resolver = Resolver::new(Scripted::new(vec![
-            Err(ureq::Error::Timeout(ureq::Timeout::Resolve)),
-            Ok(addr(80)),
-            Err(ureq::Error::Timeout(ureq::Timeout::Resolve)),
-            Err(ureq::Error::HostNotFound),
-        ]));
-        let e = resolve(&resolver, "http://gw.test/b/s").unwrap_err();
-        assert!(is_not_sent(&e), "{e}");
-        assert!(matches!(
-            sent_nothing(e),
-            (ureq::Error::Timeout(ureq::Timeout::Resolve), true)
-        ));
-        assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(80));
-        age(&resolver, "gw.test:80", DNS_FRESH);
-        assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(80));
-        assert_eq!(lookups(&resolver), 3);
-        // The failed lookup holds the next one off for DNS_RETRY.
-        let next = resolver.hosts().get("gw.test:80").unwrap().next;
-        assert!(next > Instant::now() && next <= Instant::now().checked_add(DNS_RETRY).unwrap());
-        assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(80));
-        assert_eq!(lookups(&resolver), 3);
-        age(&resolver, "gw.test:80", DNS_STALE_LIMIT);
-        let e = resolve(&resolver, "http://gw.test/b/s").unwrap_err();
-        assert!(matches!(sent_nothing(e), (ureq::Error::HostNotFound, true)));
-        assert_eq!(lookups(&resolver), 4);
-    }
-
     // An IP address is never cached, and each scheme's port of a host is its own entry: `https://`
     // without a port is port 443, not 80.
     #[test]
     fn ip_addresses_pass_through_and_ports_are_separate_hosts() {
         let resolver = Resolver::new(Scripted::new(vec![
-            Ok(addr(1)),
-            Ok(addr(2)),
-            Ok(addr(3)),
-            Ok(addr(4)),
-            Ok(addr(5)),
+            Answer::Addr(addr(1)),
+            Answer::Addr(addr(2)),
+            Answer::Addr(addr(3)),
+            Answer::Addr(addr(4)),
+            Answer::Addr(addr(5)),
         ]));
         assert_eq!(
             resolve(&resolver, "http://127.0.0.1:9/b/s").unwrap(),
             addr(1)
         );
         assert_eq!(resolve(&resolver, "http://[::1]:9/b/s").unwrap(), addr(2));
-        assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(3));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(3));
         assert_eq!(resolve(&resolver, "https://gw.test/b/s").unwrap(), addr(4));
         assert_eq!(
             resolve(&resolver, "http://gw.test:8080/b/s").unwrap(),
             addr(5)
         );
-        assert_eq!(resolve(&resolver, "http://gw.test/b/s").unwrap(), addr(3));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(3));
         assert_eq!(
             resolve(&resolver, "https://gw.test:443/b/s").unwrap(),
             addr(4)

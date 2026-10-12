@@ -227,7 +227,7 @@ pub fn run(args: &CadenceArgs, sink: &mut Sink) -> Result<Outcome> {
                 .collect::<Vec<_>>();
             let plan = cadence.plan(&progress, args.max_groups_per_tick);
             max_node_log = max_node_log.max(plan.node_log_bytes);
-            if plan.pressure {
+            if plan.pressure.is_pressure() {
                 pressure_ticks = pressure_ticks.saturating_add(1);
             }
             for index in plan.groups {

@@ -156,7 +156,7 @@ backend = "s3"
         );
         assert_eq!(config.storage.cold.backend, ColdBackend::S3);
         assert_eq!(config.storage.snapshot.backend, RaftSnapshotBackend::S3);
-        assert_eq!(config.raft.snapshot_build_max_concurrency, 1);
+        assert_eq!(config.raft.snapshot_build_max_concurrency, 4);
         assert_eq!(
             config.storage.cold.s3.as_ref().unwrap().bucket,
             Some("my-bucket".into())

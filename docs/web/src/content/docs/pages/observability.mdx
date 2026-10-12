@@ -143,6 +143,18 @@ Free-space admission is reported separately as `wal_available_bytes`, its two
 watermarks, `wal_disk_pressure`, and `wal_disk_stat_errors`. These are bounded
 per-node, per-core and per-group series.
 
+For the snapshot driver, the JSON snapshot includes the node's unsnapshotted
+Raft log and the most it has held (`raft_log_bytes`,
+`raft_log_bytes_high_watermark`), its pressure level against
+`raft.snapshot_log_budget` (`raft_snapshot_pressure_level`: 0 below three
+quarters of the budget, 1 up to the budget, 2 past it), the snapshot builds a
+pass keeps in flight at that level (`raft_snapshot_pressure_builds`), and the
+builds that run now and the most that ran at once
+(`raft_snapshot_builds_in_flight`, `raft_snapshot_builds_in_flight_max`). Its
+pressure passes that planned a build add up in `raft_snapshot_pressure_passes`,
+the builds they started in `raft_snapshot_pressure_groups`, and their time in
+`raft_snapshot_pressure_pass_ns`.
+
 The OTLP collection interval defaults to 60s. For a quick check, shorten it so
 readings arrive without waiting (and without relying on the shutdown flush):
 

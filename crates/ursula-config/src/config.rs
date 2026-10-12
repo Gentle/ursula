@@ -183,7 +183,12 @@ pub struct RaftConfig {
     pub install_snapshot_timeout: HumanDuration,
     /// Consecutive gRPC RPC failures before forcing a transport reconnect.
     pub grpc_reconnect_after_failures: usize,
-    /// Max concurrent snapshot builds across all groups on this node.
+    /// Max concurrent snapshot builds across all groups on this node. Each
+    /// build holds a copy of its group's state and runs its snapshot-store
+    /// requests one after another. The snapshot driver builds one group at a
+    /// time while the node's log stays below `snapshot_log_budget`, and past
+    /// it more, in even steps up to this many before the hard limit (twice
+    /// the budget).
     pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,
@@ -193,14 +198,19 @@ pub struct RaftConfig {
     /// bytes instead (`snapshot_log_budget`).
     pub snapshot_logs_since_last: u64,
     /// Maximum groups snapshotted by one driver tick, including pressure
-    /// passes.
+    /// passes, while the node's log is below `snapshot_log_budget`. Past it
+    /// a pass starts this many for each build it keeps in flight, so it
+    /// lasts about as long.
     pub snapshot_pressure_max_groups_per_tick: usize,
     /// Node log-byte budget of the snapshot driver (bounded-stream-state
     /// F12e). A group snapshots once the log it applied since its last
     /// snapshot reaches `max(F, 2 × that snapshot's size)`, where the floor
-    /// `F` is this budget divided by twice the group count, at most 16 MiB;
-    /// once the node's groups hold three quarters of the budget, a pressure
-    /// pass snapshots the groups that free the most log per snapshot byte.
+    /// `F` is this budget divided by twice the group count, at most 16 MiB.
+    /// Once the node's groups hold three quarters of the budget, a pressure
+    /// pass snapshots the groups with the most log first, and past the
+    /// budget it runs more builds at once (`snapshot_build_max_concurrency`).
+    /// Over twice the budget, the hard limit, the node refuses client writes
+    /// with a body until its log is below one and a half budgets.
     pub snapshot_log_budget: HumanSize,
     /// Far backstop of the snapshot driver: applied entries since a group's
     /// last snapshot after which it snapshots whatever its log bytes.
@@ -229,7 +239,7 @@ impl Default for RaftConfig {
             install_snapshot_timeout: HumanDuration::sec(120),
             append_transport_budget_bytes: 128 * 1024 * 1024,
             grpc_reconnect_after_failures: 8,
-            snapshot_build_max_concurrency: 1,
+            snapshot_build_max_concurrency: 4,
             snapshot_install_max_concurrency: 1,
             snapshot_logs_since_last: 5_000,
             snapshot_pressure_max_groups_per_tick: 16,

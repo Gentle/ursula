@@ -173,6 +173,7 @@ pub use engine::in_memory::next_repair_cursor;
 pub use engine::in_memory::repair_cold_index_response;
 pub use error::ErrorStatus;
 pub use error::RuntimeError;
+pub use metrics::RaftLogPressureSample;
 pub use metrics::RuntimeMailboxSnapshot;
 pub use metrics::RuntimeMetrics;
 pub use metrics::RuntimeMetricsSnapshot;

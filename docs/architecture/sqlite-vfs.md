@@ -118,9 +118,10 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   unknown outcome. Such an attempt is retried like an unknown outcome but leaves the commit's
   outcome as it was. A commit none of whose attempts can have reached the stream fails alone: at
   once on a 402 or a vouched final answer (a 4xx), and when the budget runs out on the retried ones
-  (401, 429, a vouched 5xx, an attempt that never went out). The write fails with `SQLITE_IOERR_AUTH` (an extended code SQLite reserves
-  for extensions), SQLite rolls the transaction back and nothing of it reaches the local WAL, as
-  above, but the database is not poisoned. Reads go on from the local files. The owner keeps its
+  (401, 429, a vouched 5xx, an attempt that never went out). The write fails with
+  `SQLITE_IOERR_AUTH` (an extended code SQLite reserves for extensions), SQLite rolls the
+  transaction back and nothing of it reaches the local WAL, as above, but the database is not
+  poisoned. Reads go on from the local files. The owner keeps its
   epoch, producer sequence and offset, so the next commit is sent as usual, with the sequence the
   refused append never used, and is acknowledged once the refusals stop, without a new attach.
   `ursula_status` reports `writes_refused`, with `refused_kind` (`payment_required`,
@@ -716,17 +717,20 @@ What attach does in each case:
 - Network partition or slow server, where an attempt went out on a connection and got no answer
   (a reset, a timeout waiting for the answer): its outcome is unknown, so commits block up to the
   retry budget, then poison, unless a later attempt's answer settles it. An attach that fails after
-  step 1 leaves a file with a sidecar refusing opens until an attach succeeds (§1, §3); a file
+  step 1 leaves a file with a sidecar refusing opens until an attach succeeds (§1, §3). A file
   whose first attach failed before writing its sidecar (the server unreachable, for example) is
   still a plain file and passes through.
-- DNS: the client looks a host up at most every 30 s (`net::DNS_FRESH`), so a request on a pooled
-  connection makes no query, and while lookups fail it keeps using the host's last addresses for up
-  to 10 minutes after the last successful lookup (`net::DNS_STALE_LIMIT`), with one lookup at most
-  every 5 s meanwhile (`net::DNS_RETRY`, logged as `dns_stale`). A DNS outage shorter than that
-  costs nothing. Past it, attempts fail before they go out, and commits fail alone as
-  `unreachable` (above). Before 0.7.4 every request looked its host up, a pooled connection's
-  included, and an outage of 30 s or more poisoned the databases of every owner whose commits met
-  it.
+- DNS: the client looks a host up at most once every 30 s (`net::DNS_FRESH`), by one request at a
+  time. ureq looks a host up before it takes a pooled connection, so that request waits for the
+  lookup, up to the resolve timeout of 5 s, even when a pooled connection is ready, while the
+  host's other requests go on with its last addresses. While lookups fail, the client keeps using
+  the host's last addresses for up to 10 minutes after the last successful lookup
+  (`net::DNS_STALE_LIMIT`), with one lookup every 5 s meanwhile (`net::DNS_RETRY`, logged as
+  `dns_stale`), and a failed connection makes the next attempt look the host up again. So a DNS
+  outage shorter than 10 minutes delays one request per host by up to 5 s every 5 s, and fails
+  nothing. Past it, attempts fail before they go out, and commits fail alone as `unreachable`
+  (above). Before 0.7.4 every request looked its host up, a pooled connection's included, and an
+  outage of 30 s or more poisoned the databases of every owner whose commits met it.
 - A server that refuses writes for a while (its Raft log over its hard limit under sustained
   write load, its WAL disk full) marks its refusals `x-ursula-not-applied`. So does a gateway that
   refuses a request before it forwards it, such as one whose token issuer is down for a few
@@ -892,10 +896,11 @@ The crate refuses to build with `panic = "abort"`.
   from 0.7.3, §2) and with a poison otherwise. A token sent over `http://` to a host that is not
   loopback is logged once (`token_in_clear`). The SQL functions are direct-only: a trigger or view
   of an untrusted database cannot call them.
-- A host's addresses are looked up through the system's resolver at most every 30 s per process
-  (§6), so a stream whose endpoint moves to new addresses is reached there within 30 s, and a
-  pooled connection keeps the old address until it closes. While lookups fail, the last addresses
-  serve for up to 10 minutes after the last successful lookup.
+- A host's addresses are looked up through the system's resolver at most once every 30 s per
+  process (§6), so a stream whose endpoint moves to new addresses is reached there within 30 s, or
+  at the attempt after a connection to an old address failed, and a pooled connection keeps the old
+  address until it closes. While lookups fail, the last addresses serve for up to 10 minutes after
+  the last successful lookup.
 - Appends, reads and `HEAD`s keep a connection for 90 s after its last request
   (`URSULA_VFS_IDLE_MS`, ureq's default is 15 s), so a writer that commits every 15 to 90 s reuses
   its connection instead of opening a new TCP and TLS connection per commit, which behind a reverse

@@ -467,10 +467,10 @@ impl WriteRefusal {
     }
 
     /// How the write came to apply nothing, for an error's message: refused by a layer in front of
-    /// the stream, or never sent.
+    /// the stream, or its last attempt never sent (earlier ones may have been refused).
     pub(crate) fn how(&self) -> &'static str {
         match self {
-            WriteRefusal::Unreachable { .. } => "no attempt reached the stream's endpoint",
+            WriteRefusal::Unreachable { .. } => "its last attempt failed before it went out",
             _ => "a layer in front of the stream refused it",
         }
     }

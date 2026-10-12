@@ -73,6 +73,8 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -H "conten
 
 ```
 
+The snapshot endpoint answers once the group has a snapshot of everything it had applied when the request arrived. It waits while a build of the group runs or other snapshot builds hold all of the node's build permits, and answers `503` with `Retry-After: 1` when no build of the group can start within 10 seconds (see [Manually trigger a snapshot](/docs/troubleshooting#manually-trigger-a-snapshot)).
+
 The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter. This is why `ursulactl` is the safer way to chain these calls: it consults metrics first.
 
 The group leader keeps every group at its configured voters: if the membership endpoint drops a configured voter, the leader adds it back as a learner and promotes it again once it has caught up (see [Recovering after a host crash](#recovering-after-a-host-crash)). Membership changes are for repair, not for shrinking a group.

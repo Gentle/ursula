@@ -116,7 +116,7 @@ export interface AttachStatus {
 	readonly reason: string | null;
 	/** Attached with `{ readOnly: true }`: nothing is ever appended, and every write fails with SQLITE_READONLY. */
 	readonly read_only: boolean;
-	/** The latest refusal that a layer in front of the stream answered is a `402 Payment Required` (a commit failed with {@link UrsulaPaymentRequiredError}, or a snapshot waits). It does not poison the file, and the next acknowledged commit clears it. A transaction refused as `too_large`, never sent or refused by a limit in front, leaves it as it was: it says nothing about other writes. Always `false` while `poisoned`, since a poisoned file needs a re-attach whatever the layer does. */
+	/** The latest refusal that a layer in front of the stream answered is a `402 Payment Required` (a commit failed with {@link UrsulaPaymentRequiredError}, or a snapshot waits). It does not poison the file, and the next acknowledged commit clears it. A transaction refused as `too_large`, never sent or refused by a limit in front, and a commit that was `unreachable` leave it as it was: they say nothing about the layer's answer to other writes. Always `false` while `poisoned`, since a poisoned file needs a re-attach whatever the layer does. */
 	readonly payment_required: boolean;
 	/** The layer's explanation: the `402` response's body (its first 256 bytes, then `...` when it is longer), or the token of `x-ursula-not-applied` when the body is empty (`null` when it sent neither, or without a refusal). */
 	readonly payment_reason: string | null;
@@ -124,7 +124,7 @@ export interface AttachStatus {
 	readonly writes_refused?: boolean;
 	/** What refused the latest write (see {@link WriteRefusedKind}); `null` without a refusal. Absent with an extension before 0.7.3. */
 	readonly refused_kind?: WriteRefusedKind | null;
-	/** Why: the refusing layer's response body (its first 256 bytes, then `...` when it is longer), or the token of `x-ursula-not-applied` (such as `RaftLogPressure`) when the body is empty, and always for `not_applied`. For `too_large`, the frame's size and the limit (such as `41943104-byte frame over the 33554432-byte frame limit`), or the token of a `413` from a limit in front. `null` when the layer sent neither, or without a refusal. Absent with an extension before 0.7.3. */
+	/** Why: the refusing layer's response body (its first 256 bytes, then `...` when it is longer), or the token of `x-ursula-not-applied` (such as `RaftLogPressure`) when the body is empty, and always for `not_applied`. For `too_large`, the frame's size and the limit (such as `41943104-byte frame over the 33554432-byte frame limit`), or the token of a `413` from a limit in front. For `unreachable`, the last attempt's failure (such as `timeout: resolve`). `null` when the layer sent neither, or without a refusal. Absent with an extension before 0.7.3. */
 	readonly refused_reason?: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
 	readonly snapshot: StreamOffset;

@@ -59,7 +59,8 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   a commit that starts a new WAL generation, once per WAL wrap (§6).
 - **Outcome unknown** (timeout, connection loss, a `307`, a 5xx without a vouched
   `x-ursula-not-applied`, below): retried with the same sequence until the server answers, for up to
-  `URSULA_VFS_RETRY_MS` (30 s). The server deduplicates.
+  `URSULA_VFS_RETRY_MS` (30 s). The server deduplicates. A failure before any connection carried the
+  attempt is not an unknown outcome (below).
 - **Redirects** are never followed, by any request. Followed, a request would go out without the
   token (the HTTP client drops it on every redirect), and a `301`, `302` or `303` would turn an
   append into a `GET`. A `307` keeps the method and the body, and says that the request belongs
@@ -109,19 +110,26 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   it applied its redirect rule (below) to their marker. It removes any vouch that comes from
   upstream before it adds its own, and the server never sets one. So the marker counts only behind
   a gateway of 0.7.3 or later. Without a gateway, or behind an older one, only a 401, 402 or 429
-  counts. A commit none of whose attempts can have reached the stream fails alone: at once on a
-  402 or a vouched final answer (a 4xx), and when the budget runs out on the retried ones (401,
-  429, a vouched 5xx). The write fails with `SQLITE_IOERR_AUTH` (an extended code SQLite reserves
+  counts. From 0.7.4 an attempt that failed before any byte of it went out applied nothing too: its
+  host did not resolve, or no connection to it was made, the TLS handshake included. The client's
+  resolver and connector mark the failures they return (`net::NotSent`), so this is decided by
+  where the failure happened, not by its kind: the same I/O errors also come from connections that
+  carried a request, and a failure on a connection that was made, a pooled one included, stays an
+  unknown outcome. Such an attempt is retried like an unknown outcome but leaves the commit's
+  outcome as it was. A commit none of whose attempts can have reached the stream fails alone: at
+  once on a 402 or a vouched final answer (a 4xx), and when the budget runs out on the retried ones
+  (401, 429, a vouched 5xx, an attempt that never went out). The write fails with `SQLITE_IOERR_AUTH` (an extended code SQLite reserves
   for extensions), SQLite rolls the transaction back and nothing of it reaches the local WAL, as
   above, but the database is not poisoned. Reads go on from the local files. The owner keeps its
   epoch, producer sequence and offset, so the next commit is sent as usual, with the sequence the
   refused append never used, and is acknowledged once the refusals stop, without a new attach.
   `ursula_status` reports `writes_refused`, with `refused_kind` (`payment_required`,
   `unauthorized`, `forbidden`, `rate_limited`, `not_applied` for any status but 401, 402, 403, 413
-  and 429, or `too_large` for a commit too large for one request, §7) and `refused_reason` (the
-  refusing layer's response body, its first 256 bytes followed by `...` when it is longer, or the
-  marker's value when the body is empty, and always the marker's value for `not_applied`, and for
-  `too_large` the frame's size and limit, or the marker's value of the 413), until a commit is
+  and 429, `too_large` for a commit too large for one request, §7, or `unreachable` when the last
+  attempt never went out) and `refused_reason` (the refusing layer's response body, its first 256
+  bytes followed by `...` when it is longer, or the marker's value when the body is empty, and
+  always the marker's value for `not_applied`, for `too_large` the frame's size and limit, or the
+  marker's value of the 413, and for `unreachable` the last attempt's failure), until a commit is
   acknowledged or the database is poisoned (it then needs an attach whatever the layer does). A 402
   also shows in `payment_required` and `payment_reason`, its fields since 0.7.1. The extension logs
   `writes_refused` (`payment_required` for a 402) when refusals of a kind start, and
@@ -700,10 +708,25 @@ What attach does in each case:
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).
-- Network partition or slow server: commits block up to the retry budget, then poison. An attach
-  that fails after step 1 leaves a file with a sidecar refusing opens until an attach succeeds
-  (§1, §3); a file whose first attach failed before writing its sidecar (the server unreachable,
-  for example) is still a plain file and passes through.
+- An endpoint that cannot be reached at all, for every attempt (its host does not resolve, its
+  connections are refused or time out, the TLS handshake fails): commits block up to the retry
+  budget, then fail alone with `SQLITE_IOERR_AUTH` and `refused_kind` `unreachable`. Nothing of
+  them went out, so the database is not poisoned, and the first commit after the endpoint is back
+  succeeds, with no attach (§2). Before 0.7.4 such commits poisoned.
+- Network partition or slow server, where an attempt went out on a connection and got no answer
+  (a reset, a timeout waiting for the answer): its outcome is unknown, so commits block up to the
+  retry budget, then poison, unless a later attempt's answer settles it. An attach that fails after
+  step 1 leaves a file with a sidecar refusing opens until an attach succeeds (§1, §3); a file
+  whose first attach failed before writing its sidecar (the server unreachable, for example) is
+  still a plain file and passes through.
+- DNS: the client looks a host up at most every 30 s (`net::DNS_FRESH`), so a request on a pooled
+  connection makes no query, and while lookups fail it keeps using the host's last addresses for up
+  to 10 minutes after the last successful lookup (`net::DNS_STALE_LIMIT`), with one lookup at most
+  every 5 s meanwhile (`net::DNS_RETRY`, logged as `dns_stale`). A DNS outage shorter than that
+  costs nothing. Past it, attempts fail before they go out, and commits fail alone as
+  `unreachable` (above). Before 0.7.4 every request looked its host up, a pooled connection's
+  included, and an outage of 30 s or more poisoned the databases of every owner whose commits met
+  it.
 - A server that refuses writes for a while (its Raft log over its hard limit under sustained
   write load, its WAL disk full) marks its refusals `x-ursula-not-applied`. So does a gateway that
   refuses a request before it forwards it, such as one whose token issuer is down for a few
@@ -864,6 +887,10 @@ The crate refuses to build with `panic = "abort"`.
   from 0.7.3, §2) and with a poison otherwise. A token sent over `http://` to a host that is not
   loopback is logged once (`token_in_clear`). The SQL functions are direct-only: a trigger or view
   of an untrusted database cannot call them.
+- A host's addresses are looked up through the system's resolver at most every 30 s per process
+  (§6), so a stream whose endpoint moves to new addresses is reached there within 30 s, and a
+  pooled connection keeps the old address until it closes. While lookups fail, the last addresses
+  serve for up to 10 minutes after the last successful lookup.
 - Appends, reads and `HEAD`s keep a connection for 90 s after its last request
   (`URSULA_VFS_IDLE_MS`, ureq's default is 15 s), so a writer that commits every 15 to 90 s reuses
   its connection instead of opening a new TCP and TLS connection per commit, which behind a reverse

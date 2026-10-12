@@ -361,7 +361,7 @@ A server marks a `200 OK` response with:
 Stream-Immutable: true
 ```
 
-when every later request for the same URL that succeeds receives the same body and the same `Content-Type`, `ETag`, `Stream-Next-Offset`, `Stream-Incarnation`, `Stream-Closed`, `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest`. `Stream-Up-To-Date` on a snapshot read is not part of this guarantee: it describes the stream when the response was made (Section 4.4, client rules).
+when every later request for the same URL that succeeds receives the same body and the same `Content-Type`, `Stream-Next-Offset`, `Stream-Incarnation`, `Stream-Closed`, `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest`. `Stream-Up-To-Date` and `ETag` are not part of this guarantee: a later response to the same URL that ends exactly at the tail, from a replica that can prove it, carries `Stream-Up-To-Date: true` and is not marked, and its `ETag` may differ. Clients ignore `Stream-Up-To-Date` from a read origin (Section 4.4, client rules), and a cache stores only marked responses.
 
 The server MUST send it only when the request carried `incarnation` (Section 4.1) and either:
 
@@ -371,7 +371,7 @@ The server MUST send it only when the request carried `incarnation` (Section 4.1
 
 The absence of `Stream-Up-To-Date` alone does not make a response immutable: a replica that cannot prove it holds the tail answers without it, and its read may end where its own data ends. A read that returned all it asked for ended at its bound, not at the replica's data.
 
-Closing a stream MUST NOT change the `ETag` of a response that ends below the tail, since closure is visible only at the tail.
+Closing a stream MUST NOT change the `ETag` of a marked response that ends below the tail, since closure is visible only at the tail.
 
 The server SHOULD send it whenever these hold.
 

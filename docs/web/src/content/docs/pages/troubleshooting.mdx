@@ -229,7 +229,8 @@ reach the limit, the node's metrics show how far the log got
 (`raft_log_bytes_high_watermark`), whether the driver used every build
 (`raft_snapshot_builds_in_flight_max`), and how long a build's upload takes
 (`raft_snapshot_build_ns` over `raft_snapshot_builds`). If every build was in
-use, raise `raft.snapshot_build_max_concurrency` or the budget.
+use, raise `raft.snapshot_build_max_concurrency` (the chart's
+`raft.snapshotBuildMaxConcurrency`) or the budget.
 
 `IngressBodyBytesLimitReached` means the write bodies in flight on the node
 leave too little of `server.http_inflight_body_size` for this one.

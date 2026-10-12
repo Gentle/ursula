@@ -6665,40 +6665,68 @@ mod snapshot_driver {
 
     const GROUPS: u32 = 8;
 
-    /// A snapshot store whose uploads wait until the test opens its gate.
-    /// It counts the uploads under way and the most under way at once.
+    fn group_count() -> usize {
+        usize::try_from(GROUPS).unwrap()
+    }
+
+    /// The uploads a [`GatedStore`] saw.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct Uploads {
+        /// Under way now.
+        running: usize,
+        /// The most under way at once.
+        most: usize,
+        /// Every upload that started.
+        started: usize,
+    }
+
+    /// A snapshot store whose uploads wait until the test lets them finish,
+    /// in the order they arrive, and which counts them.
     #[derive(Debug)]
     struct GatedStore {
-        gate: watch::Sender<bool>,
-        uploads: watch::Sender<(usize, usize)>,
+        /// How many uploads, by arrival, may finish.
+        allowed: watch::Sender<usize>,
+        uploads: watch::Sender<Uploads>,
     }
 
     impl GatedStore {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                gate: watch::Sender::new(false),
-                uploads: watch::Sender::new((0, 0)),
+                allowed: watch::Sender::new(0),
+                uploads: watch::Sender::new(Uploads::default()),
             })
         }
 
-        fn most(&self) -> usize {
-            self.uploads.borrow().1
+        fn uploads(&self) -> Uploads {
+            *self.uploads.borrow()
         }
 
-        async fn wait_for_uploads(&self, count: usize) {
-            tokio::time::timeout(
-                Duration::from_secs(30),
+        /// Waits until `count` uploads are under way at once.
+        async fn wait_for_uploads(&self, count: usize, within: Duration) {
+            let reached = tokio::time::timeout(
+                within,
                 self.uploads
                     .subscribe()
-                    .wait_for(|(running, _)| *running >= count),
+                    .wait_for(|uploads| uploads.running >= count),
             )
             .await
-            .unwrap_or_else(|_elapsed| panic!("{count} uploads never ran at once"))
-            .expect("the store keeps its count");
+            .map(|reached| reached.map(drop));
+            assert!(
+                matches!(reached, Ok(Ok(()))),
+                "{count} uploads never ran at once within {within:?}: {:?}",
+                self.uploads()
+            );
         }
 
+        /// Lets the next `count` uploads to arrive finish.
+        fn release(&self, count: usize) {
+            self.allowed
+                .send_modify(|allowed| *allowed = allowed.saturating_add(count));
+        }
+
+        /// Lets every upload finish.
         fn open(&self) {
-            self.gate.send_replace(true);
+            self.allowed.send_replace(usize::MAX);
         }
     }
 
@@ -6709,15 +6737,23 @@ mod snapshot_driver {
             bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
-                self.uploads.send_modify(|(running, most)| {
-                    *running = running.saturating_add(1);
-                    *most = (*most).max(*running);
+                let mut ticket = 0;
+                self.uploads.send_modify(|uploads| {
+                    ticket = uploads.started;
+                    uploads.started = uploads.started.saturating_add(1);
+                    uploads.running = uploads.running.saturating_add(1);
+                    uploads.most = uploads.most.max(uploads.running);
                 });
-                let mut gate = self.gate.subscribe();
-                let opened = gate.wait_for(|open| *open).await.map(drop);
-                self.uploads
-                    .send_modify(|(running, _)| *running = running.saturating_sub(1));
-                opened.map_err(|_closed| SnapshotStoreError::Backend("the gate is gone".into()))?;
+                let mut allowed = self.allowed.subscribe();
+                let released = allowed
+                    .wait_for(|allowed| *allowed > ticket)
+                    .await
+                    .map(drop);
+                self.uploads.send_modify(|uploads| {
+                    uploads.running = uploads.running.saturating_sub(1);
+                });
+                released
+                    .map_err(|_closed| SnapshotStoreError::Backend("the gate is gone".into()))?;
                 Ok(SnapshotLocation::Inline {
                     bytes: bytes.to_vec(),
                 })
@@ -6737,9 +6773,14 @@ mod snapshot_driver {
     }
 
     /// One node, the only voter of [`GROUPS`] groups, whose snapshots go to
-    /// `store` and which builds at most four of them at once. Every group
-    /// holds `appends` appends of 8 KiB.
-    async fn loaded_node(store: &Arc<GatedStore>, appends: usize) -> StaticGrpcTestNode {
+    /// `store` and which builds at most four of them at once. Group `i`
+    /// holds one stream, returned at index `i`, with `appends[i]` appends of
+    /// 8 KiB.
+    async fn loaded_node(
+        store: &Arc<GatedStore>,
+        appends: &[usize],
+    ) -> (StaticGrpcTestNode, Vec<BucketStreamId>) {
+        assert_eq!(appends.len(), group_count());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -6753,7 +6794,7 @@ mod snapshot_driver {
             peers.clone(),
             peers,
             true,
-            usize::try_from(GROUPS).unwrap(),
+            group_count(),
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
                     // The driver snapshots, not OpenRaft's entry policy.
@@ -6785,12 +6826,13 @@ mod snapshot_driver {
             streams
                 .entry(node.runtime.locate(&stream_id).raft_group_id)
                 .or_insert(stream_id);
-            if streams.len() == usize::try_from(GROUPS).unwrap() {
+            if streams.len() == group_count() {
                 break;
             }
         }
-        assert_eq!(streams.len(), usize::try_from(GROUPS).unwrap());
-        for stream_id in streams.values() {
+        assert_eq!(streams.len(), group_count());
+        let streams = streams.into_values().collect::<Vec<_>>();
+        for (stream_id, count) in streams.iter().zip(appends) {
             node.runtime
                 .create_stream(CreateStreamRequest::new(
                     stream_id.clone(),
@@ -6798,17 +6840,22 @@ mod snapshot_driver {
                 ))
                 .await
                 .expect("create the group's stream");
-            for _ in 0..appends {
-                node.runtime
-                    .append(AppendRequest::from_bytes(stream_id.clone(), vec![
-                        7_u8;
-                        8 << 10
-                    ]))
-                    .await
-                    .expect("append to the group's stream");
-            }
+            append(&node, stream_id, *count).await;
         }
-        node
+        (node, streams)
+    }
+
+    /// Appends `count` records of 8 KiB to `stream_id`.
+    async fn append(node: &StaticGrpcTestNode, stream_id: &BucketStreamId, count: usize) {
+        for _ in 0..count {
+            node.runtime
+                .append(AppendRequest::from_bytes(stream_id.clone(), vec![
+                    7_u8;
+                    8 << 10
+                ]))
+                .await
+                .expect("append to the group's stream");
+        }
     }
 
     /// Runs the production snapshot driver of `node` with `cadence`.
@@ -6851,20 +6898,20 @@ mod snapshot_driver {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_driver_uses_every_build_slot_at_the_hard_limit() {
         let store = GatedStore::new();
-        let node = loaded_node(&store, 4).await;
+        let (node, _) = loaded_node(&store, &[4; 8]).await;
         let coordinator = node.registry.snapshot_build_coordinator();
         assert_eq!(coordinator.max_concurrency(), 4);
         let log = coordinator.node_log_bytes();
         // A budget of a third of the log puts the node past its hard limit.
-        let cadence = SnapshotCadence::new(log / 3, usize::try_from(GROUPS).unwrap(), 100_000);
+        let cadence = SnapshotCadence::new(log / 3, group_count(), 100_000);
         assert_eq!(cadence.pressure(log, 4), LogPressure::Escalated {
             builds: 4
         });
         drive(&node, &store, cadence);
-        store.wait_for_uploads(4).await;
+        store.wait_for_uploads(4, Duration::from_secs(30)).await;
         // The node runs four builds at most: the next waits for a slot.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(store.most(), 4);
+        assert_eq!(store.uploads().most, 4);
         let metrics = node.runtime.metrics().snapshot();
         assert_eq!(metrics.raft_snapshot_pressure_level, 2);
         assert_eq!(metrics.raft_snapshot_pressure_builds, 4);
@@ -6872,7 +6919,7 @@ mod snapshot_driver {
         assert!(metrics.raft_log_bytes_high_watermark >= log);
         store.open();
         wait_for_log_at_most(&node, cadence.pressure_target_bytes()).await;
-        assert_eq!(store.most(), 4);
+        assert_eq!(store.uploads().most, 4);
         node.shutdown().await;
     }
 
@@ -6881,21 +6928,17 @@ mod snapshot_driver {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_driver_builds_one_group_at_a_time_below_the_budget() {
         let store = GatedStore::new();
-        let node = loaded_node(&store, 4).await;
+        let (node, _) = loaded_node(&store, &[4; 8]).await;
         let coordinator = node.registry.snapshot_build_coordinator();
         let log = coordinator.node_log_bytes();
         // The log at seven eighths of the budget: past the watermark.
-        let cadence = SnapshotCadence::new(
-            (log / 7).saturating_mul(8),
-            usize::try_from(GROUPS).unwrap(),
-            100_000,
-        );
+        let cadence = SnapshotCadence::new((log / 7).saturating_mul(8), group_count(), 100_000);
         assert_eq!(cadence.pressure(log, 4), LogPressure::Watermark);
         drive(&node, &store, cadence);
-        store.wait_for_uploads(1).await;
-        // Several driver ticks pass with the first build held at the gate.
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        // Several driver ticks pass with the first build held at the store.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(store.most(), 1);
+        assert_eq!(store.uploads().most, 1);
         assert_eq!(
             node.runtime
                 .metrics()
@@ -6905,7 +6948,134 @@ mod snapshot_driver {
         );
         store.open();
         wait_for_log_at_most(&node, cadence.pressure_target_bytes()).await;
-        assert_eq!(store.most(), 1);
+        assert_eq!(store.uploads().most, 1);
+        node.shutdown().await;
+    }
+
+    /// #519: the builds of a pass follow the log down. A pass that started
+    /// four builds near the hard limit starts no other while one of them
+    /// still runs, once the other three brought the log below the budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_escalated_pass_keeps_one_build_in_flight_once_the_log_is_below_the_budget() {
+        let store = GatedStore::new();
+        // Four groups of eight appends, which a pass starts first, and four
+        // of one.
+        let (node, _) = loaded_node(&store, &[8, 8, 8, 8, 1, 1, 1, 1]).await;
+        let coordinator = node.registry.snapshot_build_coordinator();
+        let log = coordinator.node_log_bytes();
+        let largest = coordinator
+            .log_progress()
+            .values()
+            .map(|progress| progress.log_bytes)
+            .max()
+            .expect("the node's groups");
+        // The log at 1.9 budgets: four builds.
+        let cadence = SnapshotCadence::new((log / 19).saturating_mul(10), group_count(), 100_000);
+        assert_eq!(cadence.pressure(log, 4), LogPressure::Escalated {
+            builds: 4
+        });
+        // Once three of the large groups are snapshotted the log is below
+        // the budget, where a pass keeps one build in flight.
+        let rest = log.saturating_sub(largest.saturating_mul(3));
+        assert!(rest < cadence.node_budget_bytes);
+        assert_eq!(cadence.pressure(rest, 4).builds(), 1);
+        drive(&node, &store, cadence);
+        store.wait_for_uploads(4, Duration::from_secs(30)).await;
+        assert_eq!(store.uploads().started, 4);
+
+        store.release(3);
+        wait_for_log_at_most(&node, cadence.node_budget_bytes.saturating_sub(1)).await;
+        // Driver polls pass with the fourth build held at the store, and the
+        // pass, planned for four builds, starts none of its other groups.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let uploads = store.uploads();
+        assert_eq!((uploads.started, uploads.running), (4, 1));
+        let metrics = node.runtime.metrics().snapshot();
+        assert_eq!(metrics.raft_snapshot_pressure_builds, 1);
+        assert_eq!(metrics.raft_snapshot_builds_in_flight, 1);
+        store.open();
+        wait_for_log_at_most(&node, cadence.pressure_target_bytes()).await;
+        node.shutdown().await;
+    }
+
+    /// #519: a pass that waits for a build slot follows the log up too. Its
+    /// one build is held at the store while writes take the log from the
+    /// watermark to 1.75 budgets: the pass ends, and the passes after it run
+    /// every build slot, well before the minute a pass waits for a slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pass_waiting_for_a_slot_escalates_with_the_log() {
+        let store = GatedStore::new();
+        let (node, streams) = loaded_node(&store, &[4; 8]).await;
+        let coordinator = node.registry.snapshot_build_coordinator();
+        let log = coordinator.node_log_bytes();
+        // The log at seven eighths of the budget: past the watermark.
+        let cadence = SnapshotCadence::new((log / 7).saturating_mul(8), group_count(), 100_000);
+        assert_eq!(cadence.pressure(log, 4), LogPressure::Watermark);
+        drive(&node, &store, cadence);
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        // The pass took group 0 first: write to the others.
+        let target = (cadence.node_budget_bytes / 4).saturating_mul(7);
+        for stream_id in streams.iter().skip(1).cycle() {
+            if coordinator.node_log_bytes() >= target {
+                break;
+            }
+            append(&node, stream_id, 1).await;
+        }
+        let log = coordinator.node_log_bytes();
+        assert_eq!(cadence.pressure(log, 4), LogPressure::Escalated {
+            builds: 4
+        });
+        assert!(log < cadence.hard_limit_bytes());
+        store.wait_for_uploads(4, Duration::from_secs(10)).await;
+        // Several monitor polls, so the gauges saw the fourth build.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let metrics = node.runtime.metrics().snapshot();
+        assert_eq!(metrics.raft_snapshot_pressure_level, 2);
+        assert_eq!(metrics.raft_snapshot_builds_in_flight_max, 4);
+        assert_eq!(store.uploads().most, 4);
+        // The pass that waited ended when the log outgrew it: a pass counts
+        // once it ends.
+        assert!(metrics.raft_snapshot_pressure_passes >= 1);
+        store.open();
+        wait_for_log_at_most(&node, cadence.pressure_target_bytes()).await;
+        node.shutdown().await;
+    }
+
+    /// #519: the driver never triggers a group whose build is in flight,
+    /// since OpenRaft drops that trigger and the pass would wait out the
+    /// handoff (5 s). A build started outside the driver holds one of four
+    /// slots at the hard limit, on the group with the most log, and the
+    /// driver fills the other three at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_driver_skips_a_group_whose_build_is_in_flight() {
+        let store = GatedStore::new();
+        let (node, _) = loaded_node(&store, &[8, 4, 4, 4, 4, 4, 4, 4]).await;
+        let coordinator = node.registry.snapshot_build_coordinator();
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger group 0's snapshot");
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        assert_eq!(
+            coordinator
+                .builds_in_flight()
+                .into_keys()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        let log = coordinator.node_log_bytes();
+        let cadence = SnapshotCadence::new(log / 3, group_count(), 100_000);
+        assert_eq!(cadence.pressure(log, 4), LogPressure::Escalated {
+            builds: 4
+        });
+        drive(&node, &store, cadence);
+        store.wait_for_uploads(4, Duration::from_secs(4)).await;
+        assert_eq!(store.uploads().started, 4);
+        store.open();
+        wait_for_log_at_most(&node, cadence.pressure_target_bytes()).await;
         node.shutdown().await;
     }
 }

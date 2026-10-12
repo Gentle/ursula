@@ -185,10 +185,12 @@ pub struct RaftConfig {
     pub grpc_reconnect_after_failures: usize,
     /// Max concurrent snapshot builds across all groups on this node. Each
     /// build holds a copy of its group's state and runs its snapshot-store
-    /// requests one after another. The snapshot driver builds one group at a
-    /// time while the node's log stays below `snapshot_log_budget`, and past
-    /// it more, in even steps up to this many before the hard limit (twice
-    /// the budget).
+    /// requests one after another. The snapshot driver starts a build only
+    /// while fewer run than the node's log calls for: one while the log is
+    /// below `snapshot_log_budget`, and past it more, in even steps up to
+    /// this many before the hard limit (twice the budget). Builds it started
+    /// past the budget finish after the log falls below it. With the driver
+    /// off, OpenRaft's own policy may run this many at once.
     pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,

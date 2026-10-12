@@ -22,7 +22,11 @@
 //! even steps toward the hard limit (twice the budget, where admission
 //! refuses client writes), rounded up so that every build the node allows
 //! runs before the log gets there. It starts as many more groups, so it
-//! lasts about as long as a pass below the budget.
+//! lasts about as long as a pass below the budget. Before each build a pass
+//! weighs the log again ([`SnapshotCadence::pass_step`]): it keeps only as
+//! many builds in flight as the pressure now calls for, one once its builds
+//! brought the log below the budget, and it ends once the log climbed to a
+//! higher pressure, so the next pass plans for that.
 //!
 //! Groups the Raft WAL reports lagging (their live log keeps old journal
 //! segments on disk) go first, ahead of the cadence and the pressure pass,
@@ -107,6 +111,22 @@ impl LogPressure {
             Self::Escalated { .. } => 2,
         }
     }
+}
+
+/// What a pass of the snapshot driver does before it starts its next build
+/// (#519), from [`SnapshotCadence::pass_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassStep {
+    /// The log climbed to a higher pressure than the pass was planned for.
+    /// The pass ends, so the next one plans for the pressure now, with its
+    /// group count, order and builds.
+    Outgrown,
+    /// The next build starts once fewer than `builds` run: as many as the
+    /// pressure now calls for, never more than the pass was planned for.
+    Start {
+        /// Builds the pass keeps in flight now.
+        builds: usize,
+    },
 }
 
 /// What the snapshot driver knows of one group when it plans a pass.
@@ -249,6 +269,28 @@ impl SnapshotCadence {
             .min(steps);
         LogPressure::Escalated {
             builds: taken.saturating_add(1),
+        }
+    }
+
+    /// What a pass planned under `planned` does before its next build, the
+    /// node's log now holding `node_log_bytes`, on a node that runs at most
+    /// `max_builds` builds at once. A pass whose log climbed past `planned`
+    /// ends. Otherwise its builds follow the pressure down as they bring the
+    /// log down: a pass planned past the budget keeps one build in flight
+    /// once the log is below it, as a pass planned there does.
+    pub fn pass_step(
+        &self,
+        planned: LogPressure,
+        node_log_bytes: u64,
+        max_builds: usize,
+    ) -> PassStep {
+        let now = self.pressure(node_log_bytes, max_builds);
+        if now > planned {
+            PassStep::Outgrown
+        } else {
+            PassStep::Start {
+                builds: now.builds(),
+            }
         }
     }
 
@@ -468,6 +510,7 @@ mod tests {
     use super::LogPressure;
     use super::MAX_SNAPSHOT_FLOOR_BYTES;
     use super::MIN_SNAPSHOT_FLOOR_BYTES;
+    use super::PassStep;
     use super::SnapshotCadence;
 
     const MIB: u64 = 1 << 20;
@@ -652,6 +695,34 @@ mod tests {
         assert_eq!(at(GIB - 1).builds(), 1);
     }
 
+    /// #519: before each build a pass weighs the log again. Its builds
+    /// follow the pressure down, so a pass planned near the hard limit keeps
+    /// one build in flight once its builds brought the log below the budget,
+    /// and a log that climbs past the pressure the pass was planned for ends
+    /// it, so the next pass plans for more.
+    #[test]
+    fn a_pass_follows_the_log_down_and_ends_when_it_climbs() {
+        let cadence = SnapshotCadence::new(GIB, 128, 100_000);
+        let step = |planned: LogPressure, bytes: u64| cadence.pass_step(planned, bytes, 4);
+        let four = LogPressure::Escalated { builds: 4 };
+        let two = LogPressure::Escalated { builds: 2 };
+        assert_eq!(step(four, 2 * GIB), PassStep::Start { builds: 4 });
+        assert_eq!(step(four, GIB + GIB / 2), PassStep::Start { builds: 3 });
+        assert_eq!(step(four, GIB + 1), PassStep::Start { builds: 2 });
+        assert_eq!(step(four, GIB), PassStep::Start { builds: 1 });
+        assert_eq!(step(four, GIB - 1), PassStep::Start { builds: 1 });
+        assert_eq!(step(four, 0), PassStep::Start { builds: 1 });
+        assert_eq!(step(two, GIB + 1), PassStep::Start { builds: 2 });
+        // The log climbed past the pressure the pass was planned for.
+        assert_eq!(step(two, GIB + GIB / 2), PassStep::Outgrown);
+        assert_eq!(step(LogPressure::Watermark, GIB), PassStep::Outgrown);
+        assert_eq!(step(LogPressure::Calm, 3 * GIB / 4), PassStep::Outgrown);
+        assert_eq!(step(LogPressure::Watermark, 3 * GIB / 4), PassStep::Start {
+            builds: 1
+        });
+        assert_eq!(step(LogPressure::Calm, 0), PassStep::Start { builds: 1 });
+    }
+
     /// #519: under pressure the builds are what runs short, so a pass starts
     /// with the groups that free the most log per build. Ordered by log per
     /// snapshot byte, a group that applied a few entries over a near-empty
@@ -771,6 +842,7 @@ mod proptests {
     use super::GroupDriveState;
     use super::GroupLogProgress;
     use super::LogPressure;
+    use super::PassStep;
     use super::SnapshotCadence;
 
     const MIB: u64 = 1 << 20;
@@ -856,6 +928,32 @@ mod proptests {
             }
             if high >= cadence.hard_limit_bytes() {
                 prop_assert_eq!(pressure, LogPressure::Escalated { builds: max_builds.max(1) });
+            }
+        }
+
+        /// Before each build a pass keeps as many builds in flight as the
+        /// pressure now calls for, never more than it was planned for, and
+        /// ends exactly when the log climbed past the pressure it was
+        /// planned for.
+        #[test]
+        fn prop_a_pass_never_runs_more_builds_than_planned(
+            (budget, planned_log, now_log) in logs(),
+            max_builds in 0usize..=8,
+        ) {
+            let cadence = SnapshotCadence::new(budget, 128, 100_000);
+            let planned = cadence.pressure(planned_log, max_builds);
+            let now = cadence.pressure(now_log, max_builds);
+            match cadence.pass_step(planned, now_log, max_builds) {
+                PassStep::Outgrown => prop_assert!(now > planned),
+                PassStep::Start { builds } => {
+                    prop_assert!(now <= planned);
+                    prop_assert_eq!(builds, now.builds());
+                    prop_assert!(builds <= planned.builds());
+                    prop_assert!((1..=max_builds.max(1)).contains(&builds));
+                }
+            }
+            if now_log <= planned_log {
+                prop_assert_ne!(cadence.pass_step(planned, now_log, max_builds), PassStep::Outgrown);
             }
         }
 

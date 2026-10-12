@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use futures_util::Stream;
 use futures_util::TryStreamExt;
@@ -230,23 +231,50 @@ impl SnapshotBuildCoordinator {
             .map_err(|err| GroupEngineError::new(format!("snapshot build gate closed: {err}")))
     }
 
-    /// Waits until fewer than `limit` builds hold a permit, then takes one.
-    /// A build that starts in between can take the node past `limit` for a
-    /// while: the snapshot driver paces its own builds with `limit`, and the
-    /// permits bound every build.
+    /// Waits until fewer builds hold a permit than `limit` asks for, then
+    /// takes one. `limit` is asked again whenever a build starts or ends and
+    /// at least every `poll`, since what the snapshot driver weighs (its log
+    /// pressure, #519) moves with the builds and between them. `None` ends
+    /// the wait without a permit. A build that starts in between can take
+    /// the node past the limit for a while: the driver paces its own builds
+    /// with it, and the permits bound every build.
     pub async fn acquire_below(
         &self,
-        limit: usize,
-    ) -> Result<OwnedSemaphorePermit, GroupEngineError> {
-        let limit = limit.max(1);
-        self.inner
-            .builds
-            .subscribe()
-            .wait_for(|builds| builds.len() < limit)
-            .await
-            .map(drop)
-            .map_err(|_closed| GroupEngineError::new("snapshot build registry closed"))?;
-        self.acquire().await
+        poll: Duration,
+        mut limit: impl FnMut() -> Option<usize>,
+    ) -> Result<Option<OwnedSemaphorePermit>, GroupEngineError> {
+        let mut builds = self.inner.builds.subscribe();
+        loop {
+            let Some(slots) = limit() else {
+                return Ok(None);
+            };
+            // Marked seen before the comparison, so a build that starts or
+            // ends after it wakes the wait below.
+            let running = builds.borrow_and_update().len();
+            if running < slots.max(1) {
+                return self.acquire().await.map(Some);
+            }
+            crate::rt::select! {
+                changed = builds.changed() => changed.map_err(|_closed| {
+                    GroupEngineError::new("snapshot build registry closed")
+                })?,
+                () = crate::rt::time::sleep(poll) => {}
+            }
+        }
+    }
+
+    /// Waits until the permit handed off to `raft_group_id` is no longer
+    /// pending: the group claimed it, or it was taken back. A claim
+    /// registers its build, which wakes the wait.
+    pub async fn handoff_claimed(&self, raft_group_id: u32) {
+        // Subscribed before the check, so a claim right after it still
+        // wakes the wait.
+        let mut builds = self.inner.builds.subscribe();
+        while self.handoff_pending(raft_group_id) {
+            if builds.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Reserves `permit` for the next snapshot build of `raft_group_id`.
@@ -2172,36 +2200,95 @@ mod tests {
         assert_eq!(build.available_permits(), 2);
     }
 
-    /// #519: the snapshot driver paces its builds below a limit under the
-    /// node's permits: it waits until fewer builds than the limit run.
+    /// #519: the snapshot driver waits on the build registry, not a timer,
+    /// for the group it triggered to claim its permit.
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn acquire_below_waits_until_fewer_builds_run() {
+    async fn a_claim_wakes_the_driver_waiting_for_it() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        build.log_gauge(group).record_applied(300);
+        build.hand_off(group, build.acquire().await.expect("driver's build permit"));
+        let claimed = build.handoff_claimed(group);
+        tokio::pin!(claimed);
+        assert!(futures_util::poll!(&mut claimed).is_pending());
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("a handed-off permit builds");
+        // No timer wakes the wait: the claim does, so the next poll ends it.
+        assert!(futures_util::poll!(&mut claimed).is_ready());
+        assert!(!build.handoff_pending(group));
+        drop(builder);
+        // Nothing pending: the wait returns at once.
+        tokio::time::timeout(Duration::from_secs(5), build.handoff_claimed(group))
+            .await
+            .expect("no handoff to wait for");
+    }
+
+    /// #519: the snapshot driver paces its builds below a limit under the
+    /// node's permits. It waits until fewer builds run than the limit asks
+    /// for, asks again whenever a build ends and on every poll, and stops
+    /// waiting when the limit says so.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn acquire_below_waits_until_fewer_builds_run_than_the_limit_asks() {
         let build = SnapshotBuildCoordinator::new(4);
         assert_eq!(build.max_concurrency(), 4);
         let first = build.try_lease(1, 0).expect("a free permit");
         let second = build.try_lease(2, 0).expect("a free permit");
         assert_eq!(build.running_builds(), 2);
+        let wait = Duration::from_secs(5);
+        let never = Duration::from_secs(3_600);
 
         // Two builds run: a third may start under a limit of three.
-        let third = tokio::time::timeout(std::time::Duration::from_secs(5), build.acquire_below(3))
+        let third = tokio::time::timeout(wait, build.acquire_below(never, || Some(3)))
             .await
             .expect("a free slot")
+            .expect("the registry stays open")
             .expect("a permit");
         // The driver's own permit is not a build until a group claims it.
         assert_eq!(build.running_builds(), 2);
         drop(third);
 
-        let paced = build.acquire_below(2);
+        // Under a limit of two it waits, and a build that ends lets it go
+        // without waiting for a poll.
+        let paced = build.acquire_below(never, || Some(2));
         tokio::pin!(paced);
         assert!(futures_util::poll!(&mut paced).is_pending());
         drop(first);
-        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), paced)
+        let permit = tokio::time::timeout(wait, paced)
             .await
             .expect("a slot frees once a build ends")
+            .expect("the registry stays open")
             .expect("a permit");
         assert_eq!(build.available_permits(), 2);
         drop(permit);
+
+        // The limit is asked again on every poll, so a limit that rises
+        // with no build ending lets the wait go too.
+        let limit = AtomicU64::new(1);
+        let rising = build.acquire_below(Duration::from_millis(10), || {
+            Some(usize::try_from(limit.load(Ordering::Relaxed)).unwrap())
+        });
+        tokio::pin!(rising);
+        assert!(futures_util::poll!(&mut rising).is_pending());
+        limit.store(2, Ordering::Relaxed);
+        let permit = tokio::time::timeout(wait, rising)
+            .await
+            .expect("a poll sees the higher limit")
+            .expect("the registry stays open")
+            .expect("a permit");
+        drop(permit);
+        // A limit that says stop ends the wait without a permit.
+        let stopped = tokio::time::timeout(wait, build.acquire_below(never, || None))
+            .await
+            .expect("no wait")
+            .expect("the registry stays open");
+        assert!(stopped.is_none());
+
         drop(second);
         assert_eq!(build.available_permits(), 4);
         assert_eq!(build.running_builds(), 0);

@@ -10,6 +10,7 @@ use ursula_raft::snapshot_cadence::DriveLimits;
 use ursula_raft::snapshot_cadence::GroupDriveState;
 use ursula_raft::snapshot_cadence::GroupLogProgress;
 use ursula_raft::snapshot_cadence::LogPressure;
+use ursula_raft::snapshot_cadence::PassStep;
 use ursula_raft::snapshot_cadence::SnapshotCadence;
 use ursula_raft::snapshot_cadence::SnapshotPlan;
 use ursula_runtime::RaftLogPressureSample;
@@ -30,7 +31,8 @@ const SNAPSHOT_HANDOFF_WAIT: Duration = Duration::from_secs(5);
 /// Pause between ticks while the node is over its log watermark, so a
 /// pressure pass is not capped at its group count per interval.
 const SNAPSHOT_PRESSURE_RETICK: Duration = Duration::from_millis(250);
-/// How often the node's unsnapshotted log is checked against its hard limit.
+/// How often the node's unsnapshotted log is checked against its hard limit,
+/// and weighed again by a pass that waits for a build slot.
 const LOG_PRESSURE_POLL: Duration = Duration::from_millis(100);
 
 /// What became of one snapshot trigger.
@@ -42,6 +44,9 @@ enum Trigger {
     NotStarted,
     /// No build slot came free in time: the pass ends.
     NoSlot,
+    /// The log climbed past the pressure the pass was planned for: the pass
+    /// ends, so the next one plans for the pressure now.
+    Outgrown,
 }
 
 /// Trigger one group's snapshot and see the build through to its start.
@@ -50,26 +55,39 @@ enum Trigger {
 /// finds none free is refused rather than queued. Triggering a whole plan at
 /// once therefore built about one group per tick while the rest were
 /// refused, and under sustained writes the Raft log outgrew the node. The
-/// driver takes a permit first, once fewer than `builds` builds run (which
-/// waits for one to finish), and hands it to the group it triggers.
+/// driver takes a permit first and hands it to the group it triggers. It
+/// takes one once fewer builds run than `pace` asks for, and asks again
+/// whenever a build starts or ends and every [`LOG_PRESSURE_POLL`], so the
+/// pass follows the node's log while it waits (#519). `pace` returns `None`
+/// once the log outgrew the pass.
 async fn trigger_snapshot_build(
     registry: &RaftGroupHandleRegistry,
     coordinator: &SnapshotBuildCoordinator,
     raft_group_id: u32,
-    builds: usize,
+    pace: impl FnMut() -> Option<usize>,
 ) -> Trigger {
     let Some(raft) = registry.get(RaftGroupId(raft_group_id)) else {
         return Trigger::NotStarted;
     };
-    let Ok(Ok(permit)) =
-        tokio::time::timeout(SNAPSHOT_PERMIT_WAIT, coordinator.acquire_below(builds)).await
-    else {
-        tracing::warn!(
-            raft_group_id,
-            builds,
-            "snapshot driver: no build slot within {SNAPSHOT_PERMIT_WAIT:?}; ending this tick"
-        );
-        return Trigger::NoSlot;
+    let slot = coordinator.acquire_below(LOG_PRESSURE_POLL, pace);
+    let permit = match tokio::time::timeout(SNAPSHOT_PERMIT_WAIT, slot).await {
+        Ok(Ok(Some(permit))) => permit,
+        Ok(Ok(None)) => return Trigger::Outgrown,
+        Ok(Err(err)) => {
+            tracing::error!(
+                raft_group_id,
+                %err,
+                "snapshot driver: no build permit; ending this tick"
+            );
+            return Trigger::NoSlot;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                raft_group_id,
+                "snapshot driver: no build slot within {SNAPSHOT_PERMIT_WAIT:?}; ending this tick"
+            );
+            return Trigger::NoSlot;
+        }
     };
     coordinator.hand_off(raft_group_id, permit);
     if let Err(err) = raft.trigger().snapshot().await {
@@ -77,22 +95,20 @@ async fn trigger_snapshot_build(
         tracing::error!("snapshot driver trigger group {raft_group_id} error: {err}");
         return Trigger::NotStarted;
     }
-    let claimed = async {
-        while coordinator.handoff_pending(raft_group_id) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    if tokio::time::timeout(SNAPSHOT_HANDOFF_WAIT, claimed)
-        .await
-        .is_err()
-    {
-        tracing::debug!(
-            raft_group_id,
-            "snapshot driver: handoff not claimed in time"
-        );
-    }
+    let waited = tokio::time::timeout(
+        SNAPSHOT_HANDOFF_WAIT,
+        coordinator.handoff_claimed(raft_group_id),
+    )
+    .await;
     // Unclaimed: OpenRaft dropped the trigger (e.g. a build was already running).
     if coordinator.reclaim_handoff(raft_group_id) {
+        // Each such trigger holds the pass up for the whole wait.
+        tracing::warn!(
+            raft_group_id,
+            timed_out = waited.is_err(),
+            "snapshot driver: the group did not claim its build permit within \
+             {SNAPSHOT_HANDOFF_WAIT:?}; taking it back"
+        );
         Trigger::NotStarted
     } else {
         Trigger::Started
@@ -251,8 +267,10 @@ pub(crate) struct StoreGateInputs<'a> {
 ///
 /// Each tick plans one pass ([`plan_snapshot_drive`]) and starts its builds
 /// in order, at most as many at once as the node's log pressure calls for
-/// (#519). A pass ends early once the log has climbed to a higher pressure
-/// than when the pass was planned, so the next pass plans for that.
+/// now (#519, [`SnapshotCadence::pass_step`]): fewer as the pass brings the
+/// log down, one below the budget. A pass ends early once the log has
+/// climbed to a higher pressure than when the pass was planned, so the next
+/// pass plans for that.
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
@@ -296,6 +314,11 @@ pub fn spawn_snapshot_driver(
     );
     tokio::spawn(async move {
         loop {
+            // The builds first: a build that ends between the two reads then
+            // still counts as in flight, and its group waits for the next
+            // pass instead of drawing a trigger OpenRaft may drop while it
+            // finishes the build.
+            let building = coordinator.builds_in_flight();
             let snaps = registry.metrics_snapshot();
             let store_trouble = match gate.as_mut().map(|gate| gate.latest_bad()) {
                 None => false,
@@ -321,7 +344,6 @@ pub fn spawn_snapshot_driver(
                     "snapshot driver: the Raft WAL reports groups keeping old segments"
                 );
             }
-            let building = coordinator.builds_in_flight();
             let (plan, selected) =
                 plan_snapshot_drive(&snaps, &cadence, limits, &lagging, &building);
             // Measured the way the pass measures it below, so only a rise
@@ -333,25 +355,34 @@ pub fn spawn_snapshot_driver(
                 let builds = plan.pressure.builds();
                 let planned = selected.len();
                 let mut triggered = 0u64;
+                let mut not_started = 0u64;
                 let mut outgrown = false;
+                // The builds the pass keeps in flight as the log moves, or
+                // none once the log outgrew the pass.
+                let pace = || match cadence.pass_step(
+                    planned_pressure,
+                    coordinator.node_log_bytes(),
+                    limits.max_builds,
+                ) {
+                    PassStep::Outgrown => None,
+                    PassStep::Start { builds: now } => Some(now),
+                };
                 for snapshot in selected {
-                    if cadence.pressure(coordinator.node_log_bytes(), limits.max_builds)
-                        > planned_pressure
-                    {
-                        outgrown = true;
-                        break;
-                    }
                     match trigger_snapshot_build(
                         &registry,
                         &coordinator,
                         snapshot.raft_group_id,
-                        builds,
+                        pace,
                     )
                     .await
                     {
                         Trigger::Started => triggered = triggered.saturating_add(1),
-                        Trigger::NotStarted => {}
+                        Trigger::NotStarted => not_started = not_started.saturating_add(1),
                         Trigger::NoSlot => break,
+                        Trigger::Outgrown => {
+                            outgrown = true;
+                            break;
+                        }
                     }
                 }
                 pause = next_pause(interval, plan.pressure, triggered, building.len(), outgrown);
@@ -369,7 +400,9 @@ pub fn spawn_snapshot_driver(
                         level = plan.pressure.level(),
                         builds,
                         building = building.len(),
+                        planned,
                         triggered,
+                        not_started,
                         outgrown,
                         pass_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                         "raft snapshot pressure pass completed"

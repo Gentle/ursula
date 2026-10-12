@@ -112,6 +112,7 @@ data:
     init_membership_per_group = {{ .Values.raft.initMembershipPerGroup }}
     snapshot_logs_since_last = {{ .Values.raft.snapshotLogsSinceLast }}
     snapshot_pressure_max_groups_per_tick = {{ .Values.raft.snapshotPressureMaxGroupsPerTick }}
+    snapshot_build_max_concurrency = {{ .Values.raft.snapshotBuildMaxConcurrency }}
     max_in_snapshot_log_to_keep = {{ .Values.raft.maxInSnapshotLogToKeep }}
 {{- if not (eq .Values.raft.maxUncommittedBytesPerGroup nil) }}
     max_uncommitted_size_per_group = "{{ .Values.raft.maxUncommittedBytesPerGroup }}"

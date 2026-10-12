@@ -183,7 +183,7 @@ jobs:
           retention-days: 1
 
   # The extension's macOS-only code (the kernel boot id from `kern.bootsessionuuid`) compiles and its
-  # unit test runs only here, and so do the tests of how macOS reports a reset (`EINVAL`, #542).
+  # unit test runs only here, and so does the macOS side of the reset tests (`EINVAL`, #542).
   sqlite-vfs-macos:
     name: sqlite-vfs on macOS (extension lint + units)
     runs-on: macos-15

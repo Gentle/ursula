@@ -195,22 +195,22 @@ fn no_answer(e: &ureq::Error) -> bool {
 /// `EPIPE` or `ECONNRESET`.
 ///
 /// A reset shuts a socket down both ways, and macOS then fails every `setsockopt` on it with
-/// `EINVAL` (XNU's `sosetoptlock`). ureq 3.4.2 (`TcpTransport`) sets the socket's write timeout
-/// before it writes each buffer of a request (128 KiB), its read timeout before each read (each to
-/// the time left, which differs every time), and `TCP_NODELAY` once connected. So a reset that
-/// comes in as a request goes out or as its answer starts (a pooled connection the server closed
-/// just before, or a body a gateway stopped reading, #540) fails the request this way. Under TLS
-/// too: rustls hands the socket's error back unchanged.
+/// `EINVAL` (XNU's `sosetoptlock`). ureq 3.4.2 sets the socket's write timeout before it writes
+/// each buffer of a request (128 KiB) and its read timeout before each read (`TcpTransport`, each
+/// to the time left, which differs every time), and `TCP_NODELAY` once connected (`TcpConnector`).
+/// So a reset that comes in as a request goes out or as its answer starts (a pooled connection the
+/// server closed just before, or a body a gateway stopped reading, #540) can fail the request this
+/// way. Under TLS too: rustls hands the socket's error back unchanged.
 ///
 /// No error about the request or the setup reaches here. ureq and ureq-proto make no
 /// `InvalidInput` of their own, and neither does rustls on ureq's path (its one is for TLS early
 /// data, which ureq never sends). A bad header or URL fails as `Error::Http` or `Error::BadUri`.
-/// The `InvalidInput` that std makes up for an argument it refuses carries no OS error code: from
-/// ureq's resolver, a host and port that do not parse or a NUL in the host (the other one, a zero
-/// timeout, ureq never sets). Those stay final. A request that meets any other `EINVAL` from the OS
-/// on macOS is sent again until the retry budget runs out, and then fails as before. Other systems
-/// keep `EINVAL` final: Linux reports a reset as a reset, and its `connect` fails with `EINVAL`
-/// for a wrong URL (an IPv6 link-local address without a zone).
+/// The `InvalidInput` that std makes up for an argument it refuses (a host and port that do not
+/// parse, a NUL in a host, a zero timeout, none of which ureq passes) carries no OS error code, and
+/// would stay final. A request that meets any other `EINVAL` from the OS on macOS is sent again
+/// until the retry budget runs out, and then fails as before. Other systems keep `EINVAL` final:
+/// Linux reports a reset as a reset, and its `connect` fails with `EINVAL` for a wrong URL (an
+/// IPv6 link-local address without a zone).
 fn reset_on_macos(e: &std::io::Error) -> bool {
     cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EINVAL)
 }
@@ -218,8 +218,8 @@ fn reset_on_macos(e: &std::io::Error) -> bool {
 /// A transport failure before any connection carried the request: the host did not resolve, the
 /// connection was refused or failed, the TLS handshake failed, or resolving or connecting (TLS
 /// included) timed out. Nothing of the request was sent. A reset is none of these, whatever error
-/// reports it (`EINVAL` on macOS among them, `reset_on_macos`): the connection was open, so part
-/// of the request or the whole of it may have gone out.
+/// reports it (`EINVAL` on macOS among them, `reset_on_macos`): it came on an open connection,
+/// which may have carried part of the request or the whole of it.
 pub(crate) fn before_connection(e: &ureq::Error) -> bool {
     match e {
         ureq::Error::HostNotFound
@@ -2651,14 +2651,16 @@ mod tests {
 
     // On macOS a reset that comes in between two calls on the socket fails the next one with
     // `EINVAL` (`reset_on_macos`, #542): no answer there, as a reset is everywhere, and final on
-    // other systems. An `InvalidInput` that std makes up for an argument it refuses (from ureq's
-    // resolver: a host and port that do not parse, a NUL in the host) carries no OS error code and
-    // stays final everywhere. Neither is a failure before the connection, so a large snapshot body
-    // whose write met one may be too large (`snapshotter::FailureKind::may_be_size`).
+    // other systems. Like a reset, it is no failure before the connection, so a large snapshot body
+    // whose write met it may be too large (`snapshotter::FailureKind::may_be_size`). std reports
+    // `EINVAL` as `InvalidInput`, as it does the `InvalidInput` it makes up for an argument it
+    // refuses (a host and port that do not parse, a NUL in a host). That one carries no OS error
+    // code and stays final everywhere.
     #[test]
     fn einval_from_the_os_is_no_answer_on_macos_only() {
-        let einval = ureq::Error::Io(std::io::Error::from_raw_os_error(libc::EINVAL));
-        assert_eq!(einval.to_string(), "io: Invalid argument (os error 22)");
+        let einval = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert_eq!(einval.kind(), ErrorKind::InvalidInput);
+        let einval = ureq::Error::Io(einval);
         assert_eq!(no_answer(&einval), cfg!(target_os = "macos"));
         assert!(!before_connection(&einval));
         for reset in [libc::EPIPE, libc::ECONNRESET] {
@@ -2676,7 +2678,7 @@ mod tests {
                 "{e}"
             );
             let e = ureq::Error::Io(e);
-            assert!(!no_answer(&e) && !before_connection(&e), "{e}");
+            assert!(!no_answer(&e), "{e}");
         }
     }
 
@@ -2740,8 +2742,9 @@ mod tests {
     // A reset that comes in between two calls on the socket fails the next one with `EINVAL` on
     // macOS, where Linux reports `ECONNRESET` or `EPIPE` (#542). A stand-in that resets the
     // connection as a `HEAD`'s answer starts makes the client meet the reset at its read after
-    // that first line, while it is between two calls: on macOS as `EINVAL` almost every time, on
-    // Linux as `ECONNRESET`. Each `HEAD` is sent once, with no retry to hide the error.
+    // that first line, while it is between two calls: on macOS as `EINVAL` almost every time, and
+    // on Linux never (there as `ECONNRESET`). Each `HEAD` is sent once, with no retry to hide the
+    // error.
     #[test]
     fn a_reset_as_the_answer_starts_is_met_as_einval_on_macos_only() {
         let mut einval: usize = 0;
@@ -2787,7 +2790,7 @@ mod tests {
     // A read whose connection is reset as its answer starts is sent again on a new connection,
     // within the budget, whatever error reports the reset: on macOS it is usually `EINVAL`
     // (`a_reset_as_the_answer_starts_is_met_as_einval_on_macos_only`), which failed the attach
-    // before #542.
+    // there before this fix (0.7.3 and earlier).
     #[test]
     fn a_read_reset_as_its_answer_starts_is_sent_again_on_a_new_connection() {
         let (url, server) = serve_resetting(

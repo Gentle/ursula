@@ -877,14 +877,14 @@ The crate refuses to build with `panic = "abort"`.
   answer is sent again on a new connection, which also drops the other pooled connections idle for
   more than 1 s (such a device left them dead too, and ureq takes the oldest first): an append or a
   snapshot `PUT` while its outcome is unknown, and a read, `HEAD` or create within
-  `URSULA_VFS_RETRY_MS`. A refused connection fails a read at once. On macOS a reset that comes
-  in between two calls on the socket fails the next one with `EINVAL` (`Invalid argument`) rather
-  than `EPIPE` or `ECONNRESET`: ureq sets a socket option before each write and each read, and
-  macOS refuses every option on a socket a reset shut down. That `EINVAL` is no answer on macOS,
-  and on no other system (`client::reset_on_macos`). Many such devices drop
+  `URSULA_VFS_RETRY_MS`. A refused connection fails a read at once. Many such devices drop
   connections idle for about 4 minutes, so the 90 s stays well below that. Behind one that drops
   them sooner, set `URSULA_VFS_IDLE_MS` below its limit: otherwise the first request after a longer
-  pause waits out one timeout.
+  pause waits out one timeout. On macOS a reset that comes in between two calls on the socket fails
+  the next one with `EINVAL` (`Invalid argument`) rather than `EPIPE` or `ECONNRESET`: ureq sets a
+  socket option before each write and each read, and macOS refuses every option on a socket a
+  reset shut down. That `EINVAL` is no answer on macOS, and on no other system
+  (`client::reset_on_macos`).
 
 ### Versions
 
@@ -987,13 +987,13 @@ must say in its release notes to stop every owner of a stream before upgrading.
   that is no redirect alone: a `307`, a 5xx, no answer or nothing listening is none. Both agents
   resolve and connect within 5 s each.
 - Units also cover what counts as no answer. `EINVAL` from the OS is a reset on macOS and final on
-  other systems, and an `InvalidInput` that std makes up for an argument it refuses (with no OS
-  error code) is final everywhere. Neither is a failure before the connection. A stand-in resets
-  connections by closing them with bytes of the request unread. Reset as a `HEAD`'s answer starts,
-  the client meets the reset as `EINVAL` on macOS (almost every time, and at least once in ten
-  tries) and as `ECONNRESET` on Linux. A `HEAD` and a read reset this way three times are sent
-  again and succeed on the fourth connection. A reset while a 16 MiB snapshot body goes out is no
-  answer, whatever error reports it. CI runs them on macOS too.
+  other systems, and like a reset it is no failure before the connection. An `InvalidInput` that
+  std makes up for an argument it refuses (with no OS error code) is final everywhere. A stand-in
+  resets connections by closing them with bytes of the request unread. Reset as a `HEAD`'s answer
+  starts, the client meets the reset as `EINVAL` on macOS (almost every time, and at least once in
+  ten tries) and never on Linux. A `HEAD` and a read reset this way three times are sent again and
+  succeed on the fourth connection. A reset while a 16 MiB snapshot body goes out is no answer,
+  whatever error reports it. CI runs them on macOS too.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is

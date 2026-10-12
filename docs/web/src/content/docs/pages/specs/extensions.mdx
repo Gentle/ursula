@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, a JSON message text rule, and read path parameters.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, immutable reads that a shared cache can serve, a JSON message text rule, and read path parameters.
 
 The snapshot and bootstrap design in sections 2 and 3 is based on a proposal by [Loro](https://loro.dev/). Ursula implements part of it: there is no latest-snapshot redirect, no snapshot deletion and no conditional publish.
 
@@ -26,6 +26,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - [1. Buckets](#1-buckets)
 - [2. Snapshots](#2-snapshots)
 - [3. Bootstrap](#3-bootstrap)
+- [4. Immutable Reads](#4-immutable-reads)
 - [7. Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
 - [8. URL Encoding](#8-url-encoding)
 - [9. Read Path](#9-read-path)
@@ -308,6 +309,95 @@ Bootstrap is one-shot only:
 - When a server returns `410 Gone` for a read (because retention has advanced), clients SHOULD call `/bootstrap` to rebuild state, then continue tailing from the returned `Stream-Next-Offset` through the ordinary read APIs.
 - If a server has begun returning `410 Gone` for a stream (i.e., earliest retained offset > `-1`), the server MUST ensure `/bootstrap` is available and can provide a snapshot covering that earliest retained offset.
 - Clients MUST parse `/bootstrap` as an ordered sequence of parts. For a JSON stream each update part is one message; for any other stream, clients MUST NOT treat a part boundary as a message boundary.
+
+---
+
+## 4. Immutable Reads
+
+Most of a stream can no longer change: every byte below the tail and every published snapshot. This section lets a shared cache, such as a CDN, serve those parts while the server keeps serving the tail. It is independent of the application: any reader that starts behind the tail benefits, such as a subscriber replaying history or a replica that attaches from a snapshot.
+
+It adds four pieces:
+
+- the incarnation as a query parameter, so that it is part of the URL and of every cache key (Section 4.1);
+- aligned reads, so that independent readers request the same URLs (Section 4.2);
+- a response header that marks a response as immutable (Section 4.3);
+- a hint naming a separate origin for immutable reads (Section 4.4).
+
+A client that uses none of them sees no change. A server that implements none of them ignores the parameters, and a client detects that from the response (Section 4.4, client rules).
+
+### 4.1. Incarnation in the URL
+
+```
+GET {stream_url}?offset={offset}&incarnation={token}
+GET {stream_url}/snapshot/{snapshot_offset}?incarnation={token}
+```
+
+`incarnation={token}` on a catch-up read or a snapshot read is the `Stream-Incarnation` request precondition (Section 2.4) carried in the URL, with the same evaluation and the same `412 Precondition Failed` on a mismatch. A request header is not part of a cache key, so a cache would otherwise store a response of one incarnation and serve it to a reader of another.
+
+- A request that carries both the parameter and the `Stream-Incarnation` header with different values MUST be rejected with `400 Bad Request`, as MUST a malformed value or a parameter given more than once.
+- Live reads (`live=long-poll`, `live=sse`) and `offset=now` MUST reject the parameter with `400 Bad Request`. Their responses are never immutable.
+
+### 4.2. Aligned Reads
+
+```
+GET {stream_url}?offset={offset}&aligned=true&incarnation={token}
+```
+
+The server partitions each stream's offsets into chunks. An aligned read returns the bytes from `offset` to the end of the chunk that contains `offset`, or to the tail when the tail comes first. A reader that starts anywhere and continues from `Stream-Next-Offset` reaches a chunk boundary after one response, and from then on it requests exactly the URLs that every other reader of the stream requests.
+
+- The partition MUST NOT change during an incarnation, and SHOULD NOT change across server versions. A changed partition never produces a wrong response, only cache misses.
+- A chunk MUST NOT be larger than the server's response cap (Section 9.3), so an aligned read that is not at the tail always ends at a chunk boundary.
+- `aligned=true` combined with `max_bytes` or with `live` MUST be rejected with `400 Bad Request`, as MUST any other value of `aligned`.
+- On a JSON stream an aligned read MAY end inside a message, as any capped read may (Section 9.4).
+
+Ursula's chunk boundaries are the multiples of 4 MiB (4,194,304) in its offset space.
+
+### 4.3. Immutable Responses
+
+A server marks a `200 OK` response with:
+
+```
+Stream-Immutable: true
+```
+
+when every later request for the same URL that succeeds receives the same body and the same `Content-Type`, `ETag`, `Stream-Next-Offset`, `Stream-Incarnation`, `Stream-Closed`, `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest`. The server MUST send it only when:
+
+- the request carried `incarnation` (Section 4.1), and
+- it is a catch-up read whose response does not carry `Stream-Up-To-Date: true`, or one that carries `Stream-Closed: true`, or
+- it is a snapshot read (Section 2.5). Publishing different content at an offset is refused (Section 2.2).
+
+The server SHOULD send it whenever these hold.
+
+A later request for the same URL MAY fail instead: `404` after the stream is deleted or the snapshot is superseded, `410` once retention passes the offset. A cache that keeps serving a stored immutable response then serves bytes that were correct for that incarnation, which the incarnation in the URL keeps apart from any later stream at the same URL.
+
+The marker states a fact about the stream. It does not make a response storable: `Cache-Control` still governs that (base protocol Sections 8 and 10.7). A layer that knows who may read a stream, such as a gateway that authorizes every request before a cache lookup, MAY replace `Cache-Control` on a marked response with a long-lived directive, for example `private, max-age=31536000, immutable`.
+
+> **Note (informative).** Ursula's node sends `Cache-Control: no-store` on every read, marked or not, because it cannot tell a private stream from a public one. Relaxing it is left to the layer in front.
+
+### 4.4. Read Origin Hint
+
+```
+Stream-Read-Origin: https://reads.example.com
+```
+
+A server MAY send `Stream-Read-Origin` on a successful `HEAD`. Its value is an origin: a scheme, a host and an optional port, with no path. It suggests that the client send immutable reads of this stream (catch-up reads and snapshot reads that carry `incarnation`) to the same path and query on that origin, typically a CDN in front of the same server. The stream's own origin keeps every other request.
+
+A server MUST NOT send it unless requests to that origin reach the same streams at the same paths and are authorized the same way.
+
+**Client rules:**
+
+- A client MAY ignore the hint. A read origin the client is configured with, including a setting that turns the hint off, takes precedence.
+- A client MUST send only `GET` catch-up reads and snapshot reads that carry `incarnation` to the read origin. Writes, `HEAD`, live reads, `offset=now`, bootstrap, retention and `consistency=leader` reads go to the stream's own origin.
+- A client MUST ignore a hint that is not `https`, and MUST NOT send credentials to a read origin outside the stream URL's site (its registrable domain) unless configured to.
+- A client MUST accept a response from the read origin only when it is a `200 OK` whose `Stream-Incarnation` equals the requested incarnation, and for a snapshot also whose `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest` are the expected ones. This also rejects a server that ignored the parameter for a stream recreated since. On any other response or a transport error, the client repeats the request at the stream's own origin.
+- A response from the read origin may be older than the stream. A client MUST NOT take `Stream-Up-To-Date` from it as current: it learns the tail, and reads from where the read origin left it, at the stream's own origin.
+- A client SHOULD use aligned reads (Section 4.2) at the read origin, and SHOULD stop using it once the response is not marked immutable, since the rest of the stream is then within a chunk of the tail.
+
+### 4.5. Security Considerations
+
+- A shared cache keeps an immutable response after the stream is deleted, until the entry expires. A deployment that stores private stream bytes in a shared cache MUST authorize every request before the cache lookup, and SHOULD bound the lifetime of entries to how long the bytes of a deleted stream may stay reachable.
+- The cache key MUST include whatever the authorization depends on beyond the URL.
+- Reads served from a cache do not reach the server and do not renew a stream's sliding TTL (base protocol Section 5.1).
 
 ---
 

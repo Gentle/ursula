@@ -176,6 +176,7 @@ pub use rejoin::run_rejoin_vote_barrier;
 pub use sim_runtime::MadsimOpenRaftRuntime;
 pub use snapshot_codec::decode_group_snapshot;
 pub use snapshot_codec::group_snapshot_frames;
+pub use state_machine::Handoff;
 pub use state_machine::RaftGroupSnapshotBuilder;
 pub use state_machine::RaftGroupStateMachine;
 pub use state_machine::SnapshotBuildCoordinator;

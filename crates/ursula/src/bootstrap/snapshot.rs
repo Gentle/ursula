@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use tokio::time::Instant;
+use ursula_raft::Handoff;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::SnapshotBuildCoordinator;
@@ -34,14 +35,25 @@ const SNAPSHOT_PRESSURE_RETICK: Duration = Duration::from_millis(250);
 /// How often the node's unsnapshotted log is checked against its hard limit,
 /// and weighed again by a pass that waits for a build slot.
 const LOG_PRESSURE_POLL: Duration = Duration::from_millis(100);
+/// Passes a group is left out of after a trigger of it went unclaimed
+/// ([`HeldGroups`]), doubled for each such trigger in a row.
+const FIRST_HOLD_PASSES: u32 = 2;
+/// The most passes a group is left out of after triggers of it went
+/// unclaimed ([`HeldGroups`]).
+const MAX_HOLD_PASSES: u32 = 32;
 
 /// What became of one snapshot trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Trigger {
     /// The group claimed the handed-off permit, so its build runs.
     Started,
-    /// The group is gone, the trigger failed, or OpenRaft dropped it.
+    /// The group is gone, or the trigger failed.
     NotStarted,
+    /// The group did not claim the handed-off permit in time: OpenRaft
+    /// dropped the trigger, or the build waits behind the group's applies.
+    /// The pass goes on, and leaves the group out of the next passes
+    /// ([`HeldGroups`]).
+    Unclaimed,
     /// No build slot came free in time: the pass ends.
     NoSlot,
     /// The log climbed past the pressure the pass was planned for: the pass
@@ -89,29 +101,87 @@ async fn trigger_snapshot_build(
             return Trigger::NoSlot;
         }
     };
-    coordinator.hand_off(raft_group_id, permit);
-    if let Err(err) = raft.trigger().snapshot().await {
-        coordinator.reclaim_handoff(raft_group_id);
-        tracing::error!("snapshot driver trigger group {raft_group_id} error: {err}");
-        return Trigger::NotStarted;
-    }
-    let waited = tokio::time::timeout(
-        SNAPSHOT_HANDOFF_WAIT,
-        coordinator.handoff_claimed(raft_group_id),
-    )
-    .await;
-    // Unclaimed: OpenRaft dropped the trigger (e.g. a build was already running).
-    if coordinator.reclaim_handoff(raft_group_id) {
-        // Each such trigger holds the pass up for the whole wait.
-        tracing::warn!(
+    match coordinator
+        .hand_off_and_trigger(
             raft_group_id,
-            timed_out = waited.is_err(),
-            "snapshot driver: the group did not claim its build permit within \
-             {SNAPSHOT_HANDOFF_WAIT:?}; taking it back"
-        );
-        Trigger::NotStarted
-    } else {
-        Trigger::Started
+            permit,
+            SNAPSHOT_HANDOFF_WAIT,
+            raft.trigger().snapshot(),
+        )
+        .await
+    {
+        Handoff::Claimed => Trigger::Started,
+        Handoff::Unclaimed => {
+            // Each such trigger holds the pass up for the whole wait.
+            tracing::warn!(
+                raft_group_id,
+                "snapshot driver: the group did not claim its build permit within \
+                 {SNAPSHOT_HANDOFF_WAIT:?}; taking it back"
+            );
+            Trigger::Unclaimed
+        }
+        Handoff::TriggerFailed(err) => {
+            tracing::error!("snapshot driver trigger group {raft_group_id} error: {err}");
+            Trigger::NotStarted
+        }
+    }
+}
+
+/// The groups the snapshot driver leaves out of its next passes because a
+/// trigger of theirs went unclaimed.
+///
+/// OpenRaft drops a trigger while it counts a build of the group as running,
+/// which it does until RaftCore handles the build's end, after the build
+/// released its permit. A pass planned in between can draw such a trigger,
+/// and each holds the pass up for [`SNAPSHOT_HANDOFF_WAIT`] with its build
+/// slot idle. So a group whose trigger went unclaimed is left out of the next
+/// [`FIRST_HOLD_PASSES`] passes, and of twice as many after each such trigger
+/// in a row, up to [`MAX_HOLD_PASSES`], so that a group whose triggers keep
+/// going unclaimed does not head every pass. A claimed trigger clears it.
+#[derive(Debug, Default)]
+struct HeldGroups {
+    groups: BTreeMap<u32, Hold>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Hold {
+    /// Passes the group is still left out of.
+    passes: u32,
+    /// Passes its next unclaimed trigger leaves it out of.
+    next: u32,
+}
+
+impl HeldGroups {
+    /// The groups this pass leaves out, which it counts.
+    fn pass(&mut self) -> BTreeSet<u32> {
+        let held = self
+            .groups
+            .iter()
+            .filter(|(_, hold)| hold.passes > 0)
+            .map(|(group, _)| *group)
+            .collect();
+        for hold in self.groups.values_mut() {
+            hold.passes = hold.passes.saturating_sub(1);
+        }
+        held
+    }
+
+    /// Records what became of a trigger of `raft_group_id`.
+    fn triggered(&mut self, raft_group_id: u32, trigger: Trigger) {
+        match trigger {
+            Trigger::Started => {
+                self.groups.remove(&raft_group_id);
+            }
+            Trigger::Unclaimed => {
+                let hold = self.groups.entry(raft_group_id).or_insert(Hold {
+                    passes: 0,
+                    next: FIRST_HOLD_PASSES,
+                });
+                hold.passes = hold.next;
+                hold.next = hold.next.saturating_mul(2).min(MAX_HOLD_PASSES);
+            }
+            Trigger::NotStarted | Trigger::NoSlot | Trigger::Outgrown => {}
+        }
     }
 }
 
@@ -216,13 +286,16 @@ pub(crate) fn group_log_progress(snapshot: &RaftGroupMetricsSnapshot) -> GroupLo
 /// The groups to snapshot this pass under the byte-based cadence (F12e) and
 /// the node's log pressure (#519): the groups the Raft WAL reports
 /// `lagging` first, never a group with a build in `building` (the log each
-/// such build will still free), within `limits`.
+/// such build will still free) or one the driver `held` out of the pass
+/// ([`HeldGroups`], counted as building with nothing to free), within
+/// `limits`.
 pub(crate) fn plan_snapshot_drive<'a>(
     snapshots: &'a [RaftGroupMetricsSnapshot],
     cadence: &SnapshotCadence,
     limits: DriveLimits,
     lagging: &BTreeSet<RaftGroupId>,
     building: &BTreeMap<u32, u64>,
+    held: &BTreeSet<u32>,
 ) -> (SnapshotPlan, Vec<&'a RaftGroupMetricsSnapshot>) {
     let groups = snapshots
         .iter()
@@ -233,7 +306,10 @@ pub(crate) fn plan_snapshot_drive<'a>(
                 group_log_progress(snapshot)
             },
             lagging: lagging.contains(&RaftGroupId(snapshot.raft_group_id)),
-            building: building.get(&snapshot.raft_group_id).copied(),
+            building: building
+                .get(&snapshot.raft_group_id)
+                .copied()
+                .or_else(|| held.contains(&snapshot.raft_group_id).then_some(0)),
         })
         .collect::<Vec<_>>();
     let plan = cadence.plan_pass(&groups, limits);
@@ -313,12 +389,17 @@ pub fn spawn_snapshot_driver(
         runtime.metrics(),
     );
     tokio::spawn(async move {
+        let mut held_groups = HeldGroups::default();
         loop {
-            // The builds first: a build that ends between the two reads then
-            // still counts as in flight, and its group waits for the next
-            // pass instead of drawing a trigger OpenRaft may drop while it
-            // finishes the build.
+            // The builds first: a group whose build ends after this read
+            // still counts as in flight, and one whose build ended before it
+            // shows, in the metrics read next, the log after the build freed
+            // it, never the log before. OpenRaft keeps counting a build until
+            // RaftCore handles its end, after the build released its permit,
+            // so a trigger in that window still goes unclaimed: its group
+            // then sits out the next passes (`HeldGroups`).
             let building = coordinator.builds_in_flight();
+            let held = held_groups.pass();
             let snaps = registry.metrics_snapshot();
             let store_trouble = match gate.as_mut().map(|gate| gate.latest_bad()) {
                 None => false,
@@ -345,7 +426,7 @@ pub fn spawn_snapshot_driver(
                 );
             }
             let (plan, selected) =
-                plan_snapshot_drive(&snaps, &cadence, limits, &lagging, &building);
+                plan_snapshot_drive(&snaps, &cadence, limits, &lagging, &building, &held);
             // Measured the way the pass measures it below, so only a rise
             // during the pass ends it.
             let planned_pressure =
@@ -356,6 +437,7 @@ pub fn spawn_snapshot_driver(
                 let planned = selected.len();
                 let mut triggered = 0u64;
                 let mut not_started = 0u64;
+                let mut unclaimed = 0u64;
                 let mut outgrown = false;
                 // The builds the pass keeps in flight as the log moves, or
                 // none once the log outgrew the pass.
@@ -368,16 +450,18 @@ pub fn spawn_snapshot_driver(
                     PassStep::Start { builds: now } => Some(now),
                 };
                 for snapshot in selected {
-                    match trigger_snapshot_build(
+                    let trigger = trigger_snapshot_build(
                         &registry,
                         &coordinator,
                         snapshot.raft_group_id,
                         pace,
                     )
-                    .await
-                    {
+                    .await;
+                    held_groups.triggered(snapshot.raft_group_id, trigger);
+                    match trigger {
                         Trigger::Started => triggered = triggered.saturating_add(1),
                         Trigger::NotStarted => not_started = not_started.saturating_add(1),
+                        Trigger::Unclaimed => unclaimed = unclaimed.saturating_add(1),
                         Trigger::NoSlot => break,
                         Trigger::Outgrown => {
                             outgrown = true;
@@ -400,9 +484,11 @@ pub fn spawn_snapshot_driver(
                         level = plan.pressure.level(),
                         builds,
                         building = building.len(),
+                        held = held.len(),
                         planned,
                         triggered,
                         not_started,
+                        unclaimed,
                         outgrown,
                         pass_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                         "raft snapshot pressure pass completed"
@@ -428,11 +514,14 @@ pub fn spawn_snapshot_driver(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     use ursula_raft::snapshot_cadence::LogPressure;
 
+    use super::HeldGroups;
     use super::SNAPSHOT_PRESSURE_RETICK;
+    use super::Trigger;
     use super::next_pause;
     use super::should_drive_snapshots;
 
@@ -465,6 +554,38 @@ mod tests {
         // A shorter interval stays.
         let short = Duration::from_millis(100);
         assert_eq!(next_pause(short, escalated, 1, 0, false), short);
+    }
+
+    /// A group whose trigger went unclaimed sits out the next two passes,
+    /// twice as many after each such trigger in a row, at most 32, until a
+    /// trigger of it is claimed.
+    #[test]
+    fn a_group_whose_trigger_went_unclaimed_sits_out_the_next_passes() {
+        let mut held = HeldGroups::default();
+        let sits_out =
+            |held: &mut HeldGroups| (0..64).take_while(|_| held.pass().contains(&7)).count();
+        assert!(held.pass().is_empty());
+        held.triggered(7, Trigger::Unclaimed);
+        assert_eq!(sits_out(&mut held), 2);
+        held.triggered(7, Trigger::Unclaimed);
+        assert_eq!(sits_out(&mut held), 4);
+        for _ in 0..5 {
+            held.triggered(7, Trigger::Unclaimed);
+        }
+        assert_eq!(sits_out(&mut held), 32);
+        // A claimed trigger clears it.
+        held.triggered(7, Trigger::Started);
+        held.triggered(7, Trigger::Unclaimed);
+        assert_eq!(sits_out(&mut held), 2);
+        // Other outcomes leave it as it was.
+        held.triggered(7, Trigger::NotStarted);
+        held.triggered(7, Trigger::NoSlot);
+        held.triggered(7, Trigger::Outgrown);
+        held.triggered(7, Trigger::Unclaimed);
+        assert_eq!(sits_out(&mut held), 4);
+        // Each group is held on its own.
+        held.triggered(8, Trigger::Unclaimed);
+        assert_eq!(held.pass(), BTreeSet::from([8]));
     }
 
     #[test]

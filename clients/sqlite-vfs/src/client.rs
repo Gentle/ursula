@@ -856,7 +856,7 @@ fn append_on(
             }
             Err(e) => {
                 resend.fresh = true;
-                // Failed before any byte of it went out (`net`): this attempt applied nothing.
+                // One that failed before any byte of it went out (`net`) applied nothing.
                 let (e, sent_nothing) = net::sent_nothing(e);
                 let refusal = sent_nothing.then(|| WriteRefusal::Unreachable {
                     reason: e.to_string(),

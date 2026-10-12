@@ -28,6 +28,7 @@ use crate::error::Gone;
 use crate::error::WriteRefusal;
 use crate::log;
 use crate::log::Level;
+use crate::net;
 
 /// `Producer-Id` prefix; the stream incarnation follows (`producer_id`).
 const PRODUCER: &str = "sqlite-ursula-vfs";
@@ -81,9 +82,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// An agent whose requests time out after `timeout` and that keeps a connection for
 /// `max_idle_age` after its last request. Resolving and connecting time out after
 /// `CONNECT_TIMEOUT` each. The pool keeps ureq's bounds: at most 3 idle connections per host and
-/// 10 in all.
+/// 10 in all. Hosts resolve through the shared cache of `net::Resolver`, and a failure to resolve
+/// or to connect proves the request never went out (`net`). ureq's proxy from the environment
+/// applies, as it always did (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`): a CONNECT
+/// proxy's host resolves through the same cache, and a failure to reach the proxy, or to have it
+/// open the tunnel, proves nothing went out either.
 fn new_agent(timeout: Duration, max_idle_age: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    new_agent_with(timeout, max_idle_age, net::Resolver::shared())
+}
+
+/// `new_agent` resolving through `resolver`.
+fn new_agent_with<R: ureq::unversioned::resolver::Resolver>(
+    timeout: Duration,
+    max_idle_age: Duration,
+    resolver: net::Resolver<R>,
+) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .timeout_resolve(Some(CONNECT_TIMEOUT))
         .timeout_connect(Some(CONNECT_TIMEOUT))
@@ -95,8 +109,8 @@ fn new_agent(timeout: Duration, max_idle_age: Duration) -> ureq::Agent {
         .max_redirects(0)
         .max_idle_age(max_idle_age)
         .tls_config(tls())
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(config, net::Connector::new(resolver.clone()), resolver)
 }
 
 /// TLS for `https://` stream URLs: the bundled Mozilla roots, or only the certificate authorities
@@ -173,7 +187,7 @@ fn prepared<B>(req: ureq::RequestBuilder<B>, resend: Resend) -> ureq::RequestBui
 /// error (an answer that is not HTTP/1, such as from a gRPC port, is the same every time), nor
 /// anything about the request or the setup.
 fn no_answer(e: &ureq::Error) -> bool {
-    match e {
+    match net::unwrapped(e) {
         ureq::Error::Io(e) => {
             matches!(
                 e.kind(),
@@ -221,6 +235,9 @@ fn reset_on_macos(e: &std::io::Error) -> bool {
 /// reports it (`EINVAL` on macOS among them, `reset_on_macos`): it came on an open connection,
 /// which may have carried part of the request or the whole of it.
 pub(crate) fn before_connection(e: &ureq::Error) -> bool {
+    if net::is_not_sent(e) {
+        return true;
+    }
     match e {
         ureq::Error::HostNotFound
         | ureq::Error::ConnectionFailed
@@ -655,12 +672,44 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// (`redirect_retried`); any other redirect (a 308 among them) fails the append
 /// ([`Error::Redirected`]).
 ///
+/// An attempt that failed before any byte of it went out (`net::NotSent`: its host did not
+/// resolve, or no connection to it was made, the TLS handshake included) applied nothing, as a
+/// proven refusal did. It is retried like an unknown outcome, but leaves the append's outcome as it
+/// was: an append whose every attempt failed so, or was refused, ends as [`Append::Refused`] once
+/// the budget runs out, with the last attempt's refusal, or [`WriteRefusal::Unreachable`] when the
+/// last attempt failed before it went out. So a server that cannot be reached fails the commit
+/// alone instead of poisoning the database. A failure on a connection that was made, a pooled one
+/// included, is an unknown outcome.
+///
 /// A frame over `max_frame_bytes()` is never sent: it ends as [`Append::Unsent`] at once, with
 /// [`WriteRefusal::TooLarge`]. A 413 that proves it applied nothing (`applied_nothing`: marked and
 /// vouched for) ends as [`Append::Refused`] with the same kind, while no attempt can have reached
 /// the stream (any other is a rejection, like any other 4xx that proves nothing). The same frame
 /// can never pass, so neither is retried.
 pub(crate) fn append(
+    url: &str,
+    incarnation: &str,
+    producer: &str,
+    body: &[u8],
+    epoch: u64,
+    seq: u64,
+) -> Append {
+    let retrying = Retrying {
+        agent: agent(),
+        deadline: retry_deadline(),
+    };
+    append_on(retrying, url, incarnation, producer, body, epoch, seq)
+}
+
+/// What `append_on` sends its attempts with: the agent, and when the retry budget runs out.
+struct Retrying<'a> {
+    agent: &'a ureq::Agent,
+    deadline: Instant,
+}
+
+/// `append`'s attempts, on `retrying.agent` until `retrying.deadline`.
+fn append_on(
+    retrying: Retrying<'_>,
     url: &str,
     incarnation: &str,
     producer: &str,
@@ -676,7 +725,7 @@ pub(crate) fn append(
         return Append::Unsent(WriteRefusal::frame_over_limit(body.len(), limit));
     }
     let started = Instant::now();
-    let deadline = retry_deadline();
+    let Retrying { agent, deadline } = retrying;
     let mut backoff = Duration::from_millis(20);
     let mut attempts: u32 = 0;
     // How the next attempt goes out, after a refused token or no answer.
@@ -685,7 +734,7 @@ pub(crate) fn append(
     let mut reached = false;
     loop {
         attempts = attempts.saturating_add(1);
-        let mut req = prepared(agent().post(url), std::mem::take(&mut resend))
+        let mut req = prepared(agent.post(url), std::mem::take(&mut resend))
             .header("content-type", CONTENT_TYPE)
             .header("stream-incarnation", incarnation)
             .header("producer-id", producer)
@@ -810,7 +859,12 @@ pub(crate) fn append(
             }
             Err(e) => {
                 resend.fresh = true;
-                (Attempt::Transport(Box::new(e)), None)
+                // One that failed before any byte of it went out (`net`) applied nothing.
+                let (e, sent_nothing) = net::sent_nothing(e);
+                let refusal = sent_nothing.then(|| WriteRefusal::Unreachable {
+                    reason: e.to_string(),
+                });
+                (Attempt::Transport(Box::new(e)), refusal)
             }
         };
         // An answer that does not prove the attempt applied nothing (`refusal` is set exactly
@@ -877,6 +931,7 @@ pub(crate) fn create_stream(url: &str) -> Result<(), Error> {
 
 /// A request that got no answer.
 fn http_error(op: &'static str, url: &str, e: ureq::Error) -> Error {
+    let (e, _sent_nothing) = net::sent_nothing(e);
     Error::Http {
         op,
         url: url.to_owned(),
@@ -1161,7 +1216,7 @@ pub(crate) fn put_idempotent(
             }
             Err(e) => {
                 resend.fresh = true;
-                Attempt::Transport(Box::new(e))
+                Attempt::Transport(Box::new(net::sent_nothing(e).0))
             }
         };
         if !resend.refresh {
@@ -1326,9 +1381,11 @@ mod tests {
 
     use super::Append;
     use super::Proof;
+    use super::Retrying;
     use super::agent;
     use super::answers;
     use super::append;
+    use super::append_on;
     use super::applied_nothing;
     use super::before_connection;
     use super::bulk_agent;
@@ -1345,6 +1402,7 @@ mod tests {
     use super::mock::serve;
     use super::mock::vouched;
     use super::new_agent;
+    use super::new_agent_with;
     use super::no_answer;
     use super::put_idempotent;
     use super::read_from;
@@ -1353,6 +1411,7 @@ mod tests {
     use crate::error::Error;
     use crate::error::FrameLimit;
     use crate::error::WriteRefusal;
+    use crate::net;
 
     /// Held by each test that sets the process-wide token (`set_token`): tests run in parallel.
     static TOKEN: Mutex<()> = Mutex::new(());
@@ -2959,5 +3018,241 @@ mod tests {
             .find_map(|line| line.strip_prefix("content-length:"))
             .map_or(0, |n| n.trim().parse().unwrap());
         conn.read_exact(&mut vec![0u8; len]).is_ok()
+    }
+
+    /// A resolver whose lookups answer from its answers in order, the last one again once they
+    /// run out, and which counts them. Clones share the count.
+    #[derive(Clone, Debug)]
+    struct Lookups(Arc<Script>);
+
+    #[derive(Debug)]
+    struct Script {
+        made: AtomicUsize,
+        answers: Vec<Result<std::net::SocketAddr, ureq::Timeout>>,
+    }
+
+    impl Lookups {
+        fn new(answers: Vec<Result<std::net::SocketAddr, ureq::Timeout>>) -> Self {
+            Lookups(Arc::new(Script {
+                made: AtomicUsize::new(0),
+                answers,
+            }))
+        }
+
+        fn made(&self) -> usize {
+            self.0.made.load(Ordering::Relaxed)
+        }
+    }
+
+    impl ureq::unversioned::resolver::Resolver for Lookups {
+        fn resolve(
+            &self,
+            _uri: &ureq::http::Uri,
+            _config: &ureq::config::Config,
+            _timeout: ureq::unversioned::transport::NextTimeout,
+        ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+            let made = self.0.made.fetch_add(1, Ordering::Relaxed);
+            let answer = self.0.answers[made.min(self.0.answers.len().saturating_sub(1))];
+            let mut addrs = self.empty();
+            addrs.push(answer.map_err(ureq::Error::Timeout)?);
+            Ok(addrs)
+        }
+    }
+
+    /// An agent like `agent()` whose hosts resolve through the cache over `lookups`.
+    fn agent_over(lookups: &Lookups) -> ureq::Agent {
+        new_agent_with(
+            Duration::from_secs(10),
+            Duration::from_secs(90),
+            net::Resolver::new(lookups.clone()),
+        )
+    }
+
+    /// The address `serve` listens on, from its URL.
+    fn served(url: &str) -> std::net::SocketAddr {
+        url.trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn within(retry_budget: Duration) -> Instant {
+        Instant::now().checked_add(retry_budget).unwrap()
+    }
+
+    // Requests to a host go out with one lookup while its addresses are fresh (`net::DNS_FRESH`),
+    // where ureq looked the host up before every request, a pooled connection's included.
+    #[test]
+    fn requests_to_a_host_share_one_lookup() {
+        let (url, server) = serve(vec![answer("200 OK"); 3]);
+        let lookups = Lookups::new(vec![Ok(served(&url))]);
+        let agent = agent_over(&lookups);
+        for _ in 0..3 {
+            let r = agent.head("http://gw.test/b/s").call().unwrap();
+            assert_eq!(r.status().as_u16(), 200);
+        }
+        assert_eq!(server.join().unwrap().len(), 3);
+        assert_eq!(lookups.made(), 1);
+    }
+
+    // A connection that fails makes its host's lookup due, no sooner than 5 s after the last
+    // lookup: the next request then looks the host up again and reaches the endpoint at its new
+    // address, where the cached address kept failing.
+    #[test]
+    fn a_failed_connection_looks_the_host_up_again() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let moved_from = closed.local_addr().unwrap();
+        drop(closed);
+        let (url, server) = serve(vec![answer("200 OK")]);
+        let lookups = Lookups::new(vec![Ok(moved_from), Ok(served(&url))]);
+        let resolver = net::Resolver::new(lookups.clone());
+        let agent = new_agent_with(
+            Duration::from_secs(10),
+            Duration::from_secs(90),
+            resolver.clone(),
+        );
+        let e = agent.head("http://gw.test/b/s").call().unwrap_err();
+        assert!(net::is_not_sent(&e), "{e}");
+        resolver.backdate(net::DNS_RETRY);
+        let r = agent.head("http://gw.test/b/s").call().unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert_eq!(lookups.made(), 2);
+    }
+
+    // Through a CONNECT proxy (ureq's proxy from the environment), the tunnel goes through the
+    // marking resolver and connector, and then the connector's own marking: a proxy whose host
+    // does not resolve still fails as never sent, once, so the failure is no answer, and a read is
+    // sent again, as before the marking.
+    #[test]
+    fn a_proxy_that_does_not_resolve_fails_as_never_sent_once() {
+        let lookups = Lookups::new(vec![Err(ureq::Timeout::Resolve)]);
+        let resolver = net::Resolver::new(lookups.clone());
+        let config = ureq::Agent::config_builder()
+            .proxy(Some(ureq::Proxy::new("http://proxy.test:3128").unwrap()))
+            .build();
+        let agent =
+            ureq::Agent::with_parts(config, net::Connector::new(resolver.clone()), resolver);
+        let e = agent.get("http://gw.test/b/s").call().unwrap_err();
+        assert!(no_answer(&e) && before_connection(&e), "{e}");
+        assert!(matches!(
+            net::sent_nothing(e),
+            (ureq::Error::Timeout(ureq::Timeout::Resolve), true)
+        ));
+        assert_eq!(lookups.made(), 1);
+    }
+
+    // ureq completes the TLS handshake in its connector, before any byte of the request: a
+    // handshake that fails (an endpoint that answers plain HTTP) is marked as never sent, which
+    // the proof that such a failure applied nothing relies on (`net`).
+    #[test]
+    fn a_failed_tls_handshake_sends_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}/b/s", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let e = agent().get(&url).call().unwrap_err();
+        server.join().unwrap();
+        assert!(net::is_not_sent(&e), "{e}");
+    }
+
+    // A commit that cannot reach its endpoint, every attempt refused by the host before a
+    // connection was made, applied nothing: it fails alone, with the producer sequence still free,
+    // and the database is not poisoned. It used to end as an unknown outcome.
+    #[test]
+    fn an_append_whose_every_attempt_fails_before_sending_fails_alone() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", closed.local_addr().unwrap());
+        drop(closed);
+        let retrying = Retrying {
+            agent: agent(),
+            deadline: within(Duration::from_millis(500)),
+        };
+        let unreachable = append_on(retrying, &url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&unreachable, Append::Refused(WriteRefusal::Unreachable { reason }) if reason.starts_with("io: ")),
+            "{}",
+            outcome(&unreachable)
+        );
+    }
+
+    // A lookup that times out (`Timeout::Resolve`, a DNS server that does not answer) with no
+    // address to stand in fails the attempt before anything went out: the commit fails alone.
+    #[test]
+    fn an_append_whose_lookups_time_out_fails_alone() {
+        let lookups = Lookups::new(vec![Err(ureq::Timeout::Resolve)]);
+        let agent = agent_over(&lookups);
+        let retrying = Retrying {
+            agent: &agent,
+            deadline: within(Duration::from_millis(500)),
+        };
+        let unreachable = append_on(retrying, "http://gw.test/b/s", "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&unreachable, Append::Refused(WriteRefusal::Unreachable { reason }) if reason == "timeout: resolve"),
+            "{}",
+            outcome(&unreachable)
+        );
+        // The first lookup's failure holds the next one off for `DNS_RETRY` (5 s), so the
+        // budget's other attempts fail as it did, with no lookup.
+        assert_eq!(lookups.made(), 1);
+    }
+
+    // An attempt that failed before it went out leaves the append's outcome as it was: after it,
+    // a proven refusal still fails the commit alone, where it used to be unknown.
+    #[test]
+    fn a_failure_before_sending_leaves_a_later_refusal_proven() {
+        let (url, server) = serve(vec![answer(&format!(
+            "503 Service Unavailable\r\n{}\r\n{LAST}",
+            vouched("RaftLogPressure")
+        ))]);
+        let lookups = Lookups::new(vec![Err(ureq::Timeout::Resolve), Ok(served(&url))]);
+        let agent = agent_over(&lookups);
+        let retrying = Retrying {
+            agent: &agent,
+            deadline: within(Duration::from_secs(30)),
+        };
+        let refused = append_on(retrying, "http://gw.test/b/s", "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(
+                &refused,
+                Append::Refused(WriteRefusal::NotApplied { status: 503, .. })
+            ),
+            "{}",
+            outcome(&refused)
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    // A failure on a connection that was made may come after the request went out: an attempt that
+    // got no answer keeps the append unknown, whatever failed before sending after it.
+    #[test]
+    fn a_failure_after_connecting_keeps_the_append_unknown() {
+        let (url, server) = serve(vec![String::new()]);
+        let retrying = Retrying {
+            agent: agent(),
+            deadline: within(Duration::from_millis(500)),
+        };
+        let unknown = append_on(retrying, &url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(&unknown, Append::Failed(Error::AppendUnknown { .. })),
+            "{}",
+            outcome(&unknown)
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    fn outcome(append: &Append) -> String {
+        match append {
+            Append::Refused(refusal) => format!("refused: {} ({})", refusal.kind(), refusal),
+            Append::Failed(e) => format!("failed: {e}"),
+            Append::Acked { .. } => "acked".to_owned(),
+            _ => "another outcome".to_owned(),
+        }
     }
 }

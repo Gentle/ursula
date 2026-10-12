@@ -160,11 +160,9 @@ pub(crate) enum Error {
         url: String,
         status: u16,
     },
-    /// Refused before it reached the stream, which applied nothing of it (see [`WriteRefusal`]).
-    #[error(
-        "{op} {url}: {refusal}: a layer in front of the stream refused it, and nothing of it \
-         reached the stream"
-    )]
+    /// Refused before it reached the stream, or never sent, so that the stream applied nothing of
+    /// it (see [`WriteRefusal`]).
+    #[error("{op} {url}: {refusal}: {}, and nothing of it reached the stream", .refusal.how())]
     Refused {
         op: &'static str,
         url: String,
@@ -426,6 +424,12 @@ pub(crate) enum WriteRefusal {
     /// transaction can never be sent: split it.
     #[error("{}", too_large(*.bytes, .over))]
     TooLarge { bytes: usize, over: FrameLimit },
+    /// Every attempt failed before any byte of it went out, or was refused, until the retry budget
+    /// ran out, and the last one failed so (`net::NotSent`): its host did not resolve, or no
+    /// connection to it was made, the TLS handshake included. No layer refused it: nothing reached
+    /// one. `reason` is the last attempt's failure.
+    #[error("{reason}")]
+    Unreachable { reason: String },
 }
 
 /// The limit a commit frame too large for one request is over ([`WriteRefusal::TooLarge`]).
@@ -456,7 +460,19 @@ impl WriteRefusal {
     /// refused token, a denial, rate limiting, a payment or write pressure do. A frame too large
     /// for one request says nothing about any other write.
     pub(crate) fn refuses_other_writes(&self) -> bool {
-        !matches!(self, WriteRefusal::TooLarge { .. })
+        !matches!(
+            self,
+            WriteRefusal::TooLarge { .. } | WriteRefusal::Unreachable { .. }
+        )
+    }
+
+    /// How the write came to apply nothing, for an error's message: refused by a layer in front of
+    /// the stream, or its last attempt never sent (earlier ones may have been refused).
+    pub(crate) fn how(&self) -> &'static str {
+        match self {
+            WriteRefusal::Unreachable { .. } => "its last attempt failed before it went out",
+            _ => "a layer in front of the stream refused it",
+        }
     }
 
     /// What refused the write, as `ursula_status` reports it (`refused_kind`).
@@ -468,6 +484,7 @@ impl WriteRefusal {
             WriteRefusal::RateLimited { .. } => "rate_limited",
             WriteRefusal::NotApplied { .. } => "not_applied",
             WriteRefusal::TooLarge { .. } => "too_large",
+            WriteRefusal::Unreachable { .. } => "unreachable",
         }
     }
 
@@ -481,7 +498,9 @@ impl WriteRefusal {
             | WriteRefusal::Unauthorized { body }
             | WriteRefusal::Forbidden { body }
             | WriteRefusal::RateLimited { body } => body,
-            WriteRefusal::NotApplied { reason, .. } => reason,
+            WriteRefusal::NotApplied { reason, .. } | WriteRefusal::Unreachable { reason } => {
+                reason
+            }
             WriteRefusal::TooLarge {
                 over: FrameLimit::InFront { token },
                 ..

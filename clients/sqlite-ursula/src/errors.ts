@@ -29,20 +29,26 @@ export class UrsulaReplicationError extends Error {
  * - `too_large`: the transaction's commit frame is larger than one request may be, so it was never
  *   sent (over `URSULA_VFS_MAX_FRAME_BYTES`, 32 MiB by default), or a lower limit in front refused it
  *   with a marked and vouched `413`. The same transaction can never be sent: split it into smaller
- *   ones.
+ *   ones;
+ * - `unreachable`: every attempt failed before any byte of it went out, or was refused as above,
+ *   until the retry budget ran out, and the last one failed before it went out: its host did not
+ *   resolve, or no connection to it was made (the TLS handshake included). Commit again once the
+ *   endpoint is reachable. The reason is the last attempt's failure (such as `timeout: resolve`).
+ *   From 0.7.4.
  *
  * The marker counts only with the vouch, which `ursula gateway` adds from 0.7.3 on. Without such a
  * gateway in front of the servers, only a `401`, `402` or `429`, or the extension's own frame limit,
  * refuses a write this way.
  */
-export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden" | "rate_limited" | "not_applied" | "too_large";
+export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden" | "rate_limited" | "not_applied" | "too_large" | "unreachable";
 
 /**
  * A write refused before it reached the stream, so that nothing of it was applied: by a layer in front
  * of the stream (an authorizer, a quota or billing service, a gateway or a proxy), by the server
  * before it proposed the write (under write pressure, or while it knows no leader for the stream),
  * or by the extension itself, which never sends a transaction over its frame limit (kind
- * `too_large`: only a smaller transaction succeeds). Unlike an {@link UrsulaReplicationError}, it
+ * `too_large`: only a smaller transaction succeeds), or a write that never went out because the
+ * stream's endpoint could not be reached (kind `unreachable`). Unlike an {@link UrsulaReplicationError}, it
  * leaves the file usable. A refused commit was rolled back, but the file is not poisoned: reads go on
  * from the local file, and later commits are sent as usual and succeed once the refusals stop, with
  * no new attach. A refused attach claimed nothing: attach again later, or with `{ readOnly: true }`
@@ -56,7 +62,7 @@ export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden"
 export class UrsulaWriteRefusedError extends Error {
 	/** What refused it, for a refused commit. `null` for an attach refused other than with a `402`, whose message names it. */
 	readonly kind: WriteRefusedKind | null;
-	/** Why (`refused_reason`), for a refused commit: the layer's explanation, or for `too_large` the frame's size and the limit. `null` when the layer sent no explanation, and for a refused attach, whose message carries it. */
+	/** Why (`refused_reason`), for a refused commit: the layer's explanation, for `too_large` the frame's size and the limit, and for `unreachable` the last attempt's failure (such as `timeout: resolve`). `null` when the layer sent no explanation, and for a refused attach, whose message carries it. */
 	readonly reason: string | null;
 	constructor(message: string, kind: WriteRefusedKind | null, reason: string | null, cause: unknown) {
 		super(message, { cause });

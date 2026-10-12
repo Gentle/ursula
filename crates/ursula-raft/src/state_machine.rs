@@ -99,7 +99,8 @@ struct SnapshotBuildCoordinatorInner {
     next_handoff: AtomicU64,
     /// The builds that hold a permit, by build number. The snapshot driver
     /// reads them to skip groups that already build and to wait for a free
-    /// slot (#519).
+    /// slot (#519). A hand-off taken back marks it changed too, for the
+    /// waits on hand-offs.
     builds: watch::Sender<BTreeMap<u64, BuildInFlight>>,
     /// Numbers the builds in `builds`.
     next_build: AtomicU64,
@@ -375,6 +376,35 @@ impl SnapshotBuildCoordinator {
         }
     }
 
+    /// Waits until no build of `raft_group_id` holds a permit.
+    pub async fn build_ended(&self, raft_group_id: u32) {
+        // Subscribed before the check, so a build that ends right after it
+        // still wakes the wait.
+        let mut builds = self.inner.builds.subscribe();
+        while builds
+            .borrow_and_update()
+            .values()
+            .any(|build| build.raft_group_id == raft_group_id)
+        {
+            if builds.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Waits until no permit handed to `raft_group_id` is pending: a build
+    /// claimed it, or its caller took it back ([`Handoff::Busy`]).
+    pub async fn handoff_settled(&self, raft_group_id: u32) {
+        // Subscribed before the check, so a claim or a take-back right after
+        // it still wakes the wait.
+        let mut builds = self.inner.builds.subscribe();
+        while self.handoffs().contains_key(&raft_group_id) {
+            if builds.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Reserves `permit` for the next snapshot build of `raft_group_id`
     /// ([`SnapshotBuildCoordinator::hand_off_and_trigger`]) and returns the
     /// hand-off's number, unless a permit handed to the group is still
@@ -414,7 +444,12 @@ impl SnapshotBuildCoordinator {
         };
         // The permit goes back to the node's permits outside the lock.
         drop(handoffs);
-        taken.is_some()
+        let taken = taken.is_some();
+        if taken {
+            // Wakes the waits on hand-offs.
+            self.inner.builds.send_modify(|_builds| {});
+        }
+        taken
     }
 
     /// Claims the permit handed off to `raft_group_id` for a build covering
@@ -2429,6 +2464,45 @@ mod tests {
         assert!(!build.reclaim_handoff(group, claimed_earlier));
         assert!(build.handoff_pending(group, token));
         assert!(build.reclaim_handoff(group, token));
+        assert_eq!(build.available_permits(), 2);
+    }
+
+    /// #529: a wait for a group's pending hand-off ends once a build
+    /// claims it or its caller takes it back, both of which wake it.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_pending_handoff_settles_when_claimed_or_taken_back() {
+        let build = SnapshotBuildCoordinator::new(2);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+
+        let token = build
+            .hand_off(group, build.acquire().await.expect("a permit"))
+            .expect("no hand-off pending");
+        let settled = build.handoff_settled(group);
+        tokio::pin!(settled);
+        assert!(futures_util::poll!(&mut settled).is_pending());
+        assert!(build.reclaim_handoff(group, token));
+        assert!(futures_util::poll!(&mut settled).is_ready());
+
+        build
+            .hand_off(group, build.acquire().await.expect("a permit"))
+            .expect("no hand-off pending");
+        let settled = build.handoff_settled(group);
+        tokio::pin!(settled);
+        assert!(futures_util::poll!(&mut settled).is_pending());
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("the hand-off's permit builds");
+        assert!(futures_util::poll!(&mut settled).is_ready());
+        // The build of the group holds its permit until it ends.
+        let ended = build.build_ended(group);
+        tokio::pin!(ended);
+        assert!(futures_util::poll!(&mut ended).is_pending());
+        drop(builder);
+        assert!(futures_util::poll!(&mut ended).is_ready());
         assert_eq!(build.available_permits(), 2);
     }
 

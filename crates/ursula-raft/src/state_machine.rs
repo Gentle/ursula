@@ -78,6 +78,10 @@ use crate::snapshot_references::SnapshotReferences;
 use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
 
+/// One of the node's snapshot build permits, which bound the builds it runs
+/// at once ([`SnapshotBuildCoordinator`]).
+pub type SnapshotBuildPermit = OwnedSemaphorePermit;
+
 #[derive(Debug, Clone)]
 pub struct SnapshotBuildCoordinator {
     inner: Arc<SnapshotBuildCoordinatorInner>,
@@ -222,7 +226,7 @@ impl SnapshotBuildCoordinator {
         self.inner.builds.borrow().len()
     }
 
-    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, GroupEngineError> {
+    pub async fn acquire(&self) -> Result<SnapshotBuildPermit, GroupEngineError> {
         self.inner
             .semaphore
             .clone()
@@ -242,7 +246,7 @@ impl SnapshotBuildCoordinator {
         &self,
         poll: Duration,
         mut limit: impl FnMut() -> Option<usize>,
-    ) -> Result<Option<OwnedSemaphorePermit>, GroupEngineError> {
+    ) -> Result<Option<SnapshotBuildPermit>, GroupEngineError> {
         let mut builds = self.inner.builds.subscribe();
         loop {
             let Some(slots) = limit() else {
@@ -277,6 +281,22 @@ impl SnapshotBuildCoordinator {
         }
     }
 
+    /// Waits until no build of `raft_group_id` holds a permit.
+    pub async fn build_ended(&self, raft_group_id: u32) {
+        // Subscribed before the check, so a build that ends right after it
+        // still wakes the wait.
+        let mut builds = self.inner.builds.subscribe();
+        while builds
+            .borrow_and_update()
+            .values()
+            .any(|build| build.raft_group_id == raft_group_id)
+        {
+            if builds.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Reserves `permit` for the next snapshot build of `raft_group_id`.
     ///
     /// The snapshot driver acquires a permit (waiting until fewer builds run
@@ -285,7 +305,7 @@ impl SnapshotBuildCoordinator {
     /// refused while other groups hold every permit, so a driver firing many
     /// groups at once built about one per tick and the Raft log outgrew
     /// memory under sustained writes.
-    pub fn hand_off(&self, raft_group_id: u32, permit: OwnedSemaphorePermit) {
+    pub fn hand_off(&self, raft_group_id: u32, permit: SnapshotBuildPermit) {
         self.handoffs().insert(raft_group_id, permit);
     }
 

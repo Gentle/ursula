@@ -27,6 +27,12 @@
 //! applied that rule. A client trusts the marker only together with the vouch
 //! (see [`ursula_proto::headers`]).
 //!
+//! A refusal the gateway decides from a request's head alone (access control,
+//! tenant admission) goes out once it has read the request's body, up to
+//! `max_request_body_bytes` and for 5 s at most, so that a client that sends
+//! its whole body before it reads the answer gets the refusal instead of a
+//! closed connection (#540).
+//!
 //! Module map:
 //!
 //! - [`auth`]: opt-in, provider-neutral authentication and authorization hooks.
@@ -47,6 +53,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::body::HttpBody as _;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::Method;
@@ -61,6 +68,7 @@ use axum::http::header::RETRY_AFTER;
 use axum::http::header::WWW_AUTHENTICATE;
 use axum::response::IntoResponse;
 use axum::response::Response as AxumResponse;
+use http_body_util::BodyExt as _;
 use percent_encoding::percent_decode_str;
 use tokio::time::Instant;
 use tracing::debug;
@@ -119,6 +127,10 @@ const MAX_LEADER_REDIRECTS: usize = 3;
 /// hop under way runs to its answer: a long-poll or a large upload that
 /// reached the leader is not cut short.
 const LEADER_REDIRECT_DEADLINE: Duration = Duration::from_secs(5);
+/// How long the gateway reads the body of a request it refused from the head
+/// alone before it sends the refusal anyway ([`Gateway::refuse_unread`]). A
+/// client that sends its body slowly holds the connection this long at most.
+const REFUSED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Default)]
@@ -133,6 +145,8 @@ struct GatewayMetrics {
     leader_searches: AtomicU64,
     leader_not_found: AtomicU64,
     upstream_ejections: AtomicU64,
+    refusal_drains: AtomicU64,
+    refusal_drains_cut: AtomicU64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -159,6 +173,15 @@ struct GatewayMetricsSnapshot {
     /// Upstreams left out of selection now: inside their window, or with a
     /// probe outstanding.
     upstream_ejected: usize,
+    /// Requests refused from their head alone whose body the gateway read
+    /// before it answered ([`Gateway::refuse_unread`]), counted as the
+    /// reading starts.
+    refusal_drains: u64,
+    /// Those whose reading stopped before the body ended: at
+    /// `max_request_body_bytes`, after [`REFUSED_BODY_DRAIN_TIMEOUT`], or on a
+    /// body that failed. The connection then closes after the refusal, and a
+    /// client still sending the body may see that instead of the refusal.
+    refusal_drains_cut: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -321,7 +344,7 @@ impl Gateway {
 
         let context = match self.gate(&parts).await {
             Ok(context) => context,
-            Err(refusal) => return refusal.into_response(),
+            Err(refusal) => return self.refuse_unread(refusal, body).await,
         };
         if self.access_control.is_some() {
             // The credential terminates at the gateway. Internal Ursula nodes
@@ -333,7 +356,7 @@ impl Gateway {
         if let Some(context) = &context {
             match self.admit(context) {
                 Ok(guard) => live_guard = guard,
-                Err(refusal) => return refusal.into_response(),
+                Err(refusal) => return self.refuse_unread(refusal, body).await,
             }
         }
 
@@ -485,6 +508,44 @@ impl Gateway {
                 .map_err(Refusal::Admission);
         }
         Ok(None)
+    }
+
+    /// Answers with `refusal`, which the gateway decided from the request's
+    /// head alone ([`Gateway::gate`], [`Gateway::admit`]), once it has read
+    /// the request's `body` to its end, dropping each chunk as it arrives
+    /// (#540). Answered with its body unread, a request over HTTP/1.1 loses
+    /// its connection: hyper reads once more, and closes the connection
+    /// unless that read reached the end of the body. A client that sends its
+    /// whole body before it reads the answer, as ureq (the SQLite extension's
+    /// HTTP client) does, then meets a failed write or a reset instead of the
+    /// refusal, which says nothing about whether the request was applied.
+    ///
+    /// Each request's reading is bounded: `max_request_body_bytes` at most,
+    /// the most the gateway buffers of a request it forwards, and
+    /// [`REFUSED_BODY_DRAIN_TIMEOUT`] at most. At either bound the refusal
+    /// goes out at once and the connection closes, as after the `413` for a
+    /// body over the limit. A reading keeps no byte of the body and adds no
+    /// task: it runs in the request's own handler. So the requests under way
+    /// bound the readings under way, as they bound the bodies the gateway
+    /// buffers whole for the requests it forwards, which have no time limit.
+    ///
+    /// Reading the body of a request that carries `Expect: 100-continue` has
+    /// hyper send `100 Continue`, so such a client sends its body as well.
+    /// Answering it at once would spare it the upload, but a proxy that
+    /// answers `100 Continue` itself and passes the header on would then meet
+    /// the closed connection again.
+    async fn refuse_unread(&self, refusal: Refusal, body: Body) -> AxumResponse {
+        if !body.is_end_stream() {
+            self.metrics.refusal_drains.fetch_add(1, Ordering::Relaxed);
+            let drained = drain(body, self.config.max_request_body_bytes).await;
+            if drained != Drained::Whole {
+                self.metrics
+                    .refusal_drains_cut
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            debug!(?drained, "read the body of a refused request");
+        }
+        refusal.into_response()
     }
 
     /// The cached leader route of the request's stream or group, unless its
@@ -977,6 +1038,8 @@ impl Gateway {
             leader_cache_entries,
             upstream_ejections: self.metrics.upstream_ejections.load(Ordering::Relaxed),
             upstream_ejected: self.ejections.active(Instant::now()),
+            refusal_drains: self.metrics.refusal_drains.load(Ordering::Relaxed),
+            refusal_drains_cut: self.metrics.refusal_drains_cut.load(Ordering::Relaxed),
         }
     }
 }
@@ -1279,6 +1342,41 @@ fn mark_not_applied(response: &mut AxumResponse, token: &'static str) {
     response
         .headers_mut()
         .insert(NOT_APPLIED_HEADER, HeaderValue::from_static(token));
+}
+
+/// How [`drain`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drained {
+    /// The body ended: the connection can carry the next request.
+    Whole,
+    /// The body went on past the limit.
+    OverLimit,
+    /// The body was still arriving after [`REFUSED_BODY_DRAIN_TIMEOUT`].
+    TimedOut,
+    /// The body failed, as when the client goes away in the middle of it.
+    Failed,
+}
+
+/// Reads `body` to its end and drops each chunk as it arrives: `limit` bytes
+/// at most, the limit `to_bytes` applies to a body the gateway forwards, and
+/// [`REFUSED_BODY_DRAIN_TIMEOUT`] at most.
+async fn drain(body: Body, limit: usize) -> Drained {
+    let mut body = http_body_util::Limited::new(body, limit);
+    let read = async {
+        loop {
+            match body.frame().await {
+                None => return Drained::Whole,
+                Some(Ok(_dropped)) => {}
+                Some(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
+                    return Drained::OverLimit;
+                }
+                Some(Err(_failed)) => return Drained::Failed,
+            }
+        }
+    };
+    tokio::time::timeout(REFUSED_BODY_DRAIN_TIMEOUT, read)
+        .await
+        .unwrap_or(Drained::TimedOut)
 }
 
 /// Rides the response body: counts egress bytes and, on drop, records the

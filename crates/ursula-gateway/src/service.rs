@@ -176,7 +176,9 @@ pub struct GatewayArgs {
     #[arg(long, default_value = "5")]
     upstream_tcp_user_timeout: NonZeroU64,
 
-    /// Maximum request body bytes buffered for leader-redirect replay.
+    /// Maximum request body bytes buffered for leader-redirect replay. Also
+    /// the most the gateway reads of a body before it sends a refusal it
+    /// decided from the request's head alone.
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES)]
     max_request_body_bytes: usize,
 

@@ -3671,3 +3671,368 @@ mod upstream_keepalive {
         }
     }
 }
+
+/// A refusal the gateway decides from a request's head alone reaches a client
+/// that sends its whole body before it reads the answer: the gateway reads the
+/// body first, up to `max_request_body_bytes` and for
+/// [`REFUSED_BODY_DRAIN_TIMEOUT`] at most (#540). The clients here are raw
+/// connections to the gateway's own listener.
+mod refused_bodies {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::http::HeaderName;
+    use axum::http::HeaderValue;
+    use axum::http::Request;
+    use axum::http::StatusCode;
+    use axum::http::header::AUTHORIZATION;
+    use axum::routing::any;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER;
+    use ursula_proto::headers::NOT_APPLIED_HEADER;
+
+    use super::FixedPrincipalResolver;
+    use super::FrozenClock;
+    use super::RecordingAuthorizer;
+    use super::TestUpstream;
+    use super::answering_upstream;
+    use super::spawn_upstream;
+    use super::test_config;
+    use crate::Gateway;
+    use crate::GatewayConfig;
+    use crate::REFUSED_BODY_DRAIN_TIMEOUT;
+    use crate::admission::StaticQuotaProvider;
+    use crate::auth::AccessControl;
+    use crate::auth::AuthorizationDecision;
+    use crate::auth::AuthorizationError;
+
+    /// The body the clients announce: 8 MiB, more than the loopback holds
+    /// while nothing reads it. Answered with this body unread, a client that
+    /// sends all of it fails to write it before it reads anything.
+    const LARGE_BODY: usize = 8 << 20;
+    /// Bytes a client writes at a time.
+    const CHUNK: usize = 64 << 10;
+    /// The body limit of the gateways whose limit a test reaches.
+    const LIMIT: usize = 64 << 10;
+
+    /// A gateway with access control and `config`: a bearer token other than
+    /// `valid-token` is refused (`401`), and the authorizer answers
+    /// `decision` to every other request.
+    fn guarded(
+        config: GatewayConfig,
+        decision: Result<AuthorizationDecision, AuthorizationError>,
+    ) -> Gateway {
+        Gateway::with_access_control(
+            config,
+            AccessControl::new(
+                Arc::new(FixedPrincipalResolver::valid()),
+                Arc::new(RecordingAuthorizer {
+                    decision,
+                    requests: Mutex::new(Vec::new()),
+                }),
+            ),
+        )
+    }
+
+    /// Serves `gateway` on a loopback port the way `ursula gateway` does
+    /// (`service::run`).
+    async fn serve(gateway: Arc<Gateway>) -> (SocketAddr, TestUpstream) {
+        let app = Router::new()
+            .fallback(any(
+                |State(gateway): State<Arc<Gateway>>, req: Request<Body>| async move {
+                    gateway.handle(req).await
+                },
+            ))
+            .with_state(gateway);
+        let server = spawn_upstream(app).await;
+        let addr: SocketAddr = server
+            .url
+            .trim_start_matches("http://")
+            .parse()
+            .expect("a loopback address");
+        (addr, server)
+    }
+
+    /// A client like ureq: on a new connection to `addr`, it sends a POST to
+    /// `/owner-a/events` with `bearer` and a body of `len` bytes, `sent` of
+    /// them (all, or fewer to stop short), before it reads anything. The
+    /// answer's status and headers, or the error that broke the exchange.
+    async fn upload(
+        addr: SocketAddr,
+        bearer: &'static str,
+        len: usize,
+        sent: usize,
+    ) -> std::io::Result<(StatusCode, HeaderMap)> {
+        let mut connection = TcpStream::connect(addr).await?;
+        let head = format!(
+            "POST /owner-a/events HTTP/1.1\r\nhost: gateway.test\r\nauthorization: Bearer \
+             {bearer}\r\ncontent-length: {len}\r\n\r\n"
+        );
+        connection.write_all(head.as_bytes()).await?;
+        let chunk = vec![0_u8; CHUNK];
+        let mut left = sent;
+        while left > 0 {
+            let now = left.min(CHUNK);
+            connection.write_all(&chunk[..now]).await?;
+            left = left.saturating_sub(now);
+        }
+        let mut answer = Vec::new();
+        loop {
+            if let Some(end) = answer.windows(4).position(|window| window == b"\r\n\r\n") {
+                return Ok(parse_head(&answer[..end]));
+            }
+            let mut read = [0_u8; 1024];
+            let got = connection.read(&mut read).await?;
+            if got == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            answer.extend_from_slice(&read[..got]);
+        }
+    }
+
+    /// The status and headers of an answer's head, without its blank line.
+    fn parse_head(head: &[u8]) -> (StatusCode, HeaderMap) {
+        let head = std::str::from_utf8(head).expect("an ASCII head");
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .and_then(|code| StatusCode::from_bytes(code.as_bytes()).ok())
+            .expect("a status line");
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            let (name, value) = line.split_once(':').expect("a header line");
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+                HeaderValue::from_str(value.trim()).expect("a header value"),
+            );
+        }
+        (status, headers)
+    }
+
+    /// The value of `name` in `headers`.
+    fn value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+        headers
+            .get(name)
+            .map(|value| value.to_str().expect("an ASCII value"))
+    }
+
+    /// The request [`upload`] sends, without its body, as
+    /// [`Gateway::handle`] takes it.
+    fn bodiless(bearer: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/owner-a/events")
+            .header(AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    /// Lets the runtime run, the loopback included, until `done` holds, and
+    /// says whether it does. It gives up after many turns, so that a test
+    /// whose gateway never answers fails instead of waiting on a frozen clock
+    /// forever.
+    async fn until(done: impl Fn() -> bool) -> bool {
+        for _ in 0..100_000 {
+            if done() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        done()
+    }
+
+    /// Each refusal decided from the head reaches a client that sends a body
+    /// of 8 MiB before it reads the answer, with the status and headers that
+    /// the same request without a body gets: the gateway read the whole body
+    /// first. Unread, the body would fail the client's write.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_from_the_head_reaches_a_client_that_sends_its_whole_body_first() {
+        // The bucket's rate does not refill, and no reading is cut short.
+        let _frozen = FrozenClock::hold();
+        let upstream = answering_upstream().await;
+        let config = || test_config(vec![upstream.url.clone()]);
+        let rate_limited =
+            guarded(config(), Ok(AuthorizationDecision::Allow)).with_quota_provider(Arc::new(
+                StaticQuotaProvider::from_toml_str(
+                    "[[bucket]]\nid = \"owner-a\"\nrequests_per_sec = 1\n",
+                )
+                .expect("quotas"),
+            ));
+        // The bucket's one request a second goes through.
+        let admitted = rate_limited.handle(bodiless("valid-token")).await;
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let cases = [
+            (
+                "refused token",
+                guarded(config(), Ok(AuthorizationDecision::Allow)),
+                "not-a-token",
+                StatusCode::UNAUTHORIZED,
+                "InvalidCredential",
+            ),
+            (
+                "denied",
+                guarded(config(), Ok(AuthorizationDecision::Deny)),
+                "valid-token",
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+            ),
+            (
+                "concealed",
+                guarded(config(), Ok(AuthorizationDecision::ConcealAsNotFound)),
+                "valid-token",
+                StatusCode::NOT_FOUND,
+                "NotFound",
+            ),
+            (
+                "authorizer down",
+                guarded(config(), Err(AuthorizationError::Unavailable)),
+                "valid-token",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AuthorizationUnavailable",
+            ),
+            (
+                "rate limited",
+                rate_limited,
+                "valid-token",
+                StatusCode::TOO_MANY_REQUESTS,
+                "TenantRateLimited",
+            ),
+        ];
+        for (case, gateway, bearer, status, token) in cases {
+            let gateway = Arc::new(gateway);
+            let (addr, _server) = serve(Arc::clone(&gateway)).await;
+
+            let client = tokio::spawn(upload(addr, bearer, LARGE_BODY, LARGE_BODY));
+            assert!(until(|| client.is_finished()).await, "{case}: no answer");
+            let (answered, headers) = client.await.unwrap().unwrap_or_else(|error| {
+                panic!("{case}: the connection broke before the answer: {error}")
+            });
+
+            assert_eq!(answered, status, "{case}");
+            assert_eq!(value(&headers, NOT_APPLIED_HEADER), Some(token), "{case}");
+            assert_eq!(
+                value(&headers, NOT_APPLIED_CHECKED_HEADER),
+                Some("1"),
+                "{case}"
+            );
+            let unread = gateway.handle(bodiless(bearer)).await;
+            assert_eq!(answered, unread.status(), "{case}");
+            for (name, expected) in unread.headers() {
+                assert_eq!(headers.get(name), Some(expected), "{case}: {name}");
+            }
+            let metrics = gateway.metrics_snapshot();
+            assert_eq!(
+                (metrics.refusal_drains, metrics.refusal_drains_cut),
+                (1, 0),
+                "{case}"
+            );
+        }
+    }
+
+    /// A body that stops arriving is read for [`REFUSED_BODY_DRAIN_TIMEOUT`],
+    /// to the timer's millisecond, and no longer: then its client gets the
+    /// refusal, and the connection closes on the rest of the body.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_stops_arriving_is_read_until_the_timeout() {
+        let _frozen = FrozenClock::hold();
+        let upstream = answering_upstream().await;
+        let gateway = Arc::new(guarded(
+            test_config(vec![upstream.url.clone()]),
+            Ok(AuthorizationDecision::Allow),
+        ));
+        let (addr, _server) = serve(Arc::clone(&gateway)).await;
+
+        // The head and 64 KiB of an 8 MiB body, and then nothing.
+        let client = tokio::spawn(upload(addr, "not-a-token", LARGE_BODY, CHUNK));
+        assert!(
+            until(|| gateway.metrics_snapshot().refusal_drains == 1).await,
+            "the gateway reads the body"
+        );
+        let almost = REFUSED_BODY_DRAIN_TIMEOUT.saturating_sub(Duration::from_millis(1));
+        tokio::time::advance(almost).await;
+        assert!(
+            !until(|| client.is_finished()).await,
+            "answered before the timeout"
+        );
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert!(
+            until(|| client.is_finished()).await,
+            "no answer at the timeout"
+        );
+        let (status, headers) = client.await.unwrap().expect("the refusal");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            value(&headers, NOT_APPLIED_HEADER),
+            Some("InvalidCredential")
+        );
+        assert_eq!(value(&headers, NOT_APPLIED_CHECKED_HEADER), Some("1"));
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 1));
+    }
+
+    /// A body over `max_request_body_bytes` is read up to the limit and no
+    /// further, whether the gateway refused the request from its head or
+    /// would forward it (its `413`, as before): the client gets the answer as
+    /// soon as the body passes the limit, and the connection closes on the
+    /// rest of the body.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_over_the_limit_is_read_up_to_the_limit() {
+        let _frozen = FrozenClock::hold();
+        let upstream = answering_upstream().await;
+        let mut config = test_config(vec![upstream.url.clone()]);
+        config.max_request_body_bytes = LIMIT;
+        let cases = [
+            (
+                "forwarded",
+                Gateway::new(config.clone()),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "RequestBodyTooLarge",
+                (0_u64, 0_u64),
+            ),
+            (
+                "refused token",
+                guarded(config, Ok(AuthorizationDecision::Allow)),
+                StatusCode::UNAUTHORIZED,
+                "InvalidCredential",
+                (1_u64, 1_u64),
+            ),
+        ];
+        for (case, gateway, status, token, drains) in cases {
+            let gateway = Arc::new(gateway);
+            let (addr, _server) = serve(Arc::clone(&gateway)).await;
+
+            // One byte past the limit of an 8 MiB body, and then nothing.
+            let past = LIMIT.saturating_add(1);
+            let client = tokio::spawn(upload(addr, "not-a-token", LARGE_BODY, past));
+            assert!(
+                until(|| client.is_finished()).await,
+                "{case}: no answer once the body passed the limit"
+            );
+            let (answered, headers) = client.await.unwrap().expect("the answer");
+
+            assert_eq!(answered, status, "{case}");
+            assert_eq!(value(&headers, NOT_APPLIED_HEADER), Some(token), "{case}");
+            assert_eq!(
+                value(&headers, NOT_APPLIED_CHECKED_HEADER),
+                Some("1"),
+                "{case}"
+            );
+            let metrics = gateway.metrics_snapshot();
+            assert_eq!(
+                (metrics.refusal_drains, metrics.refusal_drains_cut),
+                drains,
+                "{case}"
+            );
+        }
+    }
+}

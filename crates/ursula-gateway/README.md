@@ -19,6 +19,10 @@ identifies the Raft leader.
   [Upstream Selection](#upstream-selection).
 - Buffers request bodies up to `--max-request-body-bytes`; larger requests
   receive `413 Payload Too Large` before reaching an upstream.
+- Reads the body of a request it refuses from the head alone (access control,
+  tenant admission) before it answers, so that a client that sends its whole
+  body first gets the refusal. See
+  [Refusals Before the Body](#refusals-before-the-body).
 - Follows Ursula Raft leader redirects internally, so clients never get one.
   See [Redirects](#redirects).
 - Returns other redirects to clients and rewrites redirect targets so clients
@@ -239,6 +243,39 @@ statuses as never applied without the headers, and after a redirect without
 a marker the gateway returns the leader's status unchanged, although the
 node that redirected may have proposed the write.
 
+## Refusals Before the Body
+
+The gateway decides some refusals from the request's head alone, before it
+reads the body: every access-control refusal (`401`, `403`, `404`, and the
+`503` while the token issuer or the authorizer is unavailable) and the tenant
+admission refusals (`429`). From 0.7.4 it reads the body before it sends such
+a refusal, and drops each chunk as it arrives. A client that sends its whole
+body before it reads the answer, as many HTTP/1.1 clients do, the SQLite
+extension among them, then gets the refusal with its headers.
+
+Before 0.7.4 the gateway sent such a refusal at once and closed the
+connection with the body unread. When the body was larger than one read of
+the gateway, such a client often saw a failed write or a connection reset
+instead of the refusal, which says nothing about whether the request was
+applied. The SQLite extension then retried a refused commit as an unknown
+outcome until its retry budget ran out, and poisoned the database. A proxy in
+front of the gateway could also turn the closed connection into an error of
+its own.
+
+The gateway reads at most `--max-request-body-bytes` of such a body, for 5 s
+at most. A body that goes on past the limit, or is still arriving after 5 s,
+gets the refusal at once, and the connection closes with the rest of the body
+unread. The `413` for a body over `--max-request-body-bytes` is sent the same
+way: the gateway stops reading at the limit, so a client still sending the
+body may see the connection close instead of the `413`. Keep bodies below the
+limit on the client, as the SQLite extension does for commits with
+`URSULA_VFS_MAX_FRAME_BYTES`. A request with `Expect: 100-continue` gets
+`100 Continue` and sends its body before it gets the refusal.
+
+`/__ursula/gateway/metrics` reports `refusal_drains`, the refused requests
+whose body the gateway read this way, and `refusal_drains_cut`, those whose
+body it stopped reading at the limit, after 5 s, or because the body failed.
+
 ## SSE Behavior
 
 `live=sse` responses stream through the gateway. `--response-header-timeout`
@@ -311,7 +348,9 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 
 --max-request-body-bytes <BYTES>
     Maximum request body bytes buffered for leader-redirect replay.
-    Larger requests return 413 before upstream forwarding. Defaults to 33554432.
+    Larger requests return 413 before upstream forwarding. Also the most the
+    gateway reads of a body before it sends a refusal it decided from the
+    request's head alone. Defaults to 33554432.
 
 --graceful-shutdown-timeout <SECONDS>
     Maximum graceful shutdown drain time after SIGTERM/CTRL-C. Defaults to 3600.

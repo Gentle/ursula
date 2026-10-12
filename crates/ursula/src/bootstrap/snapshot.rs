@@ -6,6 +6,7 @@ use tokio::time::Instant;
 use ursula_raft::Handoff;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
+use ursula_raft::SNAPSHOT_HANDOFF_WAIT;
 use ursula_raft::SnapshotBuildCoordinator;
 use ursula_raft::snapshot_cadence::DriveLimits;
 use ursula_raft::snapshot_cadence::GroupDriveState;
@@ -27,8 +28,6 @@ use crate::bootstrap::store_health::spawn_store_health_gate;
 /// Longest the driver waits for a build slot (a build in flight to finish)
 /// before it ends the tick.
 const SNAPSHOT_PERMIT_WAIT: Duration = Duration::from_secs(60);
-/// Longest a handed-off permit waits for the triggered group to claim it.
-const SNAPSHOT_HANDOFF_WAIT: Duration = Duration::from_secs(5);
 /// Pause between ticks while the node is over its log watermark, so a
 /// pressure pass is not capped at its group count per interval.
 const SNAPSHOT_PRESSURE_RETICK: Duration = Duration::from_millis(250);

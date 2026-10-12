@@ -62,7 +62,7 @@ export type WriteRefusedKind = "payment_required" | "unauthorized" | "forbidden"
 export class UrsulaWriteRefusedError extends Error {
 	/** What refused it, for a refused commit. `null` for an attach refused other than with a `402`, whose message names it. */
 	readonly kind: WriteRefusedKind | null;
-	/** Why (`refused_reason`), for a refused commit: the layer's explanation, or for `too_large` the frame's size and the limit. `null` when the layer sent no explanation, and for a refused attach, whose message carries it. */
+	/** Why (`refused_reason`), for a refused commit: the layer's explanation, for `too_large` the frame's size and the limit, and for `unreachable` the last attempt's failure (such as `timeout: resolve`). `null` when the layer sent no explanation, and for a refused attach, whose message carries it. */
 	readonly reason: string | null;
 	constructor(message: string, kind: WriteRefusedKind | null, reason: string | null, cause: unknown) {
 		super(message, { cause });

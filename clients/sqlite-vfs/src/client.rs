@@ -3097,8 +3097,9 @@ mod tests {
         assert_eq!(lookups.made(), 1);
     }
 
-    // A connection that fails makes its host's lookup due: the next request looks the host up
-    // again and reaches the endpoint at its new address, where the cached address kept failing.
+    // A connection that fails makes its host's lookup due, no sooner than 5 s after the last
+    // lookup: the next request then looks the host up again and reaches the endpoint at its new
+    // address, where the cached address kept failing.
     #[test]
     fn a_failed_connection_looks_the_host_up_again() {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3106,9 +3107,15 @@ mod tests {
         drop(closed);
         let (url, server) = serve(vec![answer("200 OK")]);
         let lookups = Lookups::new(vec![Ok(moved_from), Ok(served(&url))]);
-        let agent = agent_over(&lookups);
+        let resolver = net::Resolver::new(lookups.clone());
+        let agent = new_agent_with(
+            Duration::from_secs(10),
+            Duration::from_secs(90),
+            resolver.clone(),
+        );
         let e = agent.head("http://gw.test/b/s").call().unwrap_err();
         assert!(net::is_not_sent(&e), "{e}");
+        resolver.backdate(net::DNS_RETRY);
         let r = agent.head("http://gw.test/b/s").call().unwrap();
         assert_eq!(r.status().as_u16(), 200);
         assert_eq!(server.join().unwrap().len(), 1);
@@ -3191,7 +3198,9 @@ mod tests {
             "{}",
             outcome(&unreachable)
         );
-        assert!(lookups.made() >= 2);
+        // The first lookup's failure holds the next one off for `DNS_RETRY` (5 s), so the
+        // budget's other attempts fail as it did, with no lookup.
+        assert_eq!(lookups.made(), 1);
     }
 
     // An attempt that failed before it went out leaves the append's outcome as it was: after it,

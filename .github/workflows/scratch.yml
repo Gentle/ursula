@@ -1,0 +1,103 @@
+# Scratch runs for the 0.7.4 work, never merged: on a push to scratch/**, runs scripts/scratch.sh
+# from the pushed commit on RunsOn (x64, and arm64 when the commit message has [arm64]) and on a
+# GitHub-hosted macOS runner when it has [macos]. scratch-out/ comes back as an artifact per job.
+name: Scratch
+
+on:
+  push:
+    branches: ["scratch/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  x64:
+    if: ${{ !contains(github.event.head_commit.message, '[no-x64]') }}
+    runs-on: runs-on=${{ github.run_id }}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache
+    timeout-minutes: 150
+    steps:
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          rustflags: ""
+          cache-workspaces: |
+            .
+            clients/sqlite-vfs
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Scratch
+        run: bash scripts/scratch.sh x64
+      - name: Upload scratch-out
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: scratch-out-x64
+          path: scratch-out/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  arm64:
+    if: ${{ contains(github.event.head_commit.message, '[arm64]') }}
+    runs-on: runs-on=${{ github.run_id }}/cpu=8/ram=32/family=m8g+m7g/image=ubuntu24-full-arm64/extras=s3-cache
+    timeout-minutes: 150
+    steps:
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          rustflags: ""
+          cache-workspaces: |
+            .
+            clients/sqlite-vfs
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Scratch
+        run: bash scripts/scratch.sh arm64
+      - name: Upload scratch-out
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: scratch-out-arm64
+          path: scratch-out/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  macos:
+    if: ${{ contains(github.event.head_commit.message, '[macos]') }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SQLITE3_LIB_DIR: /nonexistent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          rustflags: ""
+          cache-workspaces: clients/sqlite-vfs
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Scratch
+        run: bash scripts/scratch.sh macos
+      - name: Upload scratch-out
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: scratch-out-macos
+          path: scratch-out/
+          if-no-files-found: ignore
+          retention-days: 3

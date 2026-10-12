@@ -281,6 +281,33 @@ async fn gateway_drops_an_unreachable_cached_leader_and_answers_retryable_503() 
     assert_eq!(metrics.leader_cache_entries, 0);
 }
 
+/// Ports nothing listens on, `count` of them and all different: connects to
+/// each are refused while the [`Refusing`] lives.
+async fn refusing_upstreams(count: usize) -> (Vec<String>, Refusing) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let peer = listener.local_addr().expect("local addr");
+    let mut urls = Vec::new();
+    let mut connections = Vec::new();
+    for _ in 0..count {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("loopback"))
+            .expect("bind");
+        let connection = socket.connect(peer).await.expect("connect");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+        urls.push(format!(
+            "http://{}",
+            connection.local_addr().expect("local addr")
+        ));
+        connections.push((connection, accepted));
+    }
+    (urls, Refusing {
+        _connections: connections,
+    })
+}
+
 /// A port nothing listens on: connects are refused while the [`Refusing`]
 /// lives.
 async fn refusing_upstream() -> (String, Refusing) {
@@ -289,8 +316,8 @@ async fn refusing_upstream() -> (String, Refusing) {
 }
 
 /// Holds the ports of [`refusing_upstreams`]: each is the local end of an
-/// open loopback connection, so it stays bound (no other test can take it)
-/// and nothing listens on it (a connect to it is refused). A socket that is
+/// open loopback connection, so `bind(0)` never returns it and nothing
+/// listens on it (a connect to it is refused). A socket that is
 /// only bound would hold the port too, but macOS drops a connect to it
 /// instead of refusing it, so the connect waits for its timeout.
 struct Refusing {
@@ -2162,33 +2189,6 @@ async fn a_search_hop_that_cannot_connect_searches_on_and_one_that_was_sent_stay
     let request = request.await.expect("the upstream read a request");
     let request = String::from_utf8(request).expect("an ASCII request");
     assert!(request.ends_with("\r\n\r\nabc"), "{request}");
-}
-
-/// Ports nothing listens on, `count` of them and all different: connects to
-/// each are refused while the [`Refusing`] lives.
-async fn refusing_upstreams(count: usize) -> (Vec<String>, Refusing) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let peer = listener.local_addr().expect("local addr");
-    let mut urls = Vec::new();
-    let mut connections = Vec::new();
-    for _ in 0..count {
-        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
-        socket
-            .bind("127.0.0.1:0".parse().expect("loopback"))
-            .expect("bind");
-        let connection = socket.connect(peer).await.expect("connect");
-        let (accepted, _peer) = listener.accept().await.expect("accept");
-        urls.push(format!(
-            "http://{}",
-            connection.local_addr().expect("local addr")
-        ));
-        connections.push((connection, accepted));
-    }
-    (urls, Refusing {
-        _connections: connections,
-    })
 }
 
 /// A search hop whose upstream read the whole request and closed the

@@ -1282,13 +1282,16 @@ pub(crate) mod mock {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let connection = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (accepted, _peer) = listener.accept().unwrap();
-        (connection.local_addr().unwrap(), Refusing {
+        // The listener's port, which bind chose: Linux's connect never hands a port bind chose to
+        // another connect, so no test's own connect can take it as its source port and reach
+        // itself. The accepted end keeps holding it once the listener is dropped here.
+        (accepted.local_addr().unwrap(), Refusing {
             _connection: (connection, accepted),
         })
     }
 
-    /// Holds the port of [`refusing`]: the local end of an open loopback connection, so it stays
-    /// bound (no other test can take it) and nothing listens on it (a connect to it is refused).
+    /// Holds the port of [`refusing`]: an end of an open loopback connection, so `bind(0)` never
+    /// returns it and nothing listens on it (a connect to it is refused).
     /// A socket that is only bound would hold the port too, but macOS drops a connect to it
     /// instead of refusing it, so the connect waits for its timeout.
     pub(crate) struct Refusing {

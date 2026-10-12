@@ -58,7 +58,9 @@ use crate::log::Level;
 pub(crate) const DNS_FRESH: Duration = Duration::from_secs(30);
 
 /// How long after a host's last successful lookup its addresses still serve requests while new
-/// lookups fail. Past it, a request whose lookup fails fails with it.
+/// lookups fail. Past it, a request whose lookup fails fails with it. A host no request needed for
+/// that long still uses them while one request looks it up again, rather than every request
+/// looking it up.
 pub(crate) const DNS_STALE_LIMIT: Duration = Duration::from_secs(600);
 
 /// How long after a failed lookup the host's last addresses serve requests without another
@@ -189,7 +191,8 @@ impl Entry {
 )]
 enum Plan {
     /// Uses them: they are fresh, or they stand in for a failed lookup until the next is due, or
-    /// while another request looks the host up.
+    /// while another request looks the host up, past the stale limit too when no lookup since the
+    /// last successful one failed.
     Use(ResolvedSocketAddrs),
     /// Fails as the last lookup did, which left no addresses to stand in, until the next lookup is
     /// due, or while another request looks the host up.
@@ -202,9 +205,11 @@ enum Plan {
 /// marks as being looked up (as lookup `id`) when it is to look the host up.
 fn plan(entry: &mut Entry, now: Instant, id: u64) -> Plan {
     let waits = now < entry.next || entry.looking.is_some();
-    match (entry.stand_in(now), &entry.failed) {
-        (Some(good), _) if waits => Plan::Use(good.addrs.clone()),
-        (None, Some(failure)) if waits => Plan::Fail(failure.clone()),
+    match (entry.stand_in(now), &entry.failed, &entry.good) {
+        (Some(good), _, _) if waits => Plan::Use(good.addrs.clone()),
+        (None, Some(failure), _) if waits => Plan::Fail(failure.clone()),
+        // Past the stale limit with no failure kept: no request needed the host that long.
+        (None, None, Some(good)) if entry.looking.is_some() => Plan::Use(good.addrs.clone()),
         _ => {
             entry.looking = Some(id);
             Plan::LookUp
@@ -230,7 +235,9 @@ enum Settled {
 ///
 /// A success is the host's newest addresses, due again after [`DNS_FRESH`]. A failure gives way
 /// to a success that ended since `started`: the request gets its addresses, and the entry stays as
-/// that success left it. Otherwise the failure is kept, and the addresses that stand in at `ended`
+/// that success left it, but for the next lookup, which a failed connection may have made due
+/// since: no sooner than [`DNS_RETRY`] after `ended`. Otherwise the failure is kept, and the
+/// addresses that stand in at `ended`
 /// serve the request, with the next lookup due after [`DNS_RETRY`], or at their stale limit if that
 /// comes first. With none, the request fails, and so do the host's requests until the next lookup,
 /// after [`DNS_RETRY`]. Either way, the next lookup is due after `ended`.
@@ -254,6 +261,7 @@ fn settle(
         Err(e) => e,
     };
     if let Some(good) = entry.good.as_ref().filter(|good| good.at >= started) {
+        entry.next = entry.next.max(later(ended, DNS_RETRY));
         return Settled::Found(good.addrs.clone());
     }
     entry.failed = Failure::of(&e);
@@ -765,6 +773,29 @@ mod tests {
         assert!(matches!(sent_nothing(e), (ureq::Error::HostNotFound, true)));
     }
 
+    // Past the stale limit, with no failure since the last successful lookup (no request needed the
+    // host that long), the last addresses serve while one request looks the host up again, rather
+    // than every request looking it up.
+    #[test]
+    fn past_the_stale_limit_one_request_at_a_time_looks_a_host_up() {
+        let (lookup, started, end) = gated(addr(81));
+        let resolver = Resolver::new(Scripted::new(vec![
+            Answer::Addr(addr(80)),
+            lookup,
+            Answer::Addr(addr(99)),
+        ]));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        age(&resolver, DNS_STALE_LIMIT);
+        let looking = in_thread(&resolver);
+        started.recv_timeout(STARTS).unwrap();
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(80));
+        assert_eq!(lookups(&resolver), 2);
+        end.send(()).unwrap();
+        assert_eq!(looking.join().unwrap().unwrap(), addr(81));
+        assert_eq!(resolve(&resolver, URL).unwrap(), addr(81));
+        assert_eq!(lookups(&resolver), 2);
+    }
+
     // A lookup that fails with no addresses to stand in fails the host's requests as it did until
     // the next lookup is due, with no lookup of theirs.
     #[test]
@@ -926,6 +957,12 @@ mod tests {
         assert!(matches!(settled, Settled::Found(found) if found[..] == [addr(80)]));
         assert!(entry.failed.is_none());
         assert_eq!((entry.ended, entry.next), (at(t, 5), at(t, 32)));
+        // A failed connection made the next lookup due 5 s after that success: it still comes no
+        // sooner than 5 s after this lookup ended.
+        let mut entry = looked_up(at(t, 2), at(t, 7));
+        let settled = settle(&mut entry, t, at(t, 5), Err(ureq::Error::HostNotFound));
+        assert!(matches!(settled, Settled::Found(found) if found[..] == [addr(80)]));
+        assert_eq!((entry.ended, entry.next), (at(t, 5), at(t, 10)));
     }
 
     // A lookup that fails settles on the addresses that stand in when it ended: the next lookup is

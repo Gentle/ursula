@@ -1097,18 +1097,46 @@ must say in its release notes to stop every owner of a stream before upgrading.
 One run, 2026-10-09 UTC. EKS 1.37 in us-east-1: three `m6i.xlarge` Ursula nodes, one per AZ (the
 chart's `examples/production-eks.yaml` shape: 256 groups, 4 cores, 8 GiB limit), three gateways on
 `m6i.large` nodes, one per AZ, and real S3 for the cold tier and snapshots with Ursula's default S3
-settings. Server image: main `bb7a61b` (`0.0.0-main.bb7a61b1c968`) with the chart's defaults: the
-Raft WAL on a gp3 volume with `raft.wal.fsync = never`, and no gateway quota policy, so no client
-saw a 429. Gateway `maxRequestBodyBytes` was raised to 1 GiB for the cold-start cells. Extension:
-#488 at `398369d`, and `ee5e278` for two of the three failover runs (it changes nothing on the
-commit path except a log line when an append is retried, `append_retry`). Clients: `m6i.2xlarge`
-pods (Node 22.20) in us-east-1a, one process per database, through the gateway Service. The tools
-are in `clients/sqlite-ursula/bench/`.
+settings. Server image: main `bb7a61b` (`0.0.0-main.bb7a61b1c968`), which is 0.7.0 without #487
+(retention reclaims the external payloads it drops) and #491 (a bounded listener drain at
+shutdown), with the chart's defaults: the Raft WAL on a gp3 volume with `raft.wal.fsync = never`,
+and no gateway quota policy, so no client saw a 429. Gateway `maxRequestBodyBytes` was raised to
+1 GiB for the cold-start cells. Extension: #488 at `398369d`, and `ee5e278` for two of the three
+failover runs (it changes nothing on the commit path except a log line when an append is retried,
+`append_retry`). Both predate the review fixes of #502, which 0.7.0 shipped with. Clients:
+`m6i.2xlarge` pods (Node 22.20) in us-east-1a, one process per database, through the gateway
+Service. The tools are in `clients/sqlite-ursula/bench/`.
 
-Workload: Pi Durable's `SqliteStorage` on the VFS via `openUrsulaPiStorage`, a real `Harness` with
-a faux model, turns of text, text, tool (5.0 Pi commits per turn). Latency is `Storage.commit`
-wall time after a 30 s warm-up. Each cell runs 10.5 min. Agent pace: one turn per 2 s per database.
-Baselines on the same client node type:
+**Since then.** No number in this section was measured again on a later release. These changes
+since the image and the extension measured here bear on them:
+
+- 0.7.0 (#502): the snapshot thread fsyncs the WAL and the db file before it publishes (§4.2,
+  step 6), which the extensions measured here did not. This can change the cold-start publish
+  times, the number of snapshots in the back-to-back cell and the soak's snapshot cycles.
+- 0.7.1: the gateway gives up on a connection to a vanished node after 5 s of unacknowledged data
+  (`--upstream-tcp-user-timeout`), and leaves an upstream that failed at the transport out of
+  selection for 10 to 60 s (#495, #454). See the failover runs below.
+- 0.7.2: a Raft replication read returns at most 4 MiB of entries, and a replication message stays
+  under about 8 MiB (#507).
+- 0.7.3: the gateway follows leader redirects itself instead of passing them to its clients
+  (#460), and one failed S3 health probe no longer moves every leadership on a node (#508).
+- The 0.7.3 extension never follows a redirect: it sends a `307` again to the same URL, like a
+  `503` (§2). It refuses a commit frame over `URSULA_VFS_MAX_FRAME_BYTES` (32 MiB by default)
+  without sending it (§7). Every frame in these runs was far below that limit, and the
+  back-to-back cell's 2,000-row updates made frames of about 1 MB. Appends, reads and `HEAD`s keep
+  a connection for 90 s after its last request instead of 15 s, while snapshot transfers keep 15 s
+  as before (§7). The databases here commit at least every 2 s, within either idle time. Resolving
+  and connecting time out after 5 s each (§4.4, §8). After a failed snapshot the wait before the
+  next attempt now grows from 100 ms up to 1 h when the body is too large and up to 5 min
+  otherwise, where it used to stop at 30 s, and a body over 1 MiB is sent twice at most per attempt
+  (§4.4). Between drains the extension keeps the newest 8,192 measurements of each kind, and the
+  bench tools that read per-commit measurements drain them after every commit.
+
+Workload: Pi Durable's `SqliteStorage` (`@earendil-works/pi-durable` 1.0.0, the version in the
+lockfile then) on the VFS via `openUrsulaPiStorage`, a real `Harness` with a faux model, turns of
+text, text, tool (5.0 Pi commits per turn). Latency is `Storage.commit` wall time after a 30 s
+warm-up. Each cell runs 10.5 min. Agent pace: one turn per 2 s per database. Baselines on the same
+client node type:
 
 - B1: the same Pi workload on Pi's own `openNodeSqliteStorage` on the pod's disk, no extension
   (WAL, `synchronous=NORMAL`). Measured on 2026-10-03. It involves no server.
@@ -1201,7 +1229,7 @@ above the minimum.
 300 s): 3,429 commits at p50 91 / p99 182 / max 1,138 ms, 3.35 GB written, 381 snapshots. The
 retained log never exceeded 19.5 MB (sampled every 10 s) and ended at 15.7 MB. S3 still held
 2.94 GB for the stream 29 minutes after the writes: the external payloads that #475 leaves behind,
-fixed by #487, which this image predates.
+fixed in 0.7.0 by #487, which this image predates.
 
 **Cold start**: a fresh host attaching new files, three times, best with the first in parentheses
 (`bench/coldstart.ts`; the log replayed, and the tail after a snapshot, are the attached file's
@@ -1239,7 +1267,22 @@ budget. The 2026-10-03 run's disk-WAL stalls of 8.3 to 10.1 s fit one such timeo
 replacement pod exited twice with `the Raft WAL is already in use` while the force-deleted
 container still held the WAL lock, then started. Two snapshot uploads during the kills got the
 gateway's `504` after its own 30 s upstream timeout, the same cause, and the next attempt published
-them. The snapshot read-back `503` of the 2026-10-03 run did not recur.
+them. The snapshot read-back `503` of the 2026-10-03 run did not recur. It came from a node that
+could not name a leader yet: such a node answers `503` instead of a redirect. The VFS retries that
+`503` (§3), and a 0.7.3 gateway still passes it on, since it follows only redirects.
+
+0.7.1 fixed #495 and #454 (#504, #505): a request on such a connection now fails with a `502` 5 to
+6 s after it was sent, which the VFS sends again, and the gateway leaves the dead upstream out of
+selection. A snapshot upload on such a connection fails the same way. In the last two A/B rounds of
+#505 on this cluster, with the same kill and 8 owners through each gateway, the patched gateway had
+no whole 10 s timeout, against 1 and 2 through the 0.7.0 gateway, and its owners' longest commits
+were 9.1 s (an election that answered `503` for 8 s) and 6.7 s, against 11.5 and 13.8 s.
+
+0.7.3 changed the read-back path on both sides. The gateway follows leader redirects itself
+(#460). The extension no longer follows a redirect: a followed request went out without its token,
+so behind a gateway with access control a snapshot read-back could fail. A read that meets a `307`
+now goes again to the same URL (§3). `test/redirects.e2e.ts` moves every group's leadership during
+snapshot read-backs through a gateway (§8).
 
 **S3.** Requests per minute (CloudWatch S3 request metrics), whole bucket, median (range) over the
 minutes wholly inside each cell:
@@ -1271,10 +1314,33 @@ the same load:
   group that stops building snapshots never prunes (#494), and a pin released between listing and
   reading aborts a prune (#490).
 
-**Open issues seen in this run.** #495 (failover stalls of 10 to 22 s through the gateway), #496
+**Soak** (#477), 2026-10-09, on the same cluster and server image: 16 databases through the gateway,
+at agent pace, at a 500 ms pace and flat out, with random owner `SIGKILL`s, simulated reboots and
+rebuild checks, and node kills about twice an hour. It was planned for 24 h and ended early, after
+11 h 35 min. The soak's extension also predates #502: the soak started at 06:48 UTC, and #502
+merged at 08:26 UTC. 9.7 million commits were acknowledged, with `Storage.commit` p50 about 4 ms
+and p99 13 to 19 ms, a tail set by the kills (the soak tool dropped some latency samples). Through
+30 node kills, 348 owner kills and 170 simulated reboots (126 rebuilds, 114 of them from a
+snapshot), no database was poisoned, fenced or failed, and no snapshot failed. All 172 comparisons
+of an owner with a rebuild from its stream were identical, with `integrity_check` ok on both sides.
+The retained log stayed within twice the snapshot threshold (p99 1.97 and at most 2.00 times
+`snapshot_due_bytes`), and S3 bytes per stream were bounded at the end, with no samples over time.
+The RSS of paced owners stayed flat, and the series of the long-running owners was lost. Node RSS
+grew about 0.2 to 0.25 GB per hour of uptime and did not come back when idle (#507, fixed in 0.7.2).
+One failed S3 health probe moved all 86 of a node's leaderships, which stalled owners for 1.4 to
+4.7 s (#508, fixed in 0.7.3).
+
+**Issues seen in these runs.** #495 (failover stalls of 10 to 22 s through the gateway) is fixed in
+0.7.1 (#504, #505), and #475 (external payloads kept after retention) in 0.7.0 (#487). Open: #496
 (AppendStream calls past the OpenRaft hard TTL under load), #494 and #490 (Raft snapshot objects in
-S3), #475 (external payloads kept after retention, fixed by #487 after this image), and #497
-(installing a snapshot is slower than replaying as many bytes of log).
+S3), and #497 (installing a snapshot is slower than replaying as many bytes of log). #519 did not
+occur here: under sustained writes every node's unsnapshotted Raft log can reach its hard limit at
+about the same time, and the nodes then refuse client writes for about 20 s. It happened in one of
+two later runs of 128 databases writing flat out, on #514's branch, before it shipped in 0.7.2.
+From 0.7.3 the nodes mark those refusals (`RaftLogPressure`), and an extension of 0.7.3 or later
+behind a gateway of 0.7.3 or later fails a commit refused that way alone, once the retry budget
+runs out, instead of poisoning the database (§2). Without a gateway, behind an older one, or with
+an older extension, the commit still poisons.
 
 ### Baseline: Pi Durable in a Durable Object (Cloudflare PiHarness)
 

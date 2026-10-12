@@ -3174,7 +3174,7 @@ pub(crate) async fn read_stream_by_id(
             if offset_is_now {
                 offset_now_response(response)
             } else {
-                read_response(response, &headers, None, url_incarnation.is_some())
+                read_response(response, &headers, None, url_incarnation.map(|_| max_len))
             }
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
@@ -3637,7 +3637,7 @@ pub(crate) async fn long_poll_stream(
                     response,
                     &headers,
                     Some(query.get("cursor").map(String::as_str).unwrap_or("")),
-                    false,
+                    None,
                 )
             }
         }

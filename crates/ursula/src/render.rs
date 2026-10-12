@@ -490,15 +490,15 @@ pub(crate) fn read_etag(response: &ReadStreamResponse) -> String {
     format!("\"{:016x}\"", hasher.finish())
 }
 
-/// A read's `200` (or `304`) response. `incarnation_in_url` is whether a
-/// catch-up read carried the `incarnation` parameter; such a response is
-/// marked `Stream-Immutable` when it can no longer change: it ends below the
-/// tail, or at the tail of a closed stream (extensions §4.3).
+/// A read's `200` (or `304`) response. `pinned_len` is the length a
+/// catch-up read asked for (after `aligned`, `max_bytes` and the cap) when it
+/// carried the `incarnation` parameter, and `None` otherwise. Such a response
+/// is marked `Stream-Immutable` when [`is_immutable_read`] holds.
 pub(crate) fn read_response(
     response: ReadStreamResponse,
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
-    incarnation_in_url: bool,
+    pinned_len: Option<usize>,
 ) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -528,10 +528,31 @@ pub(crate) fn read_response(
             response_cursor(response.next_offset, request_cursor),
         );
     }
-    if incarnation_in_url && (!response.up_to_date || closed_at_tail) {
+    if pinned_len.is_some_and(|len| is_immutable_read(&response, len)) {
         insert_static(&mut headers, HEADER_STREAM_IMMUTABLE, "true");
     }
     (StatusCode::OK, headers, response.payload).into_response()
+}
+
+/// Whether a catch-up read that asked for `requested_len` bytes can never
+/// answer differently for its URL (extensions §4.3): it is the tail of a
+/// closed stream, or it returned all it asked for and is not up to date.
+///
+/// The absence of `up_to_date` alone proves nothing: a follower downgrades
+/// it to false at its own tail (`ursula-raft`'s engine), because only the
+/// leader can say nothing follows, so a lagging replica's short read would
+/// pass. A full read ended at its bound, not at the replica's data, and a
+/// replica that reports closed has applied every append. A full read that
+/// is also up to date ended exactly at the tail, and its `ETag` would change
+/// once the stream grows.
+pub(crate) fn is_immutable_read(response: &ReadStreamResponse, requested_len: usize) -> bool {
+    if response.closed && response.up_to_date {
+        return true;
+    }
+    let returned = response.next_offset.checked_sub(response.offset);
+    !response.up_to_date
+        && requested_len > 0
+        && u64::try_from(requested_len).is_ok_and(|len| returned == Some(len))
 }
 
 /// A snapshot read's `200`. A published offset never changes content, so a
@@ -819,11 +840,55 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::http::StatusCode;
     use axum::http::header::CACHE_CONTROL;
+    use ursula_runtime::ReadStreamResponse;
     use ursula_runtime::RuntimeError;
+    use ursula_shard::CoreId;
+    use ursula_shard::RaftGroupId;
+    use ursula_shard::ShardId;
+    use ursula_shard::ShardPlacement;
 
     use super::insert_cache_control;
     use super::insert_default_response_headers;
+    use super::is_immutable_read;
     use super::runtime_error_status;
+
+    fn read(offset: u64, next_offset: u64, up_to_date: bool, closed: bool) -> ReadStreamResponse {
+        ReadStreamResponse {
+            placement: ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            },
+            offset,
+            next_offset,
+            content_type: "application/octet-stream".to_owned(),
+            payload: vec![0; usize::try_from(next_offset.checked_sub(offset).unwrap()).unwrap()],
+            up_to_date,
+            closed,
+            incarnation: 1,
+        }
+    }
+
+    /// A follower reports `up_to_date: false` at its own tail, so a short
+    /// read there must not pass for immutable: only a read that filled what
+    /// it asked for, or the tail of a closed stream, is.
+    #[test]
+    fn only_full_reads_and_closed_tails_are_immutable() {
+        // Filled the request below the tail.
+        assert!(is_immutable_read(&read(0, 10, false, false), 10));
+        // A follower's short read at its own tail, downgraded to not up to date.
+        assert!(!is_immutable_read(&read(0, 4, false, false), 10));
+        // Filled the request and ended exactly at the leader's tail.
+        assert!(!is_immutable_read(&read(0, 10, true, false), 10));
+        // The tail of a closed stream, full or not.
+        assert!(is_immutable_read(&read(0, 4, true, true), 10));
+        assert!(is_immutable_read(&read(10, 10, true, true), 10));
+        // An empty read below a request of nothing.
+        assert!(!is_immutable_read(&read(10, 10, false, false), 0));
+        // A closed stream read below its tail is a full read like any other.
+        assert!(is_immutable_read(&read(0, 10, false, true), 10));
+        assert!(!is_immutable_read(&read(0, 4, false, true), 10));
+    }
 
     /// Every response path calls this helper, so pinning the set here is what
     /// makes a newly added path inherit the defaults rather than quietly ship

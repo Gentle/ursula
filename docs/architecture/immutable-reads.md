@@ -59,10 +59,13 @@ read already ends at `min(offset + max_len, tail)` and never returns less below 
 - **`aligned=true`.** `aligned_read_len` turns the offset into the length up to the next multiple
   of `READ_ALIGNED_CHUNK_BYTES` (4 MiB), and the 8 MiB response cap applies after it. A const
   assertion keeps the chunk within the cap. `aligned` with `max_bytes` or `live` answers 400.
-- **The marker.** `read_response` sets `Stream-Immutable: true` on a 200 when the request carried
-  the parameter and the response is not up to date or is closed at the tail. `snapshot_response`
-  sets it on every 200 that carried the parameter. A 304, a long-poll, a 204 and errors never
-  carry it.
+- **The marker.** `read_response` sets `Stream-Immutable: true` on a 200 that carried the
+  parameter when `is_immutable_read` holds: the response is the tail of a closed stream, or it
+  returned all the length it asked for and is not up to date. Not being up to date alone is not
+  enough, because a follower downgrades `up_to_date` at its own tail (only the leader can say
+  nothing follows), so a lagging follower's short read would pass. A replica that reports closed
+  has applied every append. `snapshot_response` sets the marker on every 200 that carried the
+  parameter. A 304, a long-poll, a 204 and errors never carry it.
 - **A stable `ETag`.** `read_etag` hashes closure only for a response that reaches the tail, so a
   chunk below the tail keeps its `ETag` when the stream is closed.
 

@@ -364,8 +364,11 @@ when every later request for the same URL that succeeds receives the same body a
 
 The server MUST send it only when the request carried `incarnation` (Section 4.1) and either:
 
-- it is a catch-up read whose response does not carry `Stream-Up-To-Date: true`, or carries `Stream-Closed: true`, or
+- it is a catch-up read whose response carries `Stream-Closed: true`, or
+- it is a catch-up read that returned all it asked for (the aligned chunk, `max_bytes` or the server's cap) and does not carry `Stream-Up-To-Date: true`, or
 - it is a snapshot read (Section 2.5). Publishing different content at an offset is refused (Section 2.2).
+
+The absence of `Stream-Up-To-Date` alone does not make a response immutable: a replica that cannot prove it holds the tail answers without it, and its read may end where its own data ends. A read that returned all it asked for ended at its bound, not at the replica's data.
 
 Closing a stream MUST NOT change the `ETag` of a response that ends below the tail, since closure is visible only at the tail.
 

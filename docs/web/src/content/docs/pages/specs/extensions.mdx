@@ -389,7 +389,7 @@ Stream-Read-Origin: https://reads.example.com
 
 A server MAY send `Stream-Read-Origin` on a successful `HEAD`. Its value is an origin: a scheme, a host and an optional port, with no path. It suggests that the client send immutable reads of this stream (catch-up reads and snapshot reads that carry `incarnation`) to the same path and query on that origin, typically a CDN in front of the same server. The stream's own origin keeps every other request.
 
-A server MUST NOT send it unless requests to that origin reach the same streams at the same paths and are authorized the same way.
+A server MUST NOT send it unless requests to that origin reach the same streams at the same paths and are authorized the same way. A read origin MAY act on an authorization decision for a bounded time after it was made, so a revoked grant or a deleted stream stops being served there within that bound rather than at once. The deployment MUST document the bound.
 
 **Client rules:**
 
@@ -403,7 +403,7 @@ A server MUST NOT send it unless requests to that origin reach the same streams 
 
 ### 4.5. Security Considerations
 
-- A shared cache keeps an immutable response after the stream is deleted, until the entry expires. A deployment that stores private stream bytes in a shared cache MUST authorize every request before the cache lookup, and SHOULD bound the lifetime of entries to how long the bytes of a deleted stream may stay reachable.
+- A shared cache keeps an immutable response after the stream is deleted, until the entry expires. A deployment that stores private stream bytes in a shared cache MUST authorize every request before the cache lookup, and SHOULD bound the lifetime of entries to how long the bytes of a deleted stream may stay reachable. An authorization decision it reuses for a later request is subject to the bound of Section 4.4.
 - The cache key MUST include whatever the authorization depends on beyond the URL.
 - Reads served from a cache do not reach the server and do not renew a stream's sliding TTL (base protocol Section 5.1).
 

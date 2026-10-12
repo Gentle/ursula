@@ -88,7 +88,7 @@ receives the same credentials as the stream's origin.
    offset and digest match `HEAD`, and whose body then passes the checks a snapshot from the
    stream's origin passes. Without a digest from `HEAD`, the snapshot comes from the stream's
    origin.
-3. History from the file's offset at `{path}?offset={o}&aligned=true&incarnation={inc}`, with no
+3. History from the file's offset at `{path}?aligned=true&incarnation={inc}&offset={o}`, with no
    `consistency` parameter and no incarnation header. Accepted as a 200 of that incarnation with a
    body and a next offset past the requested one. Its `Stream-Up-To-Date` is never read.
 4. The rest with `consistency=leader` reads at the stream's origin, until up to date. The claim and

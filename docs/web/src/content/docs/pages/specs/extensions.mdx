@@ -340,7 +340,7 @@ GET {stream_url}/snapshot/{snapshot_offset}?incarnation={token}
 ### 4.2. Aligned Reads
 
 ```
-GET {stream_url}?offset={offset}&aligned=true&incarnation={token}
+GET {stream_url}?aligned=true&incarnation={token}&offset={offset}
 ```
 
 The server partitions each stream's offsets into chunks. An aligned read returns the bytes from `offset` to the end of the chunk that contains `offset`, or to the tail when the tail comes first. A reader that starts anywhere and continues from `Stream-Next-Offset` reaches a chunk boundary after one response, and from then on it requests exactly the URLs that every other reader of the stream requests.
@@ -349,6 +349,7 @@ The server partitions each stream's offsets into chunks. An aligned read returns
 - A chunk MUST NOT be larger than the server's response cap (Section 9.3), so an aligned read that is not at the tail always ends at a chunk boundary.
 - `aligned=true` combined with `max_bytes` or with `live` MUST be rejected with `400 Bad Request`, as MUST any other value of `aligned` or the parameter given more than once.
 - On a JSON stream an aligned read MAY end inside a message, as any capped read may (Section 9.4).
+- Clients SHOULD order the query parameters lexicographically (base protocol Section 8), so that every client requests one URL per chunk. A cache MAY normalize the order in its key.
 
 Ursula's chunk boundaries are the multiples of 4 MiB (4,194,304) in its offset space.
 

@@ -1136,7 +1136,7 @@ pub(crate) fn read_immutable(
     incarnation: &str,
     offset: &str,
 ) -> Result<ImmutableRead, Fallback> {
-    let request = format!("{at}?offset={offset}&aligned=true&incarnation={incarnation}");
+    let request = format!("{at}?aligned=true&incarnation={incarnation}&offset={offset}");
     let mut r = prepared(agent().get(request.as_str()), Resend::default())
         .call()
         .map_err(|e| Fallback::Transport(Box::new(e)))?;

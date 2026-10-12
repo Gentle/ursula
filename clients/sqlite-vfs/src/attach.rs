@@ -964,7 +964,7 @@ mod tests {
     }
 
     fn aligned(offset: &str) -> String {
-        format!("GET /b/s?offset={offset}&aligned=true&incarnation=i1")
+        format!("GET /b/s?aligned=true&incarnation=i1&offset={offset}")
     }
 
     // With a read origin, attach takes the snapshot and the history up to the tail `HEAD` named

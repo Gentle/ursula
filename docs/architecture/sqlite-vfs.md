@@ -803,7 +803,7 @@ The crate refuses to build with `panic = "abort"`.
   taken as `off`, logged once as `setting_adjusted`. Requests there carry the token. Only the
   snapshot `GET` and the history reads up to the tail that attach's `HEAD` named go there, as
   `GET {path}/snapshot/{offset}?incarnation={inc}` and
-  `GET {path}?offset={o}&aligned=true&incarnation={inc}` (no `consistency`). Attach takes an answer
+  `GET {path}?aligned=true&incarnation={inc}&offset={o}` (no `consistency`). Attach takes an answer
   only as a `200` of that incarnation, for a snapshot with the offset and digest `HEAD` named (then
   checks its size and checksum as always), and never reads `Stream-Up-To-Date` from it. It stops
   using the read origin at the tail, or after the first answer not marked `Stream-Immutable`. On

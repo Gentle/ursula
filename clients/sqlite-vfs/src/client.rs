@@ -35,6 +35,9 @@ const PRODUCER: &str = "sqlite-ursula-vfs";
 
 const CONTENT_TYPE: &str = "application/octet-stream";
 
+/// `User-Agent` of every request (a CONNECT proxy's too): servers and gateways tell versions apart.
+const USER_AGENT: &str = concat!("sqlite-ursula-vfs/", env!("CARGO_PKG_VERSION"));
+
 /// The protocol's offset for the beginning of a stream, and "none" for an offset that may be absent
 /// (a snapshot, retention, the local state): it sorts before every offset the server mints.
 pub(crate) const START: &str = "-1";
@@ -109,6 +112,7 @@ fn new_agent_with<R: ureq::unversioned::resolver::Resolver>(
         .max_redirects(0)
         .max_idle_age(max_idle_age)
         .tls_config(tls())
+        .user_agent(USER_AGENT)
         .build();
     ureq::Agent::with_parts(config, net::Connector::new(resolver.clone()), resolver)
 }
@@ -1399,6 +1403,7 @@ mod tests {
     use super::mock::answer;
     use super::mock::answer_with_body;
     use super::mock::marker;
+    use super::mock::request_header;
     use super::mock::serve;
     use super::mock::vouched;
     use super::new_agent;
@@ -1487,6 +1492,33 @@ mod tests {
             "GET /b/s/snapshot/9",
             "HEAD /b/s"
         ]);
+    }
+
+    // Every request names the extension and its version, so servers and gateways tell versions
+    // apart: a read, an append and a HEAD.
+    #[test]
+    fn requests_carry_the_user_agent() {
+        let (url, server) = serve(vec![
+            answer_with_body("200 OK\r\nstream-next-offset: 7", "abc"),
+            answer("200 OK"),
+            answer("200 OK\r\nstream-retained-offset: 2"),
+        ]);
+        read_from(&url, "1", "4").unwrap();
+        assert!(matches!(
+            append(&url, "i1", "p", b"frame", 1, 1),
+            Append::Acked { attempts: 1, .. }
+        ));
+        head(&url, &|| false).unwrap();
+        let requests = server.join().unwrap();
+        let expected = concat!("sqlite-ursula-vfs/", env!("CARGO_PKG_VERSION"));
+        for (request, method) in requests.iter().zip(["GET ", "POST ", "HEAD "]) {
+            assert!(request.starts_with(method), "{request}");
+            assert_eq!(
+                request_header(request, "user-agent"),
+                Some(expected),
+                "{request}"
+            );
+        }
     }
 
     // Every request carries the token. A 401 is an authorizer refusing it: the request is sent

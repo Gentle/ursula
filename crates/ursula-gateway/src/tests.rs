@@ -251,7 +251,7 @@ fn get_stream() -> Request<Body> {
 /// node.
 #[tokio::test]
 async fn gateway_drops_an_unreachable_cached_leader_and_answers_retryable_503() {
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let gateway = Gateway::new(test_config(vec![gone.clone()]));
     gateway.remember_leader("/bucket/stream".to_owned(), gone.clone());
 
@@ -281,12 +281,47 @@ async fn gateway_drops_an_unreachable_cached_leader_and_answers_retryable_503() 
     assert_eq!(metrics.leader_cache_entries, 0);
 }
 
-/// A port nothing listens on: connects are refused.
-async fn refusing_upstream() -> String {
+/// Ports nothing listens on, `count` of them and all different: connects to
+/// each are refused while the [`Refusing`] lives.
+async fn refusing_upstreams(count: usize) -> (Vec<String>, Refusing) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
-    format!("http://{}", listener.local_addr().expect("local addr"))
+    let peer = listener.local_addr().expect("local addr");
+    let mut urls = Vec::new();
+    let mut connections = Vec::new();
+    for _ in 0..count {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("loopback"))
+            .expect("bind");
+        let connection = socket.connect(peer).await.expect("connect");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+        urls.push(format!(
+            "http://{}",
+            connection.local_addr().expect("local addr")
+        ));
+        connections.push((connection, accepted));
+    }
+    (urls, Refusing {
+        _connections: connections,
+    })
+}
+
+/// A port nothing listens on: connects are refused while the [`Refusing`]
+/// lives.
+async fn refusing_upstream() -> (String, Refusing) {
+    let (mut urls, refusing) = refusing_upstreams(1).await;
+    (urls.pop().expect("one upstream"), refusing)
+}
+
+/// Holds the ports of [`refusing_upstreams`]: each is the local end of an
+/// open loopback connection, so `bind(0)` never returns it and nothing
+/// listens on it (a connect to it is refused). A socket that is
+/// only bound would hold the port too, but macOS drops a connect to it
+/// instead of refusing it, so the connect waits for its timeout.
+struct Refusing {
+    _connections: Vec<(tokio::net::TcpStream, tokio::net::TcpStream)>,
 }
 
 fn get_path(path: &str) -> Request<Body> {
@@ -368,7 +403,7 @@ async fn all_answered(gateway: &Gateway, prefix: &str, count: usize) {
 #[tokio::test(start_paused = true)]
 async fn gateway_leaves_an_upstream_that_failed_out_of_selection() {
     let _frozen = FrozenClock::hold();
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let live = [answering_upstream().await, answering_upstream().await];
     let gateway = Gateway::new(test_config(vec![
         gone.clone(),
@@ -389,7 +424,7 @@ async fn gateway_leaves_an_upstream_that_failed_out_of_selection() {
 #[tokio::test(start_paused = true)]
 async fn gateway_probes_an_ejected_upstream_after_its_window() {
     let _frozen = FrozenClock::hold();
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let live = answering_upstream().await;
     let gateway = Gateway::new(test_config(vec![gone.clone(), live.url.clone()]));
     fail_once(&gateway, &gone).await;
@@ -512,7 +547,7 @@ async fn gateway_follows_a_redirect_to_an_ejected_leader_as_its_probe() {
 #[tokio::test(start_paused = true)]
 async fn gateway_ejects_an_unreachable_redirect_leader() {
     let _frozen = FrozenClock::hold();
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let leader_url = format!("{gone}/bucket/stream");
     let follower = spawn_upstream(Router::new().route(
         "/bucket/stream",
@@ -554,7 +589,7 @@ async fn gateway_ejects_an_unreachable_redirect_leader() {
 #[tokio::test(start_paused = true)]
 async fn gateway_still_sends_when_every_upstream_is_ejected() {
     let _frozen = FrozenClock::hold();
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let gateway = Gateway::new(test_config(vec![gone.clone()]));
     fail_once(&gateway, &gone).await;
 
@@ -593,7 +628,7 @@ fn gateway_keeps_the_cached_route_when_every_upstream_is_ejected() {
 #[tokio::test(start_paused = true)]
 async fn gateway_drops_a_cached_route_to_an_ejected_upstream() {
     let _frozen = FrozenClock::hold();
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let live = answering_upstream().await;
     let gateway = Gateway::new(test_config(vec![gone.clone(), live.url.clone()]));
     fail_once(&gateway, &gone).await;
@@ -1548,7 +1583,7 @@ async fn a_redirect_the_gateway_cannot_follow_ends_in_a_503_marked_only_when_it_
 /// proposes anything, and may have proposed the write before an unmarked one.
 #[tokio::test]
 async fn a_connect_failure_is_marked_only_when_no_node_can_have_proposed_the_request() {
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
 
     let first_hop = gateway_for_url(gone.clone())
         .handle(post_path("/bucket/stream"))
@@ -2036,7 +2071,7 @@ async fn the_redirect_deadline_counts_from_the_first_redirect() {
 /// sent it. The upstream is ejected, and no route is learned.
 #[tokio::test]
 async fn a_connect_failure_after_redirects_is_marked_only_when_every_redirect_was() {
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     for (case, first, second, expected) in [
         (
             "marked, marked",
@@ -2114,7 +2149,7 @@ async fn a_leader_hop_that_times_out_is_unmarked_and_teaches_no_route() {
 #[tokio::test]
 async fn a_search_hop_that_cannot_connect_searches_on_and_one_that_was_sent_stays_unmarked() {
     let unknown = |values: &[&'static str]| raft_redirect(UNKNOWN_LEADER, marked(values));
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
 
     let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
     a.answers(unknown(&["NotLeader"]));
@@ -2154,23 +2189,6 @@ async fn a_search_hop_that_cannot_connect_searches_on_and_one_that_was_sent_stay
     let request = request.await.expect("the upstream read a request");
     let request = String::from_utf8(request).expect("an ASCII request");
     assert!(request.ends_with("\r\n\r\nabc"), "{request}");
-}
-
-/// Ports nothing listens on, `count` of them and all different: connects to
-/// each are refused.
-async fn refusing_upstreams(count: usize) -> Vec<String> {
-    let mut listeners = Vec::new();
-    for _ in 0..count {
-        listeners.push(
-            tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind"),
-        );
-    }
-    listeners
-        .iter()
-        .map(|listener| format!("http://{}", listener.local_addr().expect("local addr")))
-        .collect()
 }
 
 /// A search hop whose upstream read the whole request and closed the
@@ -2244,7 +2262,7 @@ async fn a_search_hop_that_times_out_ends_the_request_with_upstreams_left() {
 /// them never gets the request.
 #[tokio::test]
 async fn a_search_that_cannot_connect_stops_after_three_hops() {
-    let gone = refusing_upstreams(3).await;
+    let (gone, _refusing) = refusing_upstreams(3).await;
     let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
     a.answers(raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])));
     let mut upstreams = vec![a.url()];
@@ -2274,7 +2292,7 @@ async fn a_search_that_cannot_connect_stops_after_three_hops() {
 /// upstream the search goes on to keeps its marker.
 #[tokio::test]
 async fn a_search_hop_skipped_for_a_connect_failure_keeps_the_marker() {
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let (a, leader) = (Scripted::spawn().await, Scripted::spawn().await);
     a.answers(raft_redirect(UNKNOWN_LEADER, marked(&["NotLeader"])));
     leader.answers(refusal(&["RaftLogPressure"]));
@@ -2294,7 +2312,7 @@ async fn a_search_hop_skipped_for_a_connect_failure_keeps_the_marker() {
 /// gets the `503` of the connect failure, marked since every redirect was.
 #[tokio::test]
 async fn a_named_upstream_that_cannot_connect_ends_the_request() {
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let (a, b, c) = (
         Scripted::spawn().await,
         Scripted::spawn().await,
@@ -2508,7 +2526,7 @@ async fn the_gateway_vouches_for_every_response() {
             ),
     )
     .await;
-    let gone = refusing_upstream().await;
+    let (gone, _refusing) = refusing_upstream().await;
     let mut small_bodies = test_config(vec![node.url.clone()]);
     small_bodies.max_request_body_bytes = 2;
     let mut cors = test_config(vec![node.url.clone()]);

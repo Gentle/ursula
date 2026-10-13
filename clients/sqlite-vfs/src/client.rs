@@ -1276,6 +1276,28 @@ pub(crate) mod mock {
     /// wait for (or even add to now).
     pub(crate) const LAST: &str = "retry-after: 18446744073709551615";
 
+    /// A loopback port nothing listens on: connects to it are refused while the [`Refusing`]
+    /// lives.
+    pub(crate) fn refusing() -> (std::net::SocketAddr, Refusing) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _peer) = listener.accept().unwrap();
+        // The listener's port, which bind chose: Linux's connect never hands a port bind chose to
+        // another connect, so no test's own connect can take it as its source port and reach
+        // itself. The accepted end keeps holding it once the listener is dropped here.
+        (accepted.local_addr().unwrap(), Refusing {
+            _connection: (connection, accepted),
+        })
+    }
+
+    /// Holds the port of [`refusing`]: an end of an open loopback connection, so `bind(0)` never
+    /// returns it and nothing listens on it (a connect to it is refused).
+    /// A socket that is only bound would hold the port too, but macOS drops a connect to it
+    /// instead of refusing it, so the connect waits for its timeout.
+    pub(crate) struct Refusing {
+        _connection: (TcpStream, TcpStream),
+    }
+
     /// Answers one connection per answer, in order, and returns each request's head. An empty
     /// answer closes the connection without one: the attempt's outcome is unknown. The request's
     /// body is read whole before the answer: a connection closed with unread bytes is reset, which
@@ -1403,6 +1425,7 @@ mod tests {
     use super::mock::answer;
     use super::mock::answer_with_body;
     use super::mock::marker;
+    use super::mock::refusing;
     use super::mock::request_header;
     use super::mock::serve;
     use super::mock::vouched;
@@ -1994,9 +2017,8 @@ mod tests {
             let requests = server.join().unwrap();
             assert!(requests[0].starts_with("HEAD /b/s "), "{requests:?}");
         }
-        let nothing = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/b/s", nothing.local_addr().unwrap());
-        drop(nothing);
+        let (nothing, _refusing) = refusing();
+        let url = format!("http://{nothing}/b/s");
         assert!(!answers(&url), "nothing listening");
     }
 
@@ -3134,9 +3156,7 @@ mod tests {
     // address, where the cached address kept failing.
     #[test]
     fn a_failed_connection_looks_the_host_up_again() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let moved_from = closed.local_addr().unwrap();
-        drop(closed);
+        let (moved_from, _refusing) = refusing();
         let (url, server) = serve(vec![answer("200 OK")]);
         let lookups = Lookups::new(vec![Ok(moved_from), Ok(served(&url))]);
         let resolver = net::Resolver::new(lookups.clone());
@@ -3199,9 +3219,8 @@ mod tests {
     // and the database is not poisoned. It used to end as an unknown outcome.
     #[test]
     fn an_append_whose_every_attempt_fails_before_sending_fails_alone() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/b/s", closed.local_addr().unwrap());
-        drop(closed);
+        let (closed, _refusing) = refusing();
+        let url = format!("http://{closed}/b/s");
         let retrying = Retrying {
             agent: agent(),
             deadline: within(Duration::from_millis(500)),

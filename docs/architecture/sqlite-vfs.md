@@ -789,6 +789,7 @@ The crate refuses to build with `panic = "abort"`.
   fails a commit at once, alone when the `404` is vouched (§2) and with a poison otherwise. A token
   sent over `http://` to a host that is not loopback is logged once (`token_in_clear`). The SQL
   functions are direct-only: a trigger or view of an untrusted database cannot call them.
+- Every request carries `User-Agent: sqlite-ursula-vfs/<version>`, the extension's version.
 - A host's addresses are looked up through the system's resolver at most once every 30 s per
   process, so a stream whose endpoint moves is reached at its new addresses within 30 s, or 5 s
   after a connection to an old address failed (§6, DNS).

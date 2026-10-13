@@ -1,18 +1,14 @@
 //! Recovery fault schedules over real TCP/gRPC, retaining the actual Raft handlers.
 
-use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use axum::serve::Listener;
-use axum::serve::ListenerExt;
 use openraft::RaftMetrics;
 use openraft::rt::Instant as _;
 use openraft::rt::WatchReceiver;
 use openraft::type_config::alias::WatchReceiverOf;
-use tokio::net::TcpStream;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -223,36 +219,26 @@ async fn new_recovery_engine(
     (engine, store, gate, wal_root)
 }
 
-/// Binds a fixture node's gRPC listener on loopback and returns its
-/// endpoint. Every socket it accepts sets `TCP_NODELAY`, as production's
-/// listeners do (`ursula_observability::serve::serve_until_shutdown`).
-/// Without it, Nagle's algorithm holds a follower's reply while an earlier
-/// reply is unacknowledged, and the leader delays that acknowledgement (at
-/// least 40 ms on Linux) until its next request. With the fixtures' 10 ms
-/// ReadIndex rounds, each reply can then arrive one round late, round after
-/// round, so that no round reaches a quorum (#521, #547).
-async fn bind_fixture_listener() -> (String, impl Listener<Io = TcpStream, Addr = SocketAddr>) {
+/// Serves `service` over gRPC on a new loopback listener until the returned
+/// task is aborted, and returns the listener's endpoint. It serves through
+/// production's [`ursula_observability::serve::serve_until_shutdown`], which
+/// sets `TCP_NODELAY` on every socket it accepts: with the fixtures' 10 ms
+/// ReadIndex rounds, a delayed reply can otherwise keep every round short of
+/// a quorum (#521, #547).
+async fn serve_fixture(service: RecoveryTestService) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let listener = listener.tap_io(|stream| {
-        if let Err(err) = stream.set_nodelay(true) {
-            tracing::warn!("set TCP_NODELAY on an accepted fixture socket: {err}");
-        }
-    });
-    (endpoint, listener)
-}
-
-/// Serves `service` over gRPC on a new fixture listener
-/// ([`bind_fixture_listener`]) until the returned task is aborted, and
-/// returns the listener's endpoint.
-async fn serve_fixture(service: RecoveryTestService) -> (String, tokio::task::JoinHandle<()>) {
-    let (endpoint, listener) = bind_fixture_listener().await;
     let wire = pb::raft_internal_server::RaftInternalServer::new(service)
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
     let server = tokio::spawn(async move {
-        axum::serve(listener, axum::Router::new().fallback_service(wire))
-            .await
-            .unwrap();
+        ursula_observability::serve::serve_until_shutdown(
+            listener,
+            axum::Router::new().fallback_service(wire),
+            std::future::pending(),
+            None,
+        )
+        .await
+        .unwrap();
     });
     (endpoint, server)
 }
@@ -487,17 +473,6 @@ fn read_attempt_error(error: GroupEngineError) -> AttemptError {
         } => AttemptError::Transient(text),
         _ => AttemptError::Fatal(text),
     }
-}
-
-/// A fixture node's listener accepts connections with `TCP_NODELAY` set, as
-/// production's listeners do.
-#[tokio::test]
-async fn fixture_listener_sets_nodelay_on_accepted_connections() {
-    let (_endpoint, mut listener) = bind_fixture_listener().await;
-    let address = listener.local_addr().unwrap();
-    let ((accepted, _peer), client) = tokio::join!(listener.accept(), TcpStream::connect(address));
-    client.unwrap();
-    assert!(accepted.nodelay().unwrap());
 }
 
 #[tokio::test]

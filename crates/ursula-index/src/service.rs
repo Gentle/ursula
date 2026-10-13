@@ -32,6 +32,7 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use ursula_observability::serve::serve_until_shutdown;
 use ursula_observability::serve::shutdown_signal;
 
 use crate::EventIndex;
@@ -632,14 +633,18 @@ async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
+    serve_until_shutdown(
+        listener,
+        app,
+        async move {
             shutdown.await;
             if shutdown_tx.send(true).is_err() {
                 tracing::debug!("background loops already stopped");
             }
-        })
-        .await?;
+        },
+        None,
+    )
+    .await?;
     Ok(())
 }
 

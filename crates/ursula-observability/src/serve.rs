@@ -7,12 +7,15 @@
 //! exit after a grace period, multiple listeners) compose these primitives
 //! instead of re-rolling signal handling.
 
+use std::fmt::Debug;
 use std::future::Future;
 use std::future::IntoFuture;
 use std::io;
 use std::time::Duration;
 
+use axum::serve::Listener;
 use axum::serve::ListenerExt;
+use tokio::net::TcpStream;
 
 /// Wait for a termination signal: SIGTERM or Ctrl-C (Ctrl-C only on
 /// non-unix). If the SIGTERM handler cannot be installed, falls back to
@@ -55,26 +58,45 @@ pub async fn shutdown_signal() {
     }
 }
 
+/// Wrap `listener` so that every socket it accepts sets `TCP_NODELAY`.
+///
+/// Without it, Nagle's algorithm holds a reply while an earlier reply on the
+/// same connection is unacknowledged, and the peer delays that
+/// acknowledgement (at least 40 ms on Linux) until its next request. A Raft
+/// follower that writes two replies in a row then answers each ReadIndex
+/// round one round late (#521, #547).
+fn nodelay_listener<L>(listener: L) -> impl Listener<Io = TcpStream, Addr = L::Addr>
+where L: Listener<Io = TcpStream> {
+    listener.tap_io(|stream| {
+        if let Err(err) = stream.set_nodelay(true) {
+            tracing::warn!("set TCP_NODELAY on accepted socket: {err}");
+        }
+    })
+}
+
 /// Serve `listener` with `app` until `shutdown` completes, then stop accepting
 /// new connections and drain in-flight requests before returning.
+///
+/// Every connection it accepts sets `TCP_NODELAY`: without it, Nagle's
+/// algorithm and the peer's delayed acknowledgement hold back a second reply
+/// on the same connection by 40 ms or more.
 ///
 /// `drain_timeout` bounds the drain: with `Some(t)` the server returns `Ok`
 /// after `t` even if connections are still open; with `None` the drain is
 /// unbounded (callers enforce their own deadline, e.g. via a forced-exit
 /// watchdog).
-pub async fn serve_until_shutdown(
-    listener: tokio::net::TcpListener,
+pub async fn serve_until_shutdown<L>(
+    listener: L,
     app: axum::Router,
     shutdown: impl Future<Output = ()> + Send + 'static,
     drain_timeout: Option<Duration>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    L: Listener<Io = TcpStream>,
+    L::Addr: Debug,
+{
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let listener = listener.tap_io(|stream| {
-        if let Err(err) = stream.set_nodelay(true) {
-            tracing::warn!("set TCP_NODELAY on accepted socket: {err}");
-        }
-    });
-    let server = axum::serve(listener, app)
+    let server = axum::serve(nodelay_listener(listener), app)
         .with_graceful_shutdown(async move {
             drop(shutdown_rx.await);
         })
@@ -107,5 +129,81 @@ pub async fn serve_until_shutdown(
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use axum::serve::Listener;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+
+    use super::serve_until_shutdown;
+
+    /// A [`TcpListener`] that keeps a duplicate of every socket it accepts,
+    /// so that a test can read the socket options the server sets on it.
+    struct DuplicatingListener {
+        inner: TcpListener,
+        accepted: Arc<Mutex<Vec<std::net::TcpStream>>>,
+    }
+
+    impl Listener for DuplicatingListener {
+        type Addr = SocketAddr;
+        type Io = TcpStream;
+
+        async fn accept(&mut self) -> (TcpStream, SocketAddr) {
+            let (stream, peer) = self.inner.accept().await.unwrap();
+            let stream = stream.into_std().unwrap();
+            self.accepted
+                .lock()
+                .unwrap()
+                .push(stream.try_clone().unwrap());
+            (TcpStream::from_std(stream).unwrap(), peer)
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+    }
+
+    /// `serve_until_shutdown` sets `TCP_NODELAY` on every connection it
+    /// accepts.
+    #[tokio::test]
+    async fn serve_until_shutdown_sets_nodelay_on_accepted_connections() {
+        let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = inner.local_addr().unwrap();
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let listener = DuplicatingListener {
+            inner,
+            accepted: Arc::clone(&accepted),
+        };
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(serve_until_shutdown(
+            listener,
+            app,
+            std::future::pending(),
+            None,
+        ));
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let accepted = accepted.lock().unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert!(accepted[0].nodelay().unwrap());
+        drop(accepted);
+        server.abort();
     }
 }

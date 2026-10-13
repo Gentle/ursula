@@ -4651,6 +4651,7 @@ dependencies = [
  "tracing-opentelemetry",
  "ursula-config",
  "ursula-control",
+ "ursula-observability",
  "ursula-proto",
  "ursula-runtime",
  "ursula-shard",

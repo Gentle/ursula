@@ -140,7 +140,12 @@ pub struct GroupDriveState {
     /// Log bytes the group's build in flight will still free, `None` while
     /// no build runs. The snapshot driver also sets `Some(0)` for a group it
     /// holds out of its passes after a trigger of it went unclaimed: never
-    /// planned, and none of its log counted as freed.
+    /// planned, and none of its log counted as freed. It sets `Some(0)` as
+    /// well for a group whose build released its permit with a snapshot
+    /// OpenRaft has not published yet, for at most
+    /// [`crate::SNAPSHOT_HANDOFF_WAIT`]
+    /// ([`crate::SnapshotBuildCoordinator::add_publishing`]), so the pass
+    /// log's `building` count includes such groups.
     pub building: Option<u64>,
 }
 

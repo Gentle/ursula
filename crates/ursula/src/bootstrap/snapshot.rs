@@ -323,7 +323,9 @@ pub(crate) fn group_log_progress(snapshot: &RaftGroupMetricsSnapshot) -> GroupLo
 /// `lagging` first, never a group with a build in `building` (the log each
 /// such build will still free) or one the driver `held` out of the pass
 /// ([`HeldGroups`], counted as building with nothing to free), within
-/// `limits`.
+/// `limits`. `building` also holds, with nothing to free, each group whose
+/// build ended with a snapshot OpenRaft has not published yet
+/// ([`SnapshotBuildCoordinator::add_publishing`]).
 pub(crate) fn plan_snapshot_drive<'a>(
     snapshots: &'a [RaftGroupMetricsSnapshot],
     cadence: &SnapshotCadence,
@@ -443,14 +445,15 @@ pub fn spawn_snapshot_driver(
             let mut building = coordinator.builds_in_flight();
             let held = held_groups.held(Instant::now());
             let snaps = registry.metrics_snapshot();
-            for snapshot in &snaps {
-                if coordinator.publishing(
-                    snapshot.raft_group_id,
-                    snapshot.snapshot.as_ref().map(|published| published.index),
-                ) {
-                    building.entry(snapshot.raft_group_id).or_insert(0);
-                }
-            }
+            coordinator.add_publishing(
+                &mut building,
+                snaps.iter().map(|snapshot| {
+                    (
+                        snapshot.raft_group_id,
+                        snapshot.snapshot.as_ref().map(|published| published.index),
+                    )
+                }),
+            );
             let store_trouble = match gate.as_mut().map(|gate| gate.latest_bad()) {
                 None => false,
                 Some(Ok(latest_bad)) => latest_bad,

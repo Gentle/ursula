@@ -2130,8 +2130,9 @@ fn cold_reference_error_response(err: &ursula_runtime::ColdReferenceError) -> Re
 
 /// How long an operator's snapshot request waits for its build to start.
 const ADMIN_SNAPSHOT_START_WAIT: Duration = Duration::from_secs(10);
-/// How long an operator's snapshot request waits, once the group's build
-/// ended, for OpenRaft to publish the snapshot that covers it.
+/// How long an operator's snapshot request waits for the group's running
+/// build to end, and then, separately, for OpenRaft to publish the snapshot
+/// that covers it.
 const ADMIN_SNAPSHOT_PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn trigger_raft_snapshot(
@@ -2187,8 +2188,24 @@ pub(crate) async fn trigger_raft_snapshot(
         // The covering snapshot may come from a build that still publishes
         // its reference or prunes retired snapshots, and OpenRaft publishes
         // it only once that build ended, so the wait for OpenRaft starts
-        // then.
-        coordinator.build_ended(raft_group_id.0).await;
+        // then. A request OpenRaft's snapshot already covers waits for no
+        // build. The build wait is bounded like the wait for OpenRaft, so a
+        // build held up by its snapshot store (OpenDAL retries, then an
+        // inline fallback) adds at most ADMIN_SNAPSHOT_PUBLISH_WAIT, and a
+        // request whose build outlasts it waits for OpenRaft as before.
+        if !published(&raft.metrics().borrow_watched()) {
+            let build_ended = coordinator.build_ended(raft_group_id.0);
+            if tokio::time::timeout(ADMIN_SNAPSHOT_PUBLISH_WAIT, build_ended)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    raft_group_id = raft_group_id.0,
+                    "admin snapshot: the group's build did not end within \
+                     {ADMIN_SNAPSHOT_PUBLISH_WAIT:?}; waiting for its snapshot all the same"
+                );
+            }
+        }
         if let Err(err) = raft
             .wait(Some(ADMIN_SNAPSHOT_PUBLISH_WAIT))
             .metrics(

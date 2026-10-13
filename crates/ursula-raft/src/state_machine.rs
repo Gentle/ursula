@@ -766,6 +766,25 @@ impl SnapshotBuildCoordinator {
         })
     }
 
+    /// Adds to `building`, the groups [`Self::builds_in_flight`] read, each
+    /// group in `published` (a group and the last log index of the snapshot
+    /// OpenRaft's metrics show for it) that is [`Self::publishing`], as
+    /// building with nothing left to free. A group already in `building`
+    /// keeps the log its build will still free. The snapshot driver leaves
+    /// such a group out of its pass, since OpenRaft would drop a trigger of
+    /// it, for at most [`SNAPSHOT_HANDOFF_WAIT`] after its build ended.
+    pub fn add_publishing(
+        &self,
+        building: &mut BTreeMap<u32, u64>,
+        published: impl IntoIterator<Item = (u32, Option<u64>)>,
+    ) {
+        for (raft_group_id, published_index) in published {
+            if self.publishing(raft_group_id, published_index) {
+                building.entry(raft_group_id).or_insert(0);
+            }
+        }
+    }
+
     fn built(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, BuiltSnapshot>> {
         self.inner
             .built
@@ -2950,7 +2969,7 @@ mod tests {
     /// #561: a build records its snapshot once it is durable, before it
     /// publishes the snapshot's reference and prunes retired snapshots,
     /// which can take seconds: a snapshot start that times out meanwhile
-    /// still sees the snapshot that covers it.
+    /// still sees the snapshot that covers it. Each step stalls in turn.
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn a_build_records_its_snapshot_before_its_housekeeping() {
@@ -2960,14 +2979,36 @@ mod tests {
         use ursula_shard::RaftGroupId;
         use ursula_shard::ShardId;
 
-        /// Inline snapshots whose pruning never ends.
-        #[derive(Debug)]
-        struct StuckPruneStore {
-            inline: SharedSnapshotStore,
-            pruning: Arc<crate::rt::sync::Notify>,
+        /// A build's housekeeping step after its snapshot is durable.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Housekeeping {
+            /// Publishing the current reference, with its retry backoff of
+            /// up to 5 s.
+            Publish,
+            /// Pruning retired snapshots.
+            Prune,
         }
 
-        impl SnapshotStore for StuckPruneStore {
+        /// Inline snapshots whose `stuck` housekeeping step never ends.
+        #[derive(Debug)]
+        struct StuckHousekeepingStore {
+            inline: SharedSnapshotStore,
+            stuck: Housekeeping,
+            entered: Arc<crate::rt::sync::Notify>,
+        }
+
+        impl StuckHousekeepingStore {
+            fn step(&self, step: Housekeeping) -> SnapshotStoreFuture<'_, ()> {
+                if step == self.stuck {
+                    self.entered.notify_one();
+                    Box::pin(std::future::pending())
+                } else {
+                    Box::pin(async { Ok(()) })
+                }
+            }
+        }
+
+        impl SnapshotStore for StuckHousekeepingStore {
             fn upload<'a>(
                 &'a self,
                 key: SnapshotKey,
@@ -2987,14 +3028,21 @@ mod tests {
                 self.inline.delete(location)
             }
 
+            fn publish_reference<'a>(
+                &'a self,
+                _raft_group_id: u32,
+                _location: &'a SnapshotLocation,
+            ) -> SnapshotStoreFuture<'a, ()> {
+                self.step(Housekeeping::Publish)
+            }
+
             fn prune_retired<'a>(
                 &'a self,
                 _raft_group_id: u32,
                 _current: &'a SnapshotLocation,
                 _retain_latest: usize,
             ) -> SnapshotStoreFuture<'a, ()> {
-                self.pruning.notify_one();
-                Box::pin(std::future::pending())
+                self.step(Housekeeping::Prune)
             }
         }
 
@@ -3003,42 +3051,49 @@ mod tests {
             shard_id: ShardId(0),
             raft_group_id: RaftGroupId(7),
         };
-        let pruning = Arc::new(crate::rt::sync::Notify::new());
-        let mut builder = RaftGroupSnapshotBuilder {
-            apply_health: Default::default(),
-            placement,
-            snapshot: Ok(Arc::new(test_group_snapshot(placement, 9))),
-            meta: test_snapshot_meta(9),
-            current_snapshot: Arc::new(Mutex::new(None)),
-            metadata_serial: Arc::default(),
-            snapshot_store: Arc::new(StuckPruneStore {
-                inline: default_snapshot_store(),
-                pruning: Arc::clone(&pruning),
-            }),
-            metrics: None,
-            build: test_build_lease().await,
-            log_gauge: Arc::default(),
-            log_mark: GroupLogMark::default(),
-            references: Arc::default(),
-            snapshot_metadata_path: None,
-        };
-        let coordinator = builder.build.coordinator.clone();
-        {
-            let built = builder.build_snapshot();
-            tokio::pin!(built);
-            tokio::select! {
-                _built = &mut built => panic!("the pruning never ends"),
-                () = pruning.notified() => {}
+        for stuck in [Housekeeping::Publish, Housekeeping::Prune] {
+            let entered = Arc::new(crate::rt::sync::Notify::new());
+            let mut builder = RaftGroupSnapshotBuilder {
+                apply_health: Default::default(),
+                placement,
+                snapshot: Ok(Arc::new(test_group_snapshot(placement, 9))),
+                meta: test_snapshot_meta(9),
+                current_snapshot: Arc::new(Mutex::new(None)),
+                metadata_serial: Arc::default(),
+                snapshot_store: Arc::new(StuckHousekeepingStore {
+                    inline: default_snapshot_store(),
+                    stuck,
+                    entered: Arc::clone(&entered),
+                }),
+                metrics: None,
+                build: test_build_lease().await,
+                log_gauge: Arc::default(),
+                log_mark: GroupLogMark::default(),
+                references: Arc::default(),
+                snapshot_metadata_path: None,
+            };
+            let coordinator = builder.build.coordinator.clone();
+            {
+                let built = builder.build_snapshot();
+                tokio::pin!(built);
+                tokio::select! {
+                    _built = &mut built => panic!("{stuck:?} never ends"),
+                    () = entered.notified() => {}
+                }
+                assert_eq!(
+                    coordinator.built_snapshot(7),
+                    Some(test_log_id(9)),
+                    "{stuck:?}"
+                );
+                // Still building: the group is not left out as publishing.
+                assert!(!coordinator.publishing(7, None), "{stuck:?}");
             }
-            assert_eq!(coordinator.built_snapshot(7), Some(test_log_id(9)));
-            // Still building: the group is not left out as publishing.
-            assert!(!coordinator.publishing(7, None));
+            drop(builder);
+            // Released with a snapshot OpenRaft has not published yet.
+            assert!(coordinator.publishing(7, None), "{stuck:?}");
+            assert!(coordinator.publishing(7, Some(8)), "{stuck:?}");
+            assert!(!coordinator.publishing(7, Some(9)), "{stuck:?}");
         }
-        drop(builder);
-        // Released with a snapshot OpenRaft has not published yet.
-        assert!(coordinator.publishing(7, None));
-        assert!(coordinator.publishing(7, Some(8)));
-        assert!(!coordinator.publishing(7, Some(9)));
     }
 
     /// #561: a group whose build released its permit with a snapshot that
@@ -3067,6 +3122,57 @@ mod tests {
         // A build that recorded nothing leaves the record as it was.
         drop(build.try_lease(7, 0).expect("a free permit"));
         assert!(!build.publishing(7, Some(4)));
+    }
+
+    /// #561: the snapshot driver counts a group whose build released its
+    /// permit, but whose snapshot OpenRaft has not published yet, as
+    /// building with nothing to free, for at most [`SNAPSHOT_HANDOFF_WAIT`],
+    /// and leaves the log a running build will still free as it was.
+    #[cfg(not(madsim))]
+    #[tokio::test(start_paused = true)]
+    async fn the_driver_counts_a_publishing_group_as_building_for_a_bounded_while() {
+        let build = SnapshotBuildCoordinator::new(2);
+        build
+            .try_lease(7, 0)
+            .expect("a free permit")
+            .record_built(Some(test_log_id(5)));
+        // Group 8 published an earlier build and builds again.
+        build
+            .try_lease(8, 0)
+            .expect("a free permit")
+            .record_built(Some(test_log_id(3)));
+        let _running = build.try_lease(8, 300).expect("a free permit");
+        let building = |published: [(u32, Option<u64>); 3]| {
+            let mut building = build.builds_in_flight();
+            build.add_publishing(&mut building, published);
+            building
+        };
+        assert_eq!(
+            building([(7, Some(4)), (8, None), (9, None)]),
+            BTreeMap::from([(7, 0), (8, 300)])
+        );
+        // Published: the group is planned again.
+        assert_eq!(
+            building([(7, Some(5)), (8, None), (9, None)]),
+            BTreeMap::from([(8, 300)])
+        );
+        tokio::time::advance(
+            SNAPSHOT_HANDOFF_WAIT
+                .checked_sub(Duration::from_millis(1))
+                .expect("longer than a millisecond"),
+        )
+        .await;
+        assert_eq!(
+            building([(7, Some(4)), (8, None), (9, None)]),
+            BTreeMap::from([(7, 0), (8, 300)])
+        );
+        // Unpublished all the same once the wait passed: OpenRaft no longer
+        // counts the build, so the group is planned again.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            building([(7, Some(4)), (8, None), (9, None)]),
+            BTreeMap::from([(8, 300)])
+        );
     }
 
     /// #561: a group is busy while a permit handed to it is pending or a

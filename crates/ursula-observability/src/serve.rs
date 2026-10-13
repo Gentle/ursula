@@ -77,7 +77,9 @@ where L: Listener<Io = TcpStream> {
 /// Serve `listener` with `app` until `shutdown` completes, then stop accepting
 /// new connections and drain in-flight requests before returning.
 ///
-/// Every connection it accepts sets `TCP_NODELAY` (see [`nodelay_listener`]).
+/// Every connection it accepts sets `TCP_NODELAY`: without it, Nagle's
+/// algorithm and the peer's delayed acknowledgement hold back a second reply
+/// on the same connection by 40 ms or more.
 ///
 /// `drain_timeout` bounds the drain: with `Some(t)` the server returns `Ok`
 /// after `t` even if connections are still open; with `None` the drain is

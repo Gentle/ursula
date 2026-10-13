@@ -19,6 +19,8 @@ use std::ptr::null;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -69,6 +71,10 @@ const WAL_CKPT_LOCK: c_int = 1;
 /// The size of a wal-index region (the first holds the header).
 const WAL_INDEX_REGION: c_int = 32 * 1024;
 
+/// `WAL_READ_LOCK(0)`: the first of the read-mark lock slots, one of which every read transaction
+/// takes shared.
+const WAL_READ_LOCK_0: c_int = 3;
+
 /// The longest a commit waits at its commit point for a due snapshot to open its window.
 const WINDOW_WAIT: Duration = Duration::from_secs(1);
 
@@ -86,6 +92,8 @@ pub(crate) struct File {
 struct Ext {
     path: Option<String>,
     db: Option<Arc<Mutex<Db>>>,
+    /// The fence flag of a main db handle's attachment (`Db::fence`), read without its mutex.
+    fence: Option<Arc<AtomicBool>>,
     wal: bool,
     /// This main db handle holds an EXCLUSIVE file lock.
     exclusive: Cell<bool>,
@@ -425,8 +433,8 @@ unsafe fn x_open(
         return ffi::SQLITE_CANTOPEN;
     }
     // Counted before the open, so attach (which refuses while any is counted) and an open
-    // cannot pass each other; refused while `attach` runs on the path, and when it has a
-    // sidecar but no binding (`refused`).
+    // cannot pass each other; refused while `attach` runs on the path, and without a binding
+    // after its last attach failed or while it has a sidecar (`refused`).
     let main = match name {
         Some(name) if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 => {
             let mut reg = registry();
@@ -443,9 +451,10 @@ unsafe fn x_open(
                 ]);
                 return ffi::SQLITE_CANTOPEN;
             }
+            let fence = reg.fences.get(name).cloned();
             let open = reg.open.entry(name.to_owned()).or_default();
             *open = open.saturating_add(1);
-            Some(db)
+            Some((db, fence))
         }
         _ => None,
     };
@@ -464,9 +473,10 @@ unsafe fn x_open(
         return rc;
     }
     let ext = match (name, main) {
-        (Some(name), Some(db)) => Some(Ext {
+        (Some(name), Some((db, fence))) => Some(Ext {
             path: Some(name.to_owned()),
             db,
+            fence,
             wal: false,
             exclusive: Cell::new(false),
         }),
@@ -474,6 +484,7 @@ unsafe fn x_open(
             name.strip_suffix("-wal").and_then(lookup).map(|db| Ext {
                 path: None,
                 db: Some(db),
+                fence: None,
                 wal: true,
                 exclusive: Cell::new(false),
             })
@@ -1082,6 +1093,21 @@ unsafe fn x_shm_map(
 /// rewrites reach the WAL). Lock order: the real shm lock may be taken without the mutex, and the
 /// mutex may be held while releasing it, which never blocks.
 unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flags: c_int) -> c_int {
+    // Every read transaction on a WAL database takes one of the read-mark locks shared when it
+    // starts, even one whose pages its connection has cached. A fenced database refuses it, so no
+    // new read transaction serves the state the newer owner moved past: reads fail like writes
+    // until the file is attached again (`ursula_status` says `fenced`). A read transaction open
+    // already keeps its snapshot until it ends. The flag is read without the database's mutex,
+    // which a commit holds across its append (`Db::fence`).
+    if flags == ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_SHARED
+        && offset >= WAL_READ_LOCK_0
+        // SAFETY: the module contract.
+        && unsafe { ext(file) }
+            .and_then(|e| e.fence.as_deref())
+            .is_some_and(|fence| fence.load(Ordering::Acquire))
+    {
+        return ffi::SQLITE_IOERR_READ;
+    }
     let tracked = flags & ffi::SQLITE_SHM_EXCLUSIVE != 0
         && n == 1
         && (offset == WAL_WRITE_LOCK || offset == WAL_CKPT_LOCK);
@@ -1950,6 +1976,7 @@ mod tests {
             ext: Box::into_raw(Box::new(Ext {
                 path: Some(path.clone()),
                 db: Some(db.clone()),
+                fence: None,
                 wal: false,
                 exclusive: Cell::new(true),
             })),
@@ -2103,6 +2130,7 @@ mod tests {
             ext: Box::into_raw(Box::new(Ext {
                 path: None,
                 db: Some(db.clone()),
+                fence: None,
                 wal: true,
                 exclusive: Cell::new(false),
             })),

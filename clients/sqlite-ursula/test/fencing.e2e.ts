@@ -1,5 +1,7 @@
 // Producer fencing: a new owner's claim (a new producer epoch) fences every earlier owner.
 import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+import type { ConversationId, DocumentId } from "@earendil-works/pi-durable";
 import { expect, it } from "vitest";
 import { attach, status, UrsulaReplicationError } from "../src/index.ts";
 import { openUrsulaPiStorage } from "../src/pi.ts";
@@ -35,12 +37,17 @@ it("a fenced writer's commit fails, stays out of its file, and the new owner is 
 	expect(attempt(() => a.exec("INSERT INTO t VALUES ('a2')"))).toMatch(/disk I\/O error/);
 	expect(status(fileA)).toMatchObject({ poisoned: true, fenced: true });
 	expect(status(fileA).reason).toMatch(/superseded.*\(403\)/);
-	expect(xs(a)).toEqual(["a1"]);
+	// Fenced, it serves no reads either: the state it holds is behind the new owner's.
+	expect(attempt(() => xs(a))).toMatch(/disk I\/O error \(errcode 266\)/);
 	// A short marker can occur in WAL salts/checksums before the rejected write.
 	// Compare every byte instead: no part of the rejected transaction may reach disk.
 	expect(readFileSync(`${fileA}-wal`)).toEqual(walBefore);
-	expect(integrity(a)).toBe("ok");
 	a.close();
+	// The file itself holds a1, read outside the extension (read-only, so nothing is checkpointed).
+	const plain = new DatabaseSync(`file:${fileA}?vfs=unix&mode=ro`);
+	expect(xs(plain)).toEqual(["a1"]);
+	expect(integrity(plain)).toBe("ok");
+	plain.close();
 
 	// A fresh rebuild holds a1, b1 and nothing of A's attempt; A re-attached catches up and writes again.
 	const fresh = freshFile();
@@ -97,8 +104,12 @@ it("a foreign append with a higher Stream-Seq fences the owner at its next commi
 	expect(attempt(() => a.exec("INSERT INTO t VALUES ('a1')"))).toMatch(/disk I\/O error/);
 	expect(status(file)).toMatchObject({ poisoned: true, fenced: true });
 	expect(status(file).reason).toMatch(/Stream-Seq/);
-	expect(xs(a)).toEqual([]);
+	expect(attempt(() => xs(a))).toMatch(/disk I\/O error \(errcode 266\)/);
 	a.close();
+	// Nothing of the fenced commit reached the file, read outside the extension (read-only).
+	const plain = new DatabaseSync(`file:${file}?vfs=unix&mode=ro`);
+	expect(xs(plain)).toEqual([]);
+	plain.close();
 });
 
 it("Pi: a fenced commit rejects with UrsulaReplicationError", async () => {
@@ -111,6 +122,24 @@ it("Pi: a fenced commit rejects with UrsulaReplicationError", async () => {
 	);
 	expect(error).toBeInstanceOf(UrsulaReplicationError);
 	expect((error as UrsulaReplicationError).fenced).toBe(true);
+	// Fenced, the stale storage serves no reads either, and says so the same way, whether the read
+	// runs alone or inside a transaction (`document()`), which never starts: a read refused, not a
+	// commit lost.
+	const reads = [
+		await stale.conversation(await stale.mintId<ConversationId>(), ctx).then(
+			() => undefined,
+			(e: unknown) => e,
+		),
+		await stale.document(await stale.mintId<DocumentId>(), "current", ctx).then(
+			() => undefined,
+			(e: unknown) => e,
+		),
+	];
+	for (const read of reads) {
+		expect(read).toBeInstanceOf(UrsulaReplicationError);
+		expect((read as UrsulaReplicationError).fenced).toBe(true);
+		expect((read as UrsulaReplicationError).message).toMatch(/^read refused, the file is fenced: /);
+	}
 	const { harness } = await openHarness(owner); // the new owner commits
 	await harness.close(ctx);
 	await stale.close(ctx);

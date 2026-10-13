@@ -10,13 +10,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use libsqlite3_sys as ffi;
 
 use crate::config::fail_post_ack;
 use crate::config::snapshot_min_bytes;
+use crate::error::Action;
 use crate::error::Error;
+use crate::error::ErrorKind;
 use crate::error::WriteRefusal;
 use crate::host::OK;
 use crate::log;
@@ -76,6 +80,11 @@ pub(crate) struct Db {
     pub(crate) log: u64,
     /// Why the database is poisoned (re-attach to recover), see `set_poisoned`.
     pub(crate) poisoned: Option<Poisoned>,
+    /// Set once a fence poisons the database (`Poisoned::fenced`), and never cleared: read without
+    /// the mutex by every read transaction's start (`vfs::x_shm_lock`), which must not wait for a
+    /// commit holding the mutex across its append. The registry hands it to each main db handle
+    /// (`Registry::fences`).
+    pub(crate) fence: Arc<AtomicBool>,
     /// Why the latest write was refused before it reached the stream, which applied nothing of it:
     /// by a layer in front of the stream (`writes_refused`), or by the extension itself, which
     /// never sent it (`refuse_unsent`). `ursula_status` reports it (`writes_refused`,
@@ -168,6 +177,23 @@ pub(crate) struct Poisoned {
     pub(crate) damaged: bool,
 }
 
+impl Poisoned {
+    /// The kind `ursula_status` reports for the poison: `fenced` once a fence was seen, whatever
+    /// the first reason was, and otherwise the first reason's (`Error::poison_kind`).
+    pub(crate) fn kind(&self) -> ErrorKind {
+        if self.fenced {
+            ErrorKind::Fenced
+        } else {
+            self.first.poison_kind()
+        }
+    }
+
+    /// What a caller does about the poison: the kind's action (a poison's kind always has one).
+    pub(crate) fn action(&self) -> Action {
+        self.kind().action().unwrap_or(Action::Reattach)
+    }
+}
+
 impl Db {
     /// The log since the latest snapshot outgrew the database (and the configured minimum,
     /// `snapshot_due_bytes`). The log is counted in frame bytes, not taken from offsets (opaque):
@@ -258,6 +284,9 @@ impl Db {
                     damaged,
                 });
             }
+        }
+        if fenced {
+            self.fence.store(true, Ordering::Release);
         }
         self.refused = None;
         self.layer_refused = None;
@@ -386,6 +415,9 @@ impl Db {
 #[derive(Default)]
 pub(crate) struct Registry {
     pub(crate) dbs: HashMap<String, Arc<Mutex<Db>>>,
+    /// The fence flag of each binding in `dbs` (`Db::fence`), bound and unbound with it, which
+    /// `x_open` hands to the main db handles it opens without taking the database's mutex.
+    pub(crate) fences: HashMap<String, Arc<AtomicBool>>,
     /// Open main-db handles per path (attached or not): attach requires none.
     pub(crate) open: HashMap<String, usize>,
     /// Paths being attached: `x_open` refuses their main db meanwhile (an open would read under
@@ -426,25 +458,30 @@ pub(crate) fn attached(path: &str) -> Result<Arc<Mutex<Db>>, Error> {
     })
 }
 
-/// Why `x_open` refuses the main db `path` that has no binding: a sidecar next to it makes it the
-/// cache of a stream, which passed through to "unix" would take commits that never reach the stream
-/// (in a process that never attached it, or after its attach failed: the files may hold anything
-/// between their old state and the stream's). A path without a sidecar passes through. No WAL open
-/// can follow a refusal: SQLite opens `<db>-wal` only through a connection whose main db it opened.
+/// Why `x_open` refuses the main db `path` that has no binding. After a failed attach of it in
+/// this process, always: the application meant it to be replicated, and passed through to "unix"
+/// its commits would never reach the stream (and its files may hold anything between their old
+/// state and the stream's). An attach refused for the file as it stands records none
+/// (`attach::refuses_the_file`). Otherwise a sidecar next to it makes it the cache of a stream (in
+/// a process that never attached it), and a path without one passes through. No WAL open can
+/// follow a refusal: SQLite opens `<db>-wal` only through a connection whose main db it opened.
 pub(crate) fn refused(reg: &Registry, path: &str) -> Option<Refusal> {
+    if let Some(why) = reg.failed.get(path) {
+        return Some(Refusal::AttachFailed(why.clone()));
+    }
     if !fs::exists(format!("{path}-ursula")).unwrap_or(true) {
         return None;
     }
-    Some(match reg.failed.get(path) {
-        Some(why) => Refusal::AttachFailed(why.clone()),
-        None => Refusal::NotAttached,
-    })
+    Some(Refusal::NotAttached)
 }
 
 /// Why `x_open` refuses a main db (`refused`), for its log line.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Refusal {
-    #[error("its last attach failed ({0}); attach it again")]
+    #[error(
+        "its last attach failed ({}: {0}); it opens through the extension once an attach succeeds",
+        .0.kind().as_str()
+    )]
     AttachFailed(Arc<Error>),
     #[error("it is the cache of an Ursula stream (it has a sidecar); attach it first")]
     NotAttached,
@@ -471,6 +508,7 @@ impl Db {
             offset: crate::client::START.into(),
             log: 0,
             poisoned: None,
+            fence: Arc::new(AtomicBool::new(false)),
             refused: None,
             layer_refused: None,
             refused_at: None,
@@ -505,10 +543,16 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
     use libsqlite3_sys as ffi;
 
     use super::Db;
     use super::Mode;
+    use super::Refusal;
+    use super::Registry;
+    use super::refused;
     use crate::error::Error;
     use crate::error::Fence;
     use crate::error::FrameLimit;
@@ -652,6 +696,53 @@ mod tests {
         assert_eq!(d.refused, Some(too_large));
         assert!(d.layer_refused.is_none() && d.refused_at.is_none());
         assert!(d.snapshot_wanted());
+    }
+
+    // After a failed attach, `x_open` refuses the path whether or not a sidecar exists (the
+    // attach may have failed before writing one), naming the failure's kind; a path never
+    // attached opens unless it has a sidecar.
+    #[test]
+    fn a_failed_attach_refuses_opens_without_a_sidecar_too() {
+        let dir = std::env::temp_dir().join(format!("ursula-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.db").to_string_lossy().into_owned();
+        let mut reg = Registry::default();
+        assert!(refused(&reg, &path).is_none());
+        reg.failed.insert(
+            path.clone(),
+            Arc::new(Error::Status {
+                op: "head",
+                url: "http://h/s2/kv1".into(),
+                status: 400,
+                body: "bucket_id must be 4 to 64 bytes, got 2 bytes".into(),
+            }),
+        );
+        let why = refused(&reg, &path).unwrap();
+        assert!(matches!(why, Refusal::AttachFailed(_)));
+        assert!(
+            why.to_string()
+                .starts_with("its last attach failed (invalid_name: head ")
+        );
+        reg.failed.clear();
+        std::fs::write(format!("{path}-ursula"), "x").unwrap();
+        assert!(matches!(refused(&reg, &path), Some(Refusal::NotAttached)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A fence raises the flag every read transaction's start checks without the database's mutex,
+    // and nothing lowers it. Any other poison leaves it down.
+    #[test]
+    fn a_fence_raises_the_read_flag() {
+        let mut d = Db::for_tests();
+        d.poison(Error::ProducerExpiredAgain);
+        assert!(!d.fence.load(Ordering::Acquire));
+        d.poison(Error::Fenced(Fence::Superseded {
+            epoch: 2,
+            current: Some(3),
+        }));
+        assert!(d.fence.load(Ordering::Acquire));
+        d.poison(Error::LostWrite { offset: 56 });
+        assert!(d.fence.load(Ordering::Acquire) && d.fenced() && d.damaged());
     }
 
     #[test]

@@ -69,7 +69,9 @@ it("(a) after a reboot, files a power loss damaged are discarded and rebuilt fro
 	writeFileSync(file, Buffer.concat([Buffer.alloc(512), older.subarray(512)]));
 	truncateSync(`${file}-wal`, Math.floor(statSync(`${file}-wal`).size / 2));
 	// Never discarded under another process's feet.
-	expect(() => attach(file, url)).toThrow(/open by another process/);
+	expect(() => attach(file, url)).toThrow(/^ursula_attach: in_use: .* is open by another process/);
+	// Refused at the lock taken before the discard, the attach changed nothing: no failed attach.
+	expect(() => status(file)).toThrow(/not_attached: [^:]* is not attached$/);
 	reader.kill("SIGKILL");
 	await new Promise((r) => reader.once("exit", r));
 	attach(file, url);

@@ -7,7 +7,9 @@
 //! `fenced`) and [`Error::refusal`] (the request was refused before it reached the stream, which
 //! applied nothing of it, see [`WriteRefusal`]: the operation fails alone, and `ursula_attach`
 //! reports it as SQLITE_AUTH for a 402, SQLITE_IOERR_AUTH otherwise). Every other variant fails
-//! the operation, or poisons the database until it is attached again.
+//! the operation, or poisons the database until it is attached again. What callers outside the
+//! extension see is [`Error::kind`]: a stable token ([`ErrorKind`]) with what to do about it
+//! ([`Action`]), in every SQL function's error and in `ursula_status`.
 
 use std::borrow::Cow;
 use std::ffi::CStr;
@@ -15,6 +17,7 @@ use std::ffi::c_int;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::descriptors::DbFile;
 use crate::frame::FrameError;
 use crate::frame::PAGE;
 use crate::snapshot::SnapshotError;
@@ -56,23 +59,50 @@ pub(crate) enum Error {
     },
     #[error("{path} has open connections; close them before attaching")]
     OpenConnections { path: String },
+    /// The process holds the db file, its `-wal`, `-shm` or `-journal` open on a descriptor no
+    /// connection of this VFS owns (`descriptors::open_in_process`): a SQLite connection outside the
+    /// extension (opened before the extension was loaded, or through another VFS, a read-only one
+    /// included), whose commits would never reach the stream and which shares the file's
+    /// wal-index with the attachment, or another open of the file. Refused up front: nothing
+    /// changes.
+    #[error(
+        "{path} is open in this process outside the extension ({file} on descriptor {fd}): close \
+         every SQLite connection to it that the extension did not open (one opened before the \
+         extension was loaded, or through another VFS, read-only ones included) and any other \
+         open of the file, then attach again (SQLite keeps the descriptors of closed connections \
+         open while such a connection holds a lock on the file)"
+    )]
+    OpenOutsideVfs { path: String, fd: i32, file: DbFile },
     #[error("{path} is being attached by another thread")]
     AttachInProgress { path: String },
+    /// The path is not attached in this process: never, or its last attach failed. The message of
+    /// a failed one starts with that failure's kind, whose action is what to do about it.
     #[error(
-        "{path} is not attached{}",
+        "{}{path} is not attached{}",
+        .last_failure.as_ref().map_or_else(String::new, |e| format!("{}: ", e.kind().as_str())),
         .last_failure.as_ref().map_or_else(String::new, |e| format!(": its last attach failed ({e})"))
     )]
     NotAttached {
         path: String,
         last_failure: Option<Arc<Error>>,
     },
-    #[error("{path} has content but no readable sidecar ({source}); refusing to attach")]
+    /// A db file with data and no readable sidecar: a database never replicated (or one whose
+    /// sidecar was lost). Its pages may be in no stream, so attach never replays a stream over it.
+    #[error(
+        "{path} has data but no readable sidecar ({source}): it was never replicated, or its \
+         sidecar was lost, so its pages may be in no stream; refusing to attach (to replicate its \
+         rows, attach a new file and copy them into it; to attach this path anyway, move {path} \
+         and {path}-wal aside first)"
+    )]
     NoSidecar {
         path: String,
         #[source]
         source: Box<Error>,
     },
-    #[error("{path} is a cache of stream {cached}, not {wanted}; delete it to attach it there")]
+    #[error(
+        "{path} is a cache of stream {cached}, not {wanted}; to attach this path to {wanted}, move \
+         {path} and {path}-wal aside first"
+    )]
     OtherStream {
         path: String,
         cached: String,
@@ -84,8 +114,8 @@ pub(crate) enum Error {
         "{url} is missing (or hidden from this client's credentials) and {path} holds data: \
          refusing to create an empty stream over it, and keeping the files (to salvage the data, \
          copy {path} and {path}-wal to a new name and export the copy's rows into a newly \
-         attached database; to start over, delete {path}, or attach a new file under another \
-         URL)"
+         attached database; to start over, move {path} and {path}-wal aside, or attach a new file \
+         under another URL)"
     )]
     StreamMissing { path: String, url: String },
     #[error(
@@ -152,13 +182,16 @@ pub(crate) enum Error {
     #[error("put {url}: {last}")]
     PutUnknown { url: String, last: Attempt },
     #[error(
-        "{op} {url}: {status}: the endpoint refused this client's credentials (see \
-         URSULA_VFS_TOKEN_FILE and ursula_set_token)"
+        "{op} {url}: {status}{}: the endpoint refused this client's credentials (see \
+         URSULA_VFS_TOKEN_FILE and ursula_set_token)",
+        with_body(.body)
     )]
     Unauthorized {
         op: &'static str,
         url: String,
         status: u16,
+        /// The refusing layer's explanation (`client::body_text`), empty when it sent none.
+        body: String,
     },
     /// Refused before it reached the stream, or never sent, so that the stream applied nothing of
     /// it (see [`WriteRefusal`]).
@@ -167,6 +200,17 @@ pub(crate) enum Error {
         op: &'static str,
         url: String,
         refusal: WriteRefusal,
+    },
+    /// An attach failed after its claim, which may be in the stream and fence every earlier owner,
+    /// with an error whose kind says that nothing reached the stream (`retry`): an unknown outcome
+    /// instead (`attach::Progress::failure`).
+    #[error(
+        "{source}, after the attach's claim, which may be in the stream and fence every earlier \
+         owner: attach again"
+    )]
+    AfterClaim {
+        #[source]
+        source: Box<Error>,
     },
     #[error("{url} reports no Stream-Incarnation (an older server?); refusing to attach")]
     NoIncarnation { url: String },
@@ -247,7 +291,10 @@ pub(crate) enum Error {
     },
     #[error(
         "read {url} at {offset}: beyond the end of the stream that acknowledged it (the server \
-         lost acknowledged data?); the local files are kept (delete them to rebuild)"
+         lost acknowledged data?); refusing to attach, and keeping the local files, which may hold \
+         the only copy of the lost commits (to salvage them, copy the db file and its -wal to a new \
+         name and export the copy's rows into a newly attached database; to rebuild from the \
+         stream as it is, move the db file and its -wal aside first)"
     )]
     LostData { url: String, offset: String },
     #[error("gone: {0}")]
@@ -313,6 +360,181 @@ pub(crate) enum Error {
     FileSync { file: &'static str, code: c_int },
 }
 
+/// What kind of failure an error is, as the SQL functions' messages (`<function>: <kind>: ...`)
+/// and `ursula_status` (`error.kind`) name it: a stable token callers branch on instead of the
+/// message's text (design doc §1, errors). [`Error::kind`] maps every error, [`Error::poison_kind`]
+/// a poison's reason, [`WriteRefusal::error_kind`] a refused write, and each kind has one
+/// [`Action`]. `attach_failed` has none of its own: what to do is what the failure it wraps (the
+/// kind after it in the message) says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    /// An argument of a SQL function is unusable (an attach mode, a path with a NUL byte).
+    InvalidArgument,
+    /// The stream URL is unusable as given: it does not parse, names no usable scheme, or answers
+    /// with a redirect the extension does not follow.
+    InvalidUrl,
+    /// The server refused the stream URL's bucket or stream id (a `400` to its `HEAD` or create:
+    /// the message carries the server's explanation).
+    InvalidName,
+    /// The stream does not exist (or is hidden from these credentials).
+    NotFound,
+    /// The file is in use: connections of the VFS open, another thread or process attaching or
+    /// holding it, or a descriptor of this process outside the extension on the db file, its -wal,
+    /// -shm or -journal (a SQLite connection outside the extension, read-only ones included).
+    InUse,
+    /// The db file holds data but has no readable sidecar: it was never replicated, or its sidecar
+    /// was lost, so its pages may be in no stream (`Error::NoSidecar`). Attach keeps the files and
+    /// never replays a stream over them.
+    UnreplicatedFile,
+    /// The local files are the cache of another stream (`Error::OtherStream`).
+    OtherStream,
+    /// A commit's frame is larger than one request may be: the same transaction can never be
+    /// sent (`WriteRefusal::TooLarge`).
+    TooLarge,
+    /// The application did something the VFS does not support (left WAL mode, another page size,
+    /// `locking_mode=EXCLUSIVE`).
+    Unsupported,
+    /// The stream holds or answers something the extension cannot follow (an undecodable frame,
+    /// lost acknowledged data, no incarnation, an answer without its offset).
+    StreamState,
+    /// The file was never attached in this process.
+    NotAttached,
+    /// The local file system refuses an operation on the local files as it is set up: no
+    /// permission, a read-only file system, a missing or misnamed directory, no space left.
+    /// Attaching again fails the same way until the setup changes.
+    LocalSetup,
+    /// No answer from the endpoint: it did not resolve, refused or dropped the connection, or
+    /// timed out, or every attempt of a write failed before it went out.
+    Unreachable,
+    /// The endpoint answered, but put the request off (a 5xx, a `408`, a `429` or a `307`) until
+    /// the retry budget ran out.
+    Unavailable,
+    /// The endpoint refused this client's credentials (a `401`, or a `403` that is no fence) on a
+    /// request that applies nothing.
+    Unauthorized,
+    /// A write was refused before it reached the stream, which applied nothing of it
+    /// (`refused_kind` says by what).
+    Refused,
+    /// An append's outcome is unknown: no answer within the retry budget, or an answer that does
+    /// not prove that nothing was applied (a 5xx without a vouched marker, a `307`, a `403` that is
+    /// neither the fence nor vouched, a `401` after an attempt that may have reached the stream).
+    /// The stream may or may not hold it. So is an attach that failed after its claim
+    /// (`Error::AfterClaim`).
+    OutcomeUnknown,
+    /// The local files may hold pages this process did not write there (a lost write-back, a failed
+    /// fsync): nothing read from them may reach the stream.
+    LocalDamage,
+    /// A local operation failed (an I/O error on the local files that is not `LocalSetup`).
+    LocalState,
+    /// The path's last attach in this process failed: it opens again once an attach succeeds.
+    AttachFailed,
+    /// A failure inside the extension or the host's SQLite (a panic, a missing routine).
+    Internal,
+    /// Another owner claimed the stream, it was deleted and recreated, or a writer outside the
+    /// protocol appended.
+    Fenced,
+}
+
+/// What a caller does about an error of a kind ([`ErrorKind::action`]), as `ursula_status` reports
+/// it for a poison (`db::Poisoned::action`) or a refused write ([`WriteRefusal::action`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Nothing reached the stream: the same handle works again later (commit, or attach, again
+    /// once the cause is gone). A refused commit leaves the file usable.
+    Retry,
+    /// Close the file's connections and attach it again, which replays what the stream holds (and
+    /// rebuilds local files that cannot be trusted).
+    Reattach,
+    /// Another owner holds the stream: stop writing. Attaching again takes it back from that
+    /// owner, which only a deliberate takeover does.
+    Stop,
+    /// The request cannot succeed as made: fix the URL, the name, the setup, the files or the
+    /// transaction, then try again.
+    Fix,
+}
+
+impl Action {
+    /// The stable token.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Action::Retry => "retry",
+            Action::Reattach => "reattach",
+            Action::Stop => "stop",
+            Action::Fix => "fix",
+        }
+    }
+}
+
+impl ErrorKind {
+    /// The stable token.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::InvalidArgument => "invalid_argument",
+            ErrorKind::InvalidUrl => "invalid_url",
+            ErrorKind::InvalidName => "invalid_name",
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::InUse => "in_use",
+            ErrorKind::UnreplicatedFile => "unreplicated_file",
+            ErrorKind::OtherStream => "other_stream",
+            ErrorKind::TooLarge => "too_large",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::StreamState => "stream_state",
+            ErrorKind::NotAttached => "not_attached",
+            ErrorKind::LocalSetup => "local_setup",
+            ErrorKind::Unreachable => "unreachable",
+            ErrorKind::Unavailable => "unavailable",
+            ErrorKind::Unauthorized => "unauthorized",
+            ErrorKind::Refused => "refused",
+            ErrorKind::OutcomeUnknown => "outcome_unknown",
+            ErrorKind::LocalDamage => "local_damage",
+            ErrorKind::LocalState => "local_state",
+            ErrorKind::AttachFailed => "attach_failed",
+            ErrorKind::Internal => "internal",
+            ErrorKind::Fenced => "fenced",
+        }
+    }
+
+    /// What a caller does about an error of this kind. `attach_failed` has none of its own (`None`):
+    /// what to do is what the failure it wraps says.
+    pub(crate) fn action(self) -> Option<Action> {
+        Some(match self {
+            ErrorKind::InvalidArgument
+            | ErrorKind::InvalidUrl
+            | ErrorKind::InvalidName
+            | ErrorKind::NotFound
+            | ErrorKind::InUse
+            | ErrorKind::UnreplicatedFile
+            | ErrorKind::OtherStream
+            | ErrorKind::TooLarge
+            | ErrorKind::Unsupported
+            | ErrorKind::StreamState
+            | ErrorKind::NotAttached
+            | ErrorKind::LocalSetup => Action::Fix,
+            ErrorKind::Unreachable
+            | ErrorKind::Unavailable
+            | ErrorKind::Unauthorized
+            | ErrorKind::Refused => Action::Retry,
+            ErrorKind::OutcomeUnknown
+            | ErrorKind::LocalDamage
+            | ErrorKind::LocalState
+            | ErrorKind::Internal => Action::Reattach,
+            ErrorKind::Fenced => Action::Stop,
+            ErrorKind::AttachFailed => return None,
+        })
+    }
+
+    /// This kind for a failure after something may have reached the stream (the reason of a
+    /// poison, an attach past its claim): `retry` says that nothing did, so a kind with that action
+    /// is an unknown outcome there.
+    pub(crate) fn once_reached(self) -> ErrorKind {
+        if self.action() == Some(Action::Retry) {
+            ErrorKind::OutcomeUnknown
+        } else {
+            self
+        }
+    }
+}
+
 /// The data asked for lies below the stream's retention (or a snapshot was superseded): a
 /// re-attach installs the newer snapshot.
 #[derive(Debug, thiserror::Error)]
@@ -353,7 +575,7 @@ pub(crate) enum Fence {
     ProducerExpiredMoved { offset: String },
     #[error("another owner wrote or claimed while re-claiming")]
     Reclaim,
-    #[error("another owner claimed epoch {epoch} during attach; attach again")]
+    #[error("another owner claimed epoch {epoch} during attach")]
     ClaimedDuringAttach { epoch: u64 },
 }
 
@@ -475,6 +697,27 @@ impl WriteRefusal {
         }
     }
 
+    /// The kind of failure a refused write is ([`ErrorKind`]): `too_large` for a frame no request
+    /// can carry (the same transaction never goes through), `unreachable` when its last attempt
+    /// never went out, and `refused` for a layer's refusal. Used for a refused attach
+    /// ([`Error::kind`]) and a refused commit (`ursula_status`) alike.
+    pub(crate) fn error_kind(&self) -> ErrorKind {
+        match self {
+            WriteRefusal::TooLarge { .. } => ErrorKind::TooLarge,
+            WriteRefusal::Unreachable { .. } => ErrorKind::Unreachable,
+            WriteRefusal::PaymentRequired { .. }
+            | WriteRefusal::Unauthorized { .. }
+            | WriteRefusal::Forbidden { .. }
+            | WriteRefusal::RateLimited { .. }
+            | WriteRefusal::NotApplied { .. } => ErrorKind::Refused,
+        }
+    }
+
+    /// What a caller does about a refused write: its kind's action.
+    pub(crate) fn action(&self) -> Action {
+        self.error_kind().action().unwrap_or(Action::Retry)
+    }
+
     /// What refused the write, as `ursula_status` reports it (`refused_kind`).
     pub(crate) fn kind(&self) -> &'static str {
         match self {
@@ -570,6 +813,140 @@ impl Error {
             Error::Fsync { .. } | Error::LostWrite { .. } | Error::FileSync { .. }
         )
     }
+
+    /// The kind of this error as the reason a database is poisoned (`Db::set_poisoned`), the one
+    /// `ursula_status` reports (`error.kind`) unless a fence was seen since (then `fenced`). A
+    /// poison is never retried on the same handle, so a reason whose kind would be (a re-claim's
+    /// read that the endpoint put off or never answered) is an unknown outcome here: the commit
+    /// failed, and only an attach tells what the stream holds.
+    pub(crate) fn poison_kind(&self) -> ErrorKind {
+        self.kind().once_reached()
+    }
+
+    /// What kind of failure this is ([`ErrorKind`]).
+    pub(crate) fn kind(&self) -> ErrorKind {
+        if self.is_fenced() {
+            return ErrorKind::Fenced;
+        }
+        match self {
+            Error::AttachMode { .. } | Error::NulInPath { .. } => ErrorKind::InvalidArgument,
+            Error::Redirected { .. } => ErrorKind::InvalidUrl,
+            Error::Http { source, .. } => transport_kind(source),
+            Error::Status { op, status, .. } => status_kind(op, *status),
+            // An append's (a claim's) credential refusal is built only when it does not prove that
+            // nothing was applied (`client::append`): its outcome is unknown.
+            Error::Unauthorized { op: "append", .. } => ErrorKind::OutcomeUnknown,
+            Error::Unauthorized { .. } => ErrorKind::Unauthorized,
+            Error::Refused { refusal, .. } => refusal.error_kind(),
+            Error::AfterClaim { source } => source.kind().once_reached(),
+            Error::PutUnknown { last, .. } => match last {
+                Attempt::Transport(source) => transport_kind(source),
+                Attempt::Status { .. } | Attempt::Deferred { .. } => ErrorKind::Unavailable,
+            },
+            Error::Gone(_) | Error::ClaimRaces { .. } => ErrorKind::Unavailable,
+            Error::AppendUnknown { .. }
+            | Error::AppendRejected { .. }
+            | Error::AckNotPast { .. }
+            | Error::RefusedCommitApplied { .. }
+            | Error::ProducerExpiredAgain => ErrorKind::OutcomeUnknown,
+            Error::NoStream { .. } | Error::StreamMissing { .. } => ErrorKind::NotFound,
+            Error::OpenElsewhere { .. }
+            | Error::AttachedElsewhere { .. }
+            | Error::OpenConnections { .. }
+            | Error::OpenOutsideVfs { .. }
+            | Error::AttachInProgress { .. } => ErrorKind::InUse,
+            Error::NotAttached {
+                last_failure: None, ..
+            } => ErrorKind::NotAttached,
+            Error::NotAttached { .. } => ErrorKind::AttachFailed,
+            Error::NoSidecar { .. } => ErrorKind::UnreplicatedFile,
+            Error::OtherStream { .. } => ErrorKind::OtherStream,
+            Error::Io { source, .. } => io_kind(source),
+            Error::FullPathname { .. }
+            | Error::PostAck { .. }
+            | Error::NotPublished { .. }
+            | Error::LocalWalWrite(_) => ErrorKind::LocalState,
+            Error::Fsync { .. } | Error::LostWrite { .. } | Error::FileSync { .. } => {
+                ErrorKind::LocalDamage
+            }
+            Error::DbWriteOutsideCheckpoint
+            | Error::DbTruncateOutsideCheckpoint
+            | Error::WalWriteOutsideTransaction
+            | Error::PageSize(_)
+            | Error::LeavesWal => ErrorKind::Unsupported,
+            Error::NoIncarnation { .. }
+            | Error::NoNextOffset { .. }
+            | Error::OffsetNotAdvanced { .. }
+            | Error::StreamEnded { .. }
+            | Error::ClaimCut { .. }
+            | Error::ClaimScan { .. }
+            | Error::ClaimAnswer { .. }
+            | Error::Frame { .. }
+            | Error::Snapshot { .. }
+            | Error::SnapshotOffset { .. }
+            | Error::SnapshotNotReadBack { .. }
+            | Error::SnapshotTooLarge { .. }
+            | Error::SnapshotTimedOut { .. }
+            | Error::LostData { .. } => ErrorKind::StreamState,
+            // Taken above (`is_fenced`).
+            Error::Recreated { .. } | Error::Fenced(_) => ErrorKind::Fenced,
+            Error::Panicked { .. }
+            | Error::SpawnSnapshotThread(_)
+            | Error::SqliteOpen { .. }
+            | Error::SqliteQuery { .. }
+            | Error::NoResultRow { .. }
+            | Error::PersistWal(_)
+            | Error::FileHandle { .. }
+            | Error::ReadPages { .. }
+            | Error::MissingRoutine(_)
+            | Error::EncodeFrame(_) => ErrorKind::Internal,
+        }
+    }
+}
+
+/// The kind of a failed operation on a local file: one the file system refuses as it is set up (no
+/// permission, a read-only file system, a missing or misnamed directory, no space left) fails the
+/// same way until the setup changes. Any other (an I/O error, an interrupted call) is
+/// `local_state`.
+fn io_kind(e: &std::io::Error) -> ErrorKind {
+    use std::io::ErrorKind as Io;
+    match e.kind() {
+        Io::PermissionDenied
+        | Io::ReadOnlyFilesystem
+        | Io::NotFound
+        | Io::NotADirectory
+        | Io::IsADirectory
+        | Io::InvalidFilename
+        | Io::StorageFull
+        | Io::QuotaExceeded
+        | Io::FileTooLarge => ErrorKind::LocalSetup,
+        _ => ErrorKind::LocalState,
+    }
+}
+
+/// The kind of a request that got no answer: a URL that cannot be sent at all is the caller's to
+/// fix, anything else is the endpoint's (or the network's).
+fn transport_kind(e: &ureq::Error) -> ErrorKind {
+    match e {
+        ureq::Error::BadUri(_)
+        | ureq::Error::Http(_)
+        | ureq::Error::RequireHttpsOnly(_)
+        | ureq::Error::InvalidProxyUrl => ErrorKind::InvalidUrl,
+        _ => ErrorKind::Unreachable,
+    }
+}
+
+/// The kind of a final answer `status` to request `op` that its error names no other way. A `400`
+/// to the stream's `HEAD` or create refuses its URL's bucket or stream id (any later request
+/// carries ids the server took already).
+fn status_kind(op: &str, status: u16) -> ErrorKind {
+    match status {
+        400 if matches!(op, "head" | "create") => ErrorKind::InvalidName,
+        401 | 403 => ErrorKind::Unauthorized,
+        404 => ErrorKind::NotFound,
+        307 | 408 | 429 | 500..=599 => ErrorKind::Unavailable,
+        _ => ErrorKind::StreamState,
+    }
 }
 
 /// An epoch a server answer named, or `unknown`.
@@ -615,11 +992,15 @@ fn with_token(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::Action;
+    use super::Attempt;
     use super::Error;
+    use super::ErrorKind;
     use super::Fence;
     use super::FrameLimit;
     use super::Gone;
     use super::WriteRefusal;
+    use crate::descriptors::DbFile;
 
     // Callers act on the class, never on the text: attach retries `Gone`, rebuilds on a recreated
     // stream, and `ursula_status` reports `fenced` for the fence classes only. The texts below are
@@ -713,6 +1094,7 @@ mod tests {
             op: "head",
             url: "http://h/b/s".into(),
             status: 401,
+            body: String::new(),
         };
         assert_eq!(unauthorized.refusal(), None);
         let pressure = Error::Refused {
@@ -761,6 +1143,282 @@ mod tests {
             "head http://h/b/s: 301 redirect to https://h/b/s: the extension never follows \
              redirects (point the stream URL at the server or gateway itself)"
         );
+    }
+
+    // Every error has a stable kind, and every kind an action. A refusal is retried, an unknown
+    // outcome attached again, a fence stops; a URL or name the server refuses, a file in use, a
+    // file never replicated or a transaction too large needs a fix. The SQL functions show the
+    // kind after their name, and a path whose last attach failed shows that failure's kind next.
+    #[test]
+    fn errors_have_stable_kinds() {
+        let url = || "http://h/b/s".to_owned();
+        let status = |op, status| Error::Status {
+            op,
+            url: url(),
+            status,
+            body: String::new(),
+        };
+        let refused = |refusal| Error::Refused {
+            op: "claim",
+            url: url(),
+            refusal,
+        };
+        let denied = |op| Error::Unauthorized {
+            op,
+            url: url(),
+            status: 403,
+            body: String::new(),
+        };
+        let cases = [
+            (status("head", 400), "invalid_name", Some("fix")),
+            (status("create", 400), "invalid_name", Some("fix")),
+            (status("read", 400), "stream_state", Some("fix")),
+            (status("head", 404), "not_found", Some("fix")),
+            (status("head", 503), "unavailable", Some("retry")),
+            (
+                Error::Http {
+                    op: "head",
+                    url: url(),
+                    source: Box::new(ureq::Error::ConnectionFailed),
+                },
+                "unreachable",
+                Some("retry"),
+            ),
+            (
+                Error::Http {
+                    op: "head",
+                    url: url(),
+                    source: Box::new(ureq::Error::BadUri("no host".into())),
+                },
+                "invalid_url",
+                Some("fix"),
+            ),
+            (denied("head"), "unauthorized", Some("retry")),
+            // An append's (a claim's) denial does not prove that nothing was applied.
+            (denied("append"), "outcome_unknown", Some("reattach")),
+            (
+                refused(WriteRefusal::RateLimited {
+                    body: String::new(),
+                }),
+                "refused",
+                Some("retry"),
+            ),
+            (
+                refused(WriteRefusal::Unreachable {
+                    reason: "timeout: resolve".into(),
+                }),
+                "unreachable",
+                Some("retry"),
+            ),
+            (
+                refused(WriteRefusal::frame_over_limit(40 << 20, 32 << 20)),
+                "too_large",
+                Some("fix"),
+            ),
+            (
+                Error::AppendUnknown {
+                    attempts: 35,
+                    last: Attempt::Status {
+                        status: 503,
+                        body: String::new(),
+                    },
+                },
+                "outcome_unknown",
+                Some("reattach"),
+            ),
+            (
+                Error::Fenced(Fence::Superseded {
+                    epoch: 1,
+                    current: Some(2),
+                }),
+                "fenced",
+                Some("stop"),
+            ),
+            (
+                Error::Fenced(Fence::ClaimedDuringAttach { epoch: 7 }),
+                "fenced",
+                Some("stop"),
+            ),
+            (
+                Error::Recreated {
+                    url: url(),
+                    incarnation: "i1".into(),
+                },
+                "fenced",
+                Some("stop"),
+            ),
+            (
+                Error::OpenOutsideVfs {
+                    path: "/data/app.db".into(),
+                    fd: 7,
+                    file: DbFile::Shm,
+                },
+                "in_use",
+                Some("fix"),
+            ),
+            (
+                Error::NoSidecar {
+                    path: "/data/app.db".into(),
+                    source: Box::new(Error::LeavesWal),
+                },
+                "unreplicated_file",
+                Some("fix"),
+            ),
+            (
+                Error::OtherStream {
+                    path: "/data/app.db".into(),
+                    cached: "/b/a".into(),
+                    wanted: "/b/s".into(),
+                },
+                "other_stream",
+                Some("fix"),
+            ),
+            (
+                Error::LostData {
+                    url: url(),
+                    offset: "9".into(),
+                },
+                "stream_state",
+                Some("fix"),
+            ),
+            (
+                Error::LostWrite { offset: 56 },
+                "local_damage",
+                Some("reattach"),
+            ),
+            (
+                Error::PostAck {
+                    what: "local WAL write",
+                    code: 10,
+                },
+                "local_state",
+                Some("reattach"),
+            ),
+            // A local file the setup refuses fails the same way until the setup changes; any other
+            // I/O error does not.
+            (
+                Error::Io {
+                    op: "open",
+                    path: "/ro/app.db-ursula.lock".into(),
+                    source: std::io::Error::from_raw_os_error(libc::EACCES),
+                },
+                "local_setup",
+                Some("fix"),
+            ),
+            (
+                Error::Io {
+                    op: "write sidecar",
+                    path: "/data/app.db-ursula".into(),
+                    source: std::io::Error::from_raw_os_error(libc::EROFS),
+                },
+                "local_setup",
+                Some("fix"),
+            ),
+            (
+                Error::Io {
+                    op: "write sidecar",
+                    path: "/data/app.db-ursula".into(),
+                    source: std::io::Error::from_raw_os_error(libc::ENOSPC),
+                },
+                "local_setup",
+                Some("fix"),
+            ),
+            (
+                Error::Io {
+                    op: "fsync",
+                    path: "/data/app.db".into(),
+                    source: std::io::Error::from_raw_os_error(libc::EIO),
+                },
+                "local_state",
+                Some("reattach"),
+            ),
+            // Past the attach's claim, which may be in the stream, nothing promises that nothing
+            // reached it.
+            (
+                Error::AfterClaim {
+                    source: Box::new(status("read", 503)),
+                },
+                "outcome_unknown",
+                Some("reattach"),
+            ),
+            (
+                Error::NotAttached {
+                    path: "/data/app.db".into(),
+                    last_failure: None,
+                },
+                "not_attached",
+                Some("fix"),
+            ),
+            (Error::LeavesWal, "unsupported", Some("fix")),
+            (
+                Error::Panicked { entry: "x_read" },
+                "internal",
+                Some("reattach"),
+            ),
+        ];
+        for (e, kind, action) in cases {
+            assert_eq!(
+                (e.kind().as_str(), e.kind().action().map(Action::as_str)),
+                (kind, action),
+                "{e}"
+            );
+        }
+        // `attach_failed` has no action of its own: the message names the failure's kind next.
+        let failed = Error::NotAttached {
+            path: "/data/app.db".into(),
+            last_failure: Some(std::sync::Arc::new(status("head", 400))),
+        };
+        assert_eq!(failed.kind().as_str(), "attach_failed");
+        assert_eq!(failed.kind().action(), None);
+        assert_eq!(
+            failed.to_string(),
+            "invalid_name: /data/app.db is not attached: its last attach failed (head \
+             http://h/b/s: 400)"
+        );
+        // A poison is never retried on the same handle: a reason of a retry kind is an unknown
+        // outcome there.
+        assert_eq!(status("read", 503).poison_kind(), ErrorKind::OutcomeUnknown);
+        assert_eq!(Error::LeavesWal.poison_kind(), ErrorKind::Unsupported);
+        // An attach that failed past its claim says so, and is no refusal that applied nothing.
+        let after = Error::AfterClaim {
+            source: Box::new(Error::Refused {
+                op: "read",
+                url: url(),
+                refusal: WriteRefusal::PaymentRequired {
+                    body: String::new(),
+                },
+            }),
+        };
+        assert_eq!(after.kind(), ErrorKind::OutcomeUnknown);
+        assert_eq!(after.refusal(), None);
+        assert!(after.to_string().ends_with(
+            ", after the attach's claim, which may be in the stream and fence every earlier owner: \
+             attach again"
+        ));
+        // Nothing tells the caller to delete files that may hold the only copy of data: each such
+        // refusal names the salvage path, or moving the files aside.
+        let salvage = [
+            Error::LostData {
+                url: url(),
+                offset: "9".into(),
+            },
+            Error::StreamMissing {
+                path: "/data/app.db".into(),
+                url: url(),
+            },
+        ];
+        for e in salvage {
+            let m = e.to_string();
+            assert!(m.contains("to a new name and export"), "{m}");
+            assert!(m.contains("aside"), "{m}");
+            assert!(!m.contains("delete"), "{m}");
+        }
+        let never_replicated = Error::NoSidecar {
+            path: "/data/app.db".into(),
+            source: Box::new(Error::LeavesWal),
+        }
+        .to_string();
+        assert!(never_replicated.contains("aside") && !never_replicated.contains("delete"));
     }
 
     // `ursula_status` reports a refusal's kind (stable names) and its reason: the marker's token or

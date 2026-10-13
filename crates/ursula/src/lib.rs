@@ -2130,6 +2130,9 @@ fn cold_reference_error_response(err: &ursula_runtime::ColdReferenceError) -> Re
 
 /// How long an operator's snapshot request waits for its build to start.
 const ADMIN_SNAPSHOT_START_WAIT: Duration = Duration::from_secs(10);
+/// How long an operator's snapshot request waits, once the group's build
+/// ended, for OpenRaft to publish the snapshot that covers it.
+const ADMIN_SNAPSHOT_PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn trigger_raft_snapshot(
     State(state): State<HttpState>,
@@ -2146,7 +2149,9 @@ pub(crate) async fn trigger_raft_snapshot(
     let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
     // Whether a snapshot OpenRaft published covers what the group had
     // applied when the request arrived, such as one a build that began
-    // since then made.
+    // since then made. The coordinator also weighs the snapshot the group's
+    // latest build made, which OpenRaft publishes only after that build
+    // released its permit (#561).
     let published = |metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>| {
         snapshot_log_id.as_ref().is_some_and(|wanted| {
             metrics
@@ -2154,16 +2159,6 @@ pub(crate) async fn trigger_raft_snapshot(
                 .as_ref()
                 .is_some_and(|snapshot| snapshot >= wanted)
         })
-    };
-    // The group's latest build covers it too: OpenRaft publishes that
-    // snapshot only after the build released its permit (#561).
-    let covered = || {
-        published(&raft.metrics().borrow_watched())
-            || snapshot_log_id.as_ref().is_some_and(|wanted| {
-                coordinator
-                    .built_snapshot(raft_group_id.0)
-                    .is_some_and(|built| &built >= wanted)
-            })
     };
     let covering = async {
         let waited = raft
@@ -2178,8 +2173,9 @@ pub(crate) async fn trigger_raft_snapshot(
     if let Err(err) = coordinator
         .start_snapshot(
             raft_group_id.0,
+            snapshot_log_id,
             ADMIN_SNAPSHOT_START_WAIT,
-            covered,
+            || published(&raft.metrics().borrow_watched()),
             covering,
             || async { raft.trigger().snapshot().await },
         )
@@ -2187,20 +2183,26 @@ pub(crate) async fn trigger_raft_snapshot(
     {
         return snapshot_not_started(&err);
     }
-    if let Some(snapshot_log_id) = &snapshot_log_id
-        && let Err(err) = raft
-            .wait(Some(Duration::from_secs(10)))
+    if let Some(snapshot_log_id) = &snapshot_log_id {
+        // The covering snapshot may come from a build that still publishes
+        // its reference or prunes retired snapshots, and OpenRaft publishes
+        // it only once that build ended, so the wait for OpenRaft starts
+        // then.
+        coordinator.build_ended(raft_group_id.0).await;
+        if let Err(err) = raft
+            .wait(Some(ADMIN_SNAPSHOT_PUBLISH_WAIT))
             .metrics(
                 published,
                 format!("admin snapshot trigger .snapshot >= {snapshot_log_id}"),
             )
             .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("wait for raft snapshot: {err}"),
-        )
-            .into_response();
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("wait for raft snapshot: {err}"),
+            )
+                .into_response();
+        }
     }
 
     let metrics = raft.metrics().borrow_watched().clone();

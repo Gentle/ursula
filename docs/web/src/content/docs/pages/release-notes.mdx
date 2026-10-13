@@ -7,6 +7,11 @@ description: Changes that affect clients and operators, newest first.
 
 These changes are planned for 0.7.5.
 
+### Snapshot builds
+
+- **`raft.snapshot_build_max_concurrency` must be between 1 and 16** ([#561](https://github.com/tonbo-io/ursula/issues/561)). 0.7.4 took `0` as 1 and set no maximum. From 0.7.5 a configuration file that sets `0` or more than `16` no longer loads, and the node exits with `ValidationError::SnapshotBuildConcurrency`. Before the upgrade, set it to a value between 1 and 16 or remove it. The chart's schema already refuses such a `raft.snapshotBuildMaxConcurrency`, so `helm upgrade` fails before any pod restarts.
+- **Rust library APIs changed.** In `ursula-raft`, `SnapshotBuildCoordinator::start_snapshot` takes the log the snapshot is asked for and a future that ends once a published snapshot covers it, and `SnapshotBuildCoordinator` gains `busy`, `publishing` and `build_ended`. `ursula_config::validate::ValidationError` gains `SnapshotBuildConcurrency`, which is not `#[non_exhaustive]`. None of these changes touches the wire or the disk.
+
 ### SQLite VFS
 
 - **`openUrsulaPiStorage` moved to `@tonbo/sqlite-ursula/pi`, and the package has no runtime dependencies.** `@tonbo/sqlite-ursula` used to depend on `@earendil-works/pi-durable`, so an application that only attaches files for `node:sqlite` installed Pi Durable and the model SDKs it pulls in, over 100 MB. The root entry now imports nothing outside Node.js, and Pi Durable is an optional peer dependency in the range `>=1.0.0 <1.2.0`, which npm installs only when the application depends on it and reports as a mismatch when the application's version is outside it. This is a breaking change for Pi users: install `@earendil-works/pi-durable` next to the package, and import `openUrsulaPiStorage` and `UrsulaPiStorageOptions` from `@tonbo/sqlite-ursula/pi`. Every other export, the error classes included, stays in `@tonbo/sqlite-ursula`. See [Pi Durable](/docs/examples/sqlite-vfs#pi-durable).

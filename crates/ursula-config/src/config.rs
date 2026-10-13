@@ -190,7 +190,8 @@ pub struct RaftConfig {
     /// below `snapshot_log_budget`, and past it more, in even steps up to
     /// this many before the hard limit (twice the budget). Builds it started
     /// past the budget finish after the log falls below it. With the driver
-    /// off, OpenRaft's own policy may run this many at once.
+    /// off, OpenRaft's own policy may run this many at once. Between 1 and
+    /// [`RaftConfig::MAX_SNAPSHOT_BUILD_CONCURRENCY`].
     pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,
@@ -220,6 +221,15 @@ pub struct RaftConfig {
     /// Maximum number of payload-bearing Raft log entries retained per group
     /// after they are covered by a snapshot.
     pub max_in_snapshot_log_to_keep: u64,
+}
+
+impl RaftConfig {
+    /// The most snapshot builds a node may run at once
+    /// (`snapshot_build_max_concurrency`). Each build holds a copy of its
+    /// group's state and, while it uploads, its compressed snapshot, so 16
+    /// builds of large groups already hold gigabytes. A larger value is
+    /// taken for a mistake.
+    pub const MAX_SNAPSHOT_BUILD_CONCURRENCY: usize = 16;
 }
 
 impl Default for RaftConfig {

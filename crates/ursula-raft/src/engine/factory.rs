@@ -44,6 +44,14 @@ pub struct RaftEngineConfig {
     pub install_snapshot_timeout_ms: u64,
     pub snapshot_drive_interval_ms: u64,
     pub grpc_reconnect_after_failures: u32,
+    /// Snapshot builds the node runs at once. The server takes it from
+    /// `raft.snapshot_build_max_concurrency` (2 by default). The default
+    /// here is 1, the node-wide coordinator's own default
+    /// ([`crate::RaftGroupHandleRegistry`] starts with one permit and a
+    /// factory changes it only through
+    /// [`StaticGrpcRaftGroupEngineFactory::with_engine_config`]), so an
+    /// engine built without a config, as in the tests and the simulation,
+    /// keeps one build at a time and the two cannot disagree.
     pub snapshot_build_max_concurrency: usize,
     pub snapshot_logs_since_last: u64,
     pub max_in_snapshot_log_to_keep: u64,

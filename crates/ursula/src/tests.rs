@@ -6411,14 +6411,17 @@ mod snapshot_driver {
     use super::body_bytes;
     use super::send;
     use super::spawn_static_grpc_test_node;
+    use crate::ADMIN_SNAPSHOT_PUBLISH_WAIT;
     use crate::HttpState;
     use crate::admin_router;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::StoreGateInputs;
+    use crate::bootstrap::Trigger;
     use crate::bootstrap::group_log_progress;
     use crate::bootstrap::plan_snapshot_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
     use crate::bootstrap::spawn_snapshot_driver;
+    use crate::bootstrap::trigger_snapshot_build;
 
     const MIB: u64 = 1 << 20;
 
@@ -6717,12 +6720,18 @@ mod snapshot_driver {
     }
 
     /// A snapshot store whose uploads wait until the test lets them finish,
-    /// in the order they arrive, and which counts them.
+    /// in the order they arrive, and which counts them. Its pruning of
+    /// retired snapshots, a build's last housekeeping step, waits while the
+    /// test holds it.
     #[derive(Debug)]
     struct GatedStore {
         /// How many uploads, by arrival, may finish.
         allowed: watch::Sender<usize>,
         uploads: watch::Sender<Uploads>,
+        /// Whether pruning waits.
+        prune_held: watch::Sender<bool>,
+        /// How many prunes started.
+        prunes: watch::Sender<usize>,
     }
 
     impl GatedStore {
@@ -6730,7 +6739,28 @@ mod snapshot_driver {
             Arc::new(Self {
                 allowed: watch::Sender::new(0),
                 uploads: watch::Sender::new(Uploads::default()),
+                prune_held: watch::Sender::new(false),
+                prunes: watch::Sender::new(0),
             })
+        }
+
+        /// Holds pruning (`true`) until it is let go (`false`).
+        fn hold_pruning(&self, held: bool) {
+            self.prune_held.send_replace(held);
+        }
+
+        /// Waits until `count` prunes started.
+        async fn wait_for_prunes(&self, count: usize, within: Duration) {
+            let reached = tokio::time::timeout(
+                within,
+                self.prunes.subscribe().wait_for(|prunes| *prunes >= count),
+            )
+            .await
+            .map(|reached| reached.map(drop));
+            assert!(
+                matches!(reached, Ok(Ok(()))),
+                "{count} prunes never started within {within:?}"
+            );
         }
 
         fn uploads(&self) -> Uploads {
@@ -6805,6 +6835,24 @@ mod snapshot_driver {
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn prune_retired<'a>(
+            &'a self,
+            _raft_group_id: u32,
+            _current: &'a SnapshotLocation,
+            _retain_latest: usize,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                self.prunes
+                    .send_modify(|prunes| *prunes = prunes.saturating_add(1));
+                self.prune_held
+                    .subscribe()
+                    .wait_for(|held| !*held)
+                    .await
+                    .map(drop)
+                    .map_err(|_closed| SnapshotStoreError::Backend("the gate is gone".into()))
+            })
         }
     }
 
@@ -7149,6 +7197,99 @@ mod snapshot_driver {
         node.shutdown().await;
     }
 
+    /// #561: the driver triggers nothing for a busy group, one that builds
+    /// or has a permit handed to it, and does not hold it: the group's build
+    /// claims no other permit, and OpenRaft would drop the trigger while the
+    /// group builds. It sees the group building before it waits for a build
+    /// slot, so with one slot, the one the group's build holds, the driver
+    /// does not wait for that build to end and then trigger a group just
+    /// built.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_driver_skips_a_busy_group_without_waiting_for_a_slot() {
+        let store = GatedStore::new();
+        let (node, _) = node_with_permits(&store, &[1; 8], 3, 0).await;
+        let coordinator = node.registry.snapshot_build_coordinator();
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger group 0's snapshot");
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        for slots in [1, 3] {
+            let trigger = tokio::time::timeout(
+                Duration::from_secs(1),
+                trigger_snapshot_build(&node.registry, &coordinator, 0, || Some(slots)),
+            )
+            .await;
+            assert!(matches!(trigger, Ok(Trigger::Busy)), "{slots}: {trigger:?}");
+        }
+        assert_eq!(store.uploads().started, 1);
+        assert_eq!(coordinator.running_builds(), 1);
+        // A group with a permit handed to it is busy too.
+        let (handed, hand_off) = tokio::sync::oneshot::channel();
+        let pending = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                let permit = coordinator.acquire().await.expect("a permit");
+                coordinator
+                    .hand_off_and_trigger(1, permit, Duration::from_secs(3_600), async move {
+                        handed.send(()).expect("the test waits");
+                        std::future::pending::<Result<(), ()>>().await
+                    })
+                    .await
+            }
+        });
+        hand_off.await.expect("the hand-off is pending");
+        let trigger = tokio::time::timeout(
+            Duration::from_secs(1),
+            trigger_snapshot_build(&node.registry, &coordinator, 1, || Some(3)),
+        )
+        .await;
+        assert!(matches!(trigger, Ok(Trigger::Busy)), "{trigger:?}");
+        assert_eq!(store.uploads().started, 1);
+        pending.abort();
+        assert!(pending.await.is_err_and(|err| err.is_cancelled()));
+        // A group that becomes busy while the driver waits for a slot: the
+        // hand-off finds it busy, so nothing is triggered or held.
+        let handed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut other = None;
+        let pace = || {
+            if other.is_none() {
+                let coordinator = coordinator.clone();
+                let handed = std::sync::Arc::clone(&handed);
+                other = Some(tokio::spawn(async move {
+                    let permit = coordinator.acquire().await.expect("a permit");
+                    coordinator
+                        .hand_off_and_trigger(2, permit, Duration::from_secs(3_600), async move {
+                            handed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            std::future::pending::<Result<(), ()>>().await
+                        })
+                        .await
+                }));
+            }
+            // No slot below group 0's build until group 2 is busy.
+            Some(if handed.load(std::sync::atomic::Ordering::Relaxed) {
+                3
+            } else {
+                1
+            })
+        };
+        let trigger = tokio::time::timeout(
+            Duration::from_secs(5),
+            trigger_snapshot_build(&node.registry, &coordinator, 2, pace),
+        )
+        .await;
+        assert!(matches!(trigger, Ok(Trigger::Busy)), "{trigger:?}");
+        assert_eq!(store.uploads().started, 1);
+        if let Some(other) = other {
+            other.abort();
+        }
+        store.open();
+        node.shutdown().await;
+    }
+
     /// A node with `permits` build permits and no snapshot driver, so
     /// snapshots run only when an operator asks for them, and its admin
     /// router.
@@ -7279,6 +7420,96 @@ mod snapshot_driver {
                 .is_some()
         );
         assert_eq!(store.uploads().started, 1);
+        node.shutdown().await;
+    }
+
+    /// #561: an operator's snapshot of a group whose running build covers
+    /// what the request asks for, nothing applied since, builds nothing
+    /// again once that build ended, though a permit is free for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_operator_snapshot_covered_by_a_running_build_builds_nothing_again() {
+        let store = GatedStore::new();
+        let (node, admin) = operator_node(&store, 2).await;
+        let first = operator_snapshot(&admin, 0);
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        let second = operator_snapshot(&admin, 0);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        store.open();
+        let first = snapshot_index(first.await.expect("the first request")).await;
+        let second = snapshot_index(second.await.expect("the second request")).await;
+        assert!(first.is_some());
+        assert_eq!(second, first);
+        assert_eq!(store.uploads().started, 1);
+        node.shutdown().await;
+    }
+
+    /// #561: an operator's snapshot whose build's housekeeping outlasts
+    /// [`ADMIN_SNAPSHOT_PUBLISH_WAIT`] answers 200 once OpenRaft publishes
+    /// the snapshot: the request waits for the build to end, bounded on its
+    /// own, before it waits for OpenRaft, which publishes the snapshot only
+    /// then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_operator_snapshot_outlasts_its_builds_housekeeping() {
+        let store = GatedStore::new();
+        let (node, admin) = operator_node(&store, 2).await;
+        store.open();
+        store.hold_pruning(true);
+        let request = operator_snapshot(&admin, 0);
+        store.wait_for_prunes(1, Duration::from_secs(30)).await;
+        tokio::time::sleep(
+            ADMIN_SNAPSHOT_PUBLISH_WAIT
+                .checked_add(Duration::from_secs(2))
+                .expect("a short wait"),
+        )
+        .await;
+        assert!(!request.is_finished(), "the build still prunes");
+        store.hold_pruning(false);
+        assert!(
+            snapshot_index(request.await.expect("the request"))
+                .await
+                .is_some()
+        );
+        assert_eq!(store.uploads().started, 1);
+        node.shutdown().await;
+    }
+
+    /// #561: an operator's snapshot that OpenRaft's published snapshot
+    /// already covers answers at once, though another build of the group
+    /// runs: it does not wait for that build to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_operator_snapshot_already_covered_waits_for_no_build() {
+        let store = GatedStore::new();
+        let (node, admin) = operator_node(&store, 2).await;
+        store.open();
+        let first = snapshot_index(
+            operator_snapshot(&admin, 0)
+                .await
+                .expect("the first request"),
+        )
+        .await;
+        assert!(first.is_some());
+        store.hold_pruning(true);
+        let prunes = *store.prunes.borrow();
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger group 0's snapshot");
+        store
+            .wait_for_prunes(prunes.saturating_add(1), Duration::from_secs(30))
+            .await;
+        assert_eq!(
+            node.registry.snapshot_build_coordinator().running_builds(),
+            1
+        );
+        let second = tokio::time::timeout(Duration::from_secs(5), operator_snapshot(&admin, 0))
+            .await
+            .expect("the request answers at once")
+            .expect("the second request");
+        assert_eq!(snapshot_index(second).await, first);
+        store.hold_pruning(false);
         node.shutdown().await;
     }
 

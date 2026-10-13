@@ -2130,6 +2130,10 @@ fn cold_reference_error_response(err: &ursula_runtime::ColdReferenceError) -> Re
 
 /// How long an operator's snapshot request waits for its build to start.
 const ADMIN_SNAPSHOT_START_WAIT: Duration = Duration::from_secs(10);
+/// How long an operator's snapshot request waits for the group's running
+/// build to end, and then, separately, for OpenRaft to publish the snapshot
+/// that covers it.
+const ADMIN_SNAPSHOT_PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn trigger_raft_snapshot(
     State(state): State<HttpState>,
@@ -2144,47 +2148,78 @@ pub(crate) async fn trigger_raft_snapshot(
     };
     let coordinator = registry.snapshot_build_coordinator();
     let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
-    // Ends once a snapshot covers what the group had applied when the
-    // request arrived, such as one a build that began since then made.
-    let covered = || {
+    // Whether a snapshot OpenRaft published covers what the group had
+    // applied when the request arrived, such as one a build that began
+    // since then made. The coordinator also weighs the snapshot the group's
+    // latest build made, which OpenRaft publishes only after that build
+    // released its permit (#561).
+    let published = |metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>| {
         snapshot_log_id.as_ref().is_some_and(|wanted| {
-            raft.metrics()
-                .borrow_watched()
+            metrics
                 .snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot >= wanted)
         })
     };
+    let covering = async {
+        let waited = raft
+            .wait(Some(ADMIN_SNAPSHOT_START_WAIT))
+            .metrics(published, "admin snapshot start covered")
+            .await;
+        if waited.is_err() {
+            // The start's own wait ends the request.
+            std::future::pending::<()>().await;
+        }
+    };
     if let Err(err) = coordinator
         .start_snapshot(
             raft_group_id.0,
+            snapshot_log_id,
             ADMIN_SNAPSHOT_START_WAIT,
-            covered,
+            || published(&raft.metrics().borrow_watched()),
+            covering,
             || async { raft.trigger().snapshot().await },
         )
         .await
     {
         return snapshot_not_started(&err);
     }
-    if let Some(snapshot_log_id) = snapshot_log_id
-        && let Err(err) = raft
-            .wait(Some(Duration::from_secs(10)))
+    if let Some(snapshot_log_id) = &snapshot_log_id {
+        // The covering snapshot may come from a build that still publishes
+        // its reference or prunes retired snapshots, and OpenRaft publishes
+        // it only once that build ended, so the wait for OpenRaft starts
+        // then. A request OpenRaft's snapshot already covers waits for no
+        // build. The build wait is bounded like the wait for OpenRaft, so a
+        // build held up by its snapshot store (OpenDAL retries, then an
+        // inline fallback) adds at most ADMIN_SNAPSHOT_PUBLISH_WAIT, and a
+        // request whose build outlasts it waits for OpenRaft as before.
+        if !published(&raft.metrics().borrow_watched()) {
+            let build_ended = coordinator.build_ended(raft_group_id.0);
+            if tokio::time::timeout(ADMIN_SNAPSHOT_PUBLISH_WAIT, build_ended)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    raft_group_id = raft_group_id.0,
+                    "admin snapshot: the group's build did not end within \
+                     {ADMIN_SNAPSHOT_PUBLISH_WAIT:?}; waiting for its snapshot all the same"
+                );
+            }
+        }
+        if let Err(err) = raft
+            .wait(Some(ADMIN_SNAPSHOT_PUBLISH_WAIT))
             .metrics(
-                |metrics| {
-                    metrics
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot >= &snapshot_log_id)
-                },
+                published,
                 format!("admin snapshot trigger .snapshot >= {snapshot_log_id}"),
             )
             .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("wait for raft snapshot: {err}"),
-        )
-            .into_response();
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("wait for raft snapshot: {err}"),
+            )
+                .into_response();
+        }
     }
 
     let metrics = raft.metrics().borrow_watched().clone();
@@ -2562,10 +2597,6 @@ pub(crate) async fn accept_unsynced_loss(
     }
 }
 
-/// Resolves the raft registry, parses the group id, and looks up the live group
-/// handle — the preamble shared by every raft admin endpoint. Returns the
-/// appropriate error response (`400`/`404`) when any step fails, so handlers can
-/// `?`-style early-return and focus on their actual operation.
 /// The answer to an operator's snapshot whose build did not start: `503`
 /// with `Retry-After` when no build of the group could start in time, since
 /// builds end, and `500` when the permits closed or the trigger failed.
@@ -2590,6 +2621,10 @@ fn snapshot_not_started(err: &SnapshotStartError<Fatal<UrsulaRaftTypeConfig>>) -
     }
 }
 
+/// Resolves the raft registry, parses the group id, and looks up the live group
+/// handle — the preamble shared by every raft admin endpoint. Returns the
+/// appropriate error response (`400`/`404`) when any step fails, so handlers can
+/// `?`-style early-return and focus on their actual operation.
 fn resolve_raft_group(
     state: &HttpState,
     raft_group_id: u64,

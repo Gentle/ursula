@@ -907,6 +907,38 @@ peer_timeout = "0s"
         );
     }
 
+    /// #561: no build could run with 0, which was taken as 1 without a word,
+    /// and a value past the bound is taken for a mistake.
+    #[test]
+    fn a_snapshot_build_concurrency_out_of_bounds_fails_to_load() {
+        use crate::config::RaftConfig;
+        use crate::validate::ValidationError;
+
+        let max = RaftConfig::MAX_SNAPSHOT_BUILD_CONCURRENCY;
+        for (value, valid) in [(0, false), (1, true), (max, true), (max + 1, false)] {
+            let tmp = temp_config(
+                ".toml",
+                &format!("[raft]\nsnapshot_build_max_concurrency = {value}\n"),
+            );
+            let loaded = load_config(Some(tmp.path()), None, Some(1));
+            if valid {
+                let config = loaded.unwrap();
+                assert_eq!(config.raft.snapshot_build_max_concurrency, value);
+            } else {
+                let err = loaded.unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        crate::ConfigError::Validation(
+                            ValidationError::SnapshotBuildConcurrency { value: refused }
+                        ) if refused == value
+                    ),
+                    "{value}: {err}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_zero_s3_health_gate_setting_fails_to_load() {
         use crate::validate::S3HealthSetting;

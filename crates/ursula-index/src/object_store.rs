@@ -326,6 +326,7 @@ impl S3ObjectStore {
         if let Some(endpoint) = config.endpoint {
             builder = builder.endpoint(&endpoint);
         }
+        let builder = ursula_runtime::s3_credentials::with_container_credentials(builder, false);
         let operator = Operator::new(builder).map_err(object_error)?.finish();
         Ok(Self { operator })
     }

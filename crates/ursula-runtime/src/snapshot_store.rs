@@ -501,6 +501,10 @@ mod s3 {
             {
                 builder = builder.session_token(token);
             }
+            let builder = crate::s3_credentials::with_container_credentials(
+                builder,
+                crate::cold_store::s3_has_static_keys(s3),
+            );
             // Backup/snapshot objects inherit the cold tier's encryption
             // posture (#149).
             let (builder, _encryption) = crate::cold_store::apply_s3_encryption(builder, s3)

@@ -34,6 +34,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = { workspace = true }
 ursula-observability = { workspace = true }
+ursula-runtime = { workspace = true }
 
 [lints]
 workspace = true

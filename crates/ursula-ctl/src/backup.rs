@@ -79,6 +79,8 @@ impl BackupStore {
             if !prefix.is_empty() {
                 builder = builder.root(prefix);
             }
+            let builder =
+                ursula_runtime::s3_credentials::with_container_credentials(builder, false);
             opendal::Operator::new(builder)
                 .context("configure s3 backup store")?
                 .finish()

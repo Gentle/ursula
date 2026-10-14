@@ -77,6 +77,13 @@ pub(crate) fn apply_s3_encryption(
     }
 }
 
+/// Whether `s3` configures a static access key pair; when it does, AWS
+/// container credentials are not consulted.
+pub(crate) fn s3_has_static_keys(s3: &ursula_config::S3Config) -> bool {
+    let set = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+    set(s3.access_key_id.as_deref()) && set(s3.secret_access_key.as_deref())
+}
+
 /// Wrap an S3 (opendal) operator with timeout and bounded-retry layers.
 ///
 /// 1. **Per-attempt timeout** ([`TimeoutLayer`], inner): a blackholed endpoint
@@ -421,6 +428,8 @@ impl ColdStore {
         {
             builder = builder.session_token(session_token);
         }
+        let builder =
+            crate::s3_credentials::with_container_credentials(builder, s3_has_static_keys(s3));
         let (builder, encryption) = apply_s3_encryption(builder, s3)?;
 
         Ok(Self::from_operator(

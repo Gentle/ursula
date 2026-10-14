@@ -3,6 +3,7 @@
 //! Module map:
 //!
 //! - [`cold_store`]: opendal-backed cold tier handle and object path helpers.
+//! - [`s3_credentials`]: AWS container (ECS task role) credentials for S3.
 //! - [`request`]: HTTP/gRPC request and response value types for each engine op.
 //! - [`command`]: the replicated [`GroupWriteCommand`] envelope around the
 //!   canonical [`ursula_stream::StreamCommand`], plus `From` conversions from
@@ -34,6 +35,7 @@ mod ops;
 mod request;
 mod rt;
 mod runtime;
+pub mod s3_credentials;
 mod snapshot_store;
 mod trace;
 

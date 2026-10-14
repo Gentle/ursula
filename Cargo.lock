@@ -4453,6 +4453,7 @@ dependencies = [
  "url",
  "ursula-observability",
  "ursula-raft",
+ "ursula-runtime",
  "ursula-stream",
  "yaml_serde",
 ]
@@ -4508,6 +4509,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "ursula-observability",
+ "ursula-runtime",
 ]
 
 [[package]]
@@ -4577,14 +4579,19 @@ dependencies = [
 name = "ursula-runtime"
 version = "0.5.1"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "blake3",
  "bytes",
+ "chrono",
  "crc32fast",
  "criterion",
  "crossbeam-utils",
  "futures-util",
  "madsim-tokio",
  "opendal",
+ "reqsign",
+ "reqwest",
  "serde",
  "serde_bytes",
  "serde_json",

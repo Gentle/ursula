@@ -1082,6 +1082,60 @@ fn catch_up_read_returns_payload_slice_and_bounds_errors() {
     );
 }
 
+/// A hot prefix written before an external append is flushed after it: the
+/// flushed chunk ends where the external segment starts, and must not pull the
+/// cold frontier back below the external segment's end. Otherwise the external
+/// range drops out of every read plan (no hot copy, past the frontier) and the
+/// stream reads as "missing payload segment metadata".
+#[test]
+fn flushing_the_hot_prefix_keeps_a_later_external_segment_readable() {
+    let mut machine = machine();
+    create_stream(&mut machine, "ext-flush");
+    assert!(matches!(
+        machine.apply(append_cmd(stream("ext-flush"), b"abcd", Append::default())),
+        StreamResponse::Appended { next_offset: 4, .. }
+    ));
+    let appended = machine.apply(StreamCommand::AppendExternal {
+            stream_id: stream("ext-flush"),
+            content_type: Some(OCTET.to_owned()),
+            payload: ExternalPayloadRef {
+                s3_path: "s3://bucket/external/000000".to_owned(),
+                payload_len: 100,
+                object_size: 100,
+            },
+            record_ends: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 0,
+            record_match: None,
+        });
+    assert!(matches!(appended, StreamResponse::Appended { next_offset: 104, .. }), "{appended:?}");
+    assert!(matches!(
+        machine.apply(append_cmd(stream("ext-flush"), b"xy", Append::default())),
+        StreamResponse::Appended { next_offset: 106, .. }
+    ));
+    assert_eq!(machine.cold_frontier_offset(&stream("ext-flush"), 0), 104);
+
+    let candidate = machine
+        .plan_cold_flush(&stream("ext-flush"), 4, 4)
+        .expect("plan cold flush")
+        .expect("cold flush candidate");
+    assert_eq!((candidate.start_offset, candidate.end_offset), (0, 4));
+    assert!(matches!(
+        machine.apply(flush_candidate_cmd(stream("ext-flush"), &candidate, "s3://bucket/cold/000000")),
+        StreamResponse::ColdFlushed { .. }
+    ));
+
+    assert_eq!(machine.cold_frontier_offset(&stream("ext-flush"), 0), 104);
+    let plan = machine.read_plan(&stream("ext-flush"), 0, 1024).expect("read plan after flush");
+    assert_eq!(plan.next_offset, 106);
+    // And after a restart from the state-machine snapshot.
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    let plan = restored.read_plan(&stream("ext-flush"), 0, 1024).expect("read plan after restore");
+    assert_eq!(plan.next_offset, 106);
+}
+
 #[test]
 fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
     let mut machine = machine();

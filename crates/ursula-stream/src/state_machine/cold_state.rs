@@ -24,7 +24,10 @@ impl StreamColdState {
     }
 
     pub(super) fn push_cold_chunk(&mut self, chunk: ColdChunkRef) {
-        self.cold_frontier = chunk.end_offset;
+        // Max, not assignment: the hot prefix written before an external append is
+        // flushed after it, ending where the external segment starts. Lowering the
+        // frontier there would drop the external range from every read plan.
+        self.cold_frontier = self.cold_frontier.max(chunk.end_offset);
         if chunk.shared_object {
             self.cold_chunks.push(chunk);
         }
